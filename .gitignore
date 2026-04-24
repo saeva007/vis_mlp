@@ -1,0 +1,17 @@
+node_modules/
+
+__pycache__/
+.DS_Store
+*.pyc
+
+checkpoints/
+
+logs/
+
+*.out
+
+*.err
+
+catboost_info/
+
+.ipynb_checkpoints/

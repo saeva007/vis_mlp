@@ -1,0 +1,141 @@
+#!/bin/bash
+#SBATCH -J PMST_net_test_10_s2
+#SBATCH -p kshdexclu01
+# Tuned: N=4 (was 10) to avoid RCCL/AMD DCU multi-node hang. Use more nodes only if stable.
+#SBATCH -N 5
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=dcu:4
+#SBATCH --mem=0
+#SBATCH -t 240:00:00
+#SBATCH -o logs/%j.out
+#SBATCH -e logs/%j.err
+#SBATCH --exclusive
+
+echo "Job started at: $(date)"
+
+# ==========================================
+# 1. Environment
+# ==========================================
+module purge
+module load compiler/devtoolset/7.3.1
+module load mpi/hpcx/2.11.0/gcc-7.3.1
+source /public/home/xichen/ncydata/dtk/dtk-24.04.1/env.sh
+export LD_LIBRARY_PATH=/public/home/xichen/ncydata/dtk/dtk-24.04.1/.hyhal/lib:$LD_LIBRARY_PATH
+source /public/home/jarvis226/miniconda3/bin/activate
+conda activate torch
+export LD_LIBRARY_PATH=/public/home/xichen/.conda/envs/py310_ppy/openssl/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/public/home/xichen/ncydata/panpy_test_liud/hipnn/lib/release/:$LD_LIBRARY_PATH
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=4
+
+# ==========================================
+# 2. RCCL / NCCL Communication (AMD DCU cluster)
+# ==========================================
+# Disable SHM to avoid RCCL mutex crash; disable IB for socket fallback
+export NCCL_SHM_DISABLE=1
+export NCCL_IB_DISABLE=1
+# Primary: ib0 (IPoIB). Fallback: eth0 if cluster uses Ethernet for TCP
+export NCCL_SOCKET_IFNAME=ib0,eth0
+export HSA_ENABLE_SDMA=0
+export HSA_FORCE_FINE_GRAIN_PCIE=1
+export NCCL_P2P_LEVEL=0
+export NCCL_IGNORE_CPU_AFFINITY=1
+export NCCL_ALGO=Ring
+export NCCL_PROTO=Simple
+export NCCL_DEBUG=WARN
+export NCCL_ASYNC_ERROR_HANDLING=1
+# Fail fast on collective timeout (default 600s)
+export NCCL_TIMEOUT=1800
+export NCCL_SOCKET_NTHREADS=4
+export NCCL_NSOCKS_PERTHREAD=4
+
+# ==========================================
+# 3. Node Discovery and IP Resolution
+# ==========================================
+nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+head_node=${nodes[0]}
+
+MASTER_ADDR=$(srun --nodes=1 --ntasks=1 -w "$head_node" \
+    ip -4 -o addr show ib0 | awk '{print $4}' | cut -d/ -f1)
+
+if [ -z "$MASTER_ADDR" ]; then
+    echo "Warning: Could not find ib0 IP for $head_node, falling back to hostname"
+    MASTER_ADDR=${head_node}
+fi
+
+# ==========================================
+# PORT ASSIGNMENT — THE ROOT CAUSE FIX
+# ==========================================
+#
+# PROBLEM: torchrun --rdzv_backend=static creates a TCPStore server on the
+# --rdzv_endpoint port BEFORE your Python script starts. When your Python
+# init_distributed() then tries to create another TCPStore server on the
+# identical MASTER_PORT (which torchrun also exports into each worker's
+# environment as MASTER_PORT), you get "Address already in use". Rank 0
+# dies, all other ranks see "Connection reset by peer", and the job fails
+# immediately without reaching the training loop.
+#
+# FIX: Two separate ports.
+#   RDZV_PORT      — used exclusively by torchrun's --rdzv_endpoint.
+#                    torchrun binds its rendezvous TCPStore here.
+#   DIST_STORE_PORT — used exclusively by the Python dist.TCPStore inside
+#                    init_distributed(). torchrun does NOT override custom
+#                    env vars, so DIST_STORE_PORT passes through to every
+#                    worker process untouched.
+#
+# Using the last 4 digits of SLURM_JOBID ensures jobs on the same cluster
+# do not collide with each other. The +1 guarantees the two ports are
+# always distinct even if the base port wraps around.
+# ==========================================
+BASE_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+RDZV_PORT=${BASE_PORT}
+DIST_STORE_PORT=$(expr ${BASE_PORT} + 1)
+
+export MASTER_ADDR
+export DIST_STORE_PORT   # Read by Python init_distributed(); NOT overridden by torchrun
+
+echo "Head Node       : ${head_node}"
+echo "MASTER_ADDR     : ${MASTER_ADDR}"
+echo "RDZV_PORT       : ${RDZV_PORT}       (torchrun rendezvous)"
+echo "DIST_STORE_PORT : ${DIST_STORE_PORT} (Python dist.TCPStore)"
+echo "SLURM_NNODES    : ${SLURM_NNODES}"
+echo "Total DCUs      : $((SLURM_NNODES * 4))"
+
+# ==========================================
+# 4. Clean /dev/shm on all nodes
+# ==========================================
+echo "Cleaning /dev/shm on all allocated nodes..."
+srun --nodes=${SLURM_NNODES} \
+     --ntasks=${SLURM_NNODES} \
+     --ntasks-per-node=1 \
+     bash -c "rm -rf /dev/shm/torch_* /dev/shm/*X_train* /dev/shm/*y_train* 2>/dev/null; \
+              echo \"\$(hostname) SHM Cleaned\""
+
+# ==========================================
+# 5. Launch Training
+# ==========================================
+echo "Starting Training on ${SLURM_NNODES} nodes (${SLURM_NNODES}x4 DCUs)..."
+
+srun --nodes=${SLURM_NNODES} \
+     --ntasks=${SLURM_NNODES} \
+     --ntasks-per-node=1 \
+     --cpus-per-task=32 \
+     --gres=dcu:4 \
+     bash -c "
+         export MIOPEN_USER_DB_PATH=/tmp/miopen_db_${SLURM_JOBID}_\${SLURM_NODEID}
+         export MIOPEN_CUSTOM_CACHE_DIR=\${MIOPEN_USER_DB_PATH}
+         mkdir -p \${MIOPEN_USER_DB_PATH}
+
+         torchrun \
+             --nnodes=${SLURM_NNODES} \
+             --nproc_per_node=4 \
+             --node_rank=\${SLURM_NODEID} \
+             --rdzv_backend=static \
+             --rdzv_endpoint=${MASTER_ADDR}:${RDZV_PORT} \
+             --rdzv_id=${SLURM_JOBID} \
+             --max_restarts=0 \
+             PMST_net_test_10_s2.py
+     "
+
+echo "Job finished at: $(date)"
