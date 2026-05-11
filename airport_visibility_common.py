@@ -1,11 +1,40 @@
+from __future__ import annotations
+
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import xarray as xr
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    _TORCH_IMPORT_ERROR = None
+except (ImportError, OSError) as exc:
+    _TORCH_IMPORT_ERROR = exc
+
+    class _MissingTorchModule:
+        Tensor = object
+
+        def __getattr__(self, name):
+            raise ImportError(
+                "PyTorch is required for model construction/inference, but it could "
+                f"not be imported: {_TORCH_IMPORT_ERROR}"
+            ) from _TORCH_IMPORT_ERROR
+
+    class _MissingNNModule:
+        Module = object
+
+        def __getattr__(self, name):
+            raise ImportError(
+                "PyTorch is required for model construction/inference, but it could "
+                f"not be imported: {_TORCH_IMPORT_ERROR}"
+            ) from _TORCH_IMPORT_ERROR
+
+    torch = _MissingTorchModule()
+    nn = _MissingNNModule()
+    F = _MissingTorchModule()
 
 
 WINDOW_SIZE = 12
