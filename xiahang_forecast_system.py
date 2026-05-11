@@ -26,6 +26,8 @@ from scipy.spatial.distance import cdist
 from airport_visibility_common import (
     build_airport_model,
     build_inference_matrix,
+    build_improved_pmst_model,
+    build_pmst_inference_matrix,
     predict_classes_from_probs,
 )
 
@@ -1781,6 +1783,7 @@ class VisibilityForecastSystem:
         self.airport_thresholds = {"fog": 0.5, "mist": 0.5}
         self.airport_temperature = 1.0
         self.airport_station_order = None
+        self.airport_season_thresholds = None
         self.processed_dirs = set()
         self.failed_dirs = {}
         self.forecasted_timestamps = set()  # 新增：记录已预报的时间戳
@@ -1817,51 +1820,71 @@ class VisibilityForecastSystem:
             except TypeError:
                 checkpoint = torch.load(self.config['model_path'], map_location=self.device)
 
-            model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model_state = checkpoint['model_state_dict']
+            else:
+                model_state = checkpoint
+
+            model_config = {}
+            if isinstance(checkpoint, dict):
+                model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
+            if not model_config and isinstance(self.preprocessors, dict):
+                model_config = self.preprocessors.get('model_config', {})
             self.model_type = (
                 self.config.get('model_type')
                 or model_config.get('model_type')
-                or checkpoint.get('model_type')
+                or (checkpoint.get('model_type') if isinstance(checkpoint, dict) else None)
+                or (self.preprocessors.get('model_type') if isinstance(self.preprocessors, dict) else None)
                 or 'legacy_mlp'
             )
 
-            if self.model_type == 'airport_pmst':
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
                 if self.preprocessors is None:
                     self.preprocessors = {}
                 self.airport_thresholds = (
                     self.config.get('thresholds')
-                    or checkpoint.get('thresholds')
+                    or (checkpoint.get('thresholds') if isinstance(checkpoint, dict) else None)
                     or self.preprocessors.get('thresholds')
                     or {'fog': 0.5, 'mist': 0.5}
+                )
+                self.airport_season_thresholds = (
+                    self.config.get('season_thresholds')
+                    or (checkpoint.get('season_thresholds') if isinstance(checkpoint, dict) else None)
+                    or self.preprocessors.get('season_thresholds')
                 )
                 self.airport_temperature = float(
                     self.config.get(
                         'temperature',
-                        checkpoint.get(
+                        (checkpoint.get(
                             'temperature',
                             self.preprocessors.get('temperature', 1.0)
-                        )
+                        ) if isinstance(checkpoint, dict) else self.preprocessors.get('temperature', 1.0))
                     )
                 )
                 self.airport_station_order = (
                     self.config.get('station_names')
-                    or checkpoint.get('station_order')
+                    or (checkpoint.get('station_order') if isinstance(checkpoint, dict) else None)
                     or self.preprocessors.get('station_order')
                 )
-                if 'station_to_idx' not in self.preprocessors:
-                    station_order = self.airport_station_order or checkpoint.get('station_order', [])
+                if self.model_type == 'airport_pmst' and 'station_to_idx' not in self.preprocessors:
+                    station_order = self.airport_station_order or (
+                        checkpoint.get('station_order', []) if isinstance(checkpoint, dict) else []
+                    )
                     self.preprocessors['station_to_idx'] = {
                         str(name): i for i, name in enumerate(station_order)
                     }
                 if 'fill_values' not in self.preprocessors:
-                    self.preprocessors['fill_values'] = checkpoint.get('fill_values', {})
+                    self.preprocessors['fill_values'] = checkpoint.get('fill_values', {}) if isinstance(checkpoint, dict) else {}
                 if 'model_config' not in self.preprocessors:
                     self.preprocessors['model_config'] = model_config
 
-                self.model = build_airport_model(model_config).to(self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                if self.model_type == 'improved_dual_stream_pmst':
+                    self.model = build_improved_pmst_model(model_config).to(self.device)
+                else:
+                    self.model = build_airport_model(model_config).to(self.device)
+                self.model.load_state_dict(model_state)
                 logger.info(
-                    f"机场PMST模型加载成功，thresholds={self.airport_thresholds}, "
+                    f"机场PMST模型加载成功，type={self.model_type}, thresholds={self.airport_thresholds}, "
                     f"T={self.airport_temperature:.3f}"
                 )
             else:
@@ -1929,10 +1952,9 @@ class VisibilityForecastSystem:
     def preprocess_data(self, features_ds):
         """预处理数据 - 修复维度处理"""
         try:
-            if self.model_type == 'airport_pmst':
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
                 station_names = self.get_airport_station_names(features_ds.coords)
                 scaler = self.preprocessors.get('scaler')
-                station_to_idx = self.preprocessors.get('station_to_idx', {})
                 fill_values = self.preprocessors.get('fill_values', {})
                 model_config = self.preprocessors.get('model_config', {})
                 window_size = int(model_config.get('window_size', 12))
@@ -1948,19 +1970,32 @@ class VisibilityForecastSystem:
                         self.config.get('use_source_zenith', False)
                     )
                 )
-                X_scaled, out_coords, unknown = build_inference_matrix(
-                    features_ds,
-                    station_names=station_names,
-                    station_to_idx=station_to_idx,
-                    scaler=scaler,
-                    fill_values=fill_values,
-                    window_size=window_size,
-                    local_time_offset_hours=local_time_offset_hours,
-                    use_source_zenith=use_source_zenith,
-                )
+                if self.model_type == 'improved_dual_stream_pmst':
+                    X_scaled, out_coords, unknown = build_pmst_inference_matrix(
+                        features_ds,
+                        station_names=station_names,
+                        station_static=self.preprocessors.get('station_static', {}),
+                        scaler=scaler,
+                        fill_values=fill_values,
+                        window_size=window_size,
+                        local_time_offset_hours=local_time_offset_hours,
+                        use_source_zenith=True,
+                    )
+                else:
+                    station_to_idx = self.preprocessors.get('station_to_idx', {})
+                    X_scaled, out_coords, unknown = build_inference_matrix(
+                        features_ds,
+                        station_names=station_names,
+                        station_to_idx=station_to_idx,
+                        scaler=scaler,
+                        fill_values=fill_values,
+                        window_size=window_size,
+                        local_time_offset_hours=local_time_offset_hours,
+                        use_source_zenith=use_source_zenith,
+                    )
                 if unknown:
-                    logger.warning(f"存在未见过的机场站点，将使用0号站点嵌入: {unknown[:10]}")
-                logger.info(f"机场PMST预处理完成，输入形状: {X_scaled.shape}")
+                    logger.warning(f"存在未见过的机场站点，将使用默认静态/站点特征: {unknown[:10]}")
+                logger.info(f"机场PMST预处理完成，type={self.model_type}, 输入形状: {X_scaled.shape}")
                 return X_scaled, out_coords
 
             # 获取数据数组并添加调试信息
@@ -2088,11 +2123,39 @@ class VisibilityForecastSystem:
         except Exception as e:
             logger.debug(f"无法写入预报时间戳日志: {e}")
 
+    def predict_airport_classes(self, probabilities, coords):
+        if not self.airport_season_thresholds:
+            return predict_classes_from_probs(probabilities, self.airport_thresholds)
+
+        time_values = pd.DatetimeIndex(pd.to_datetime(coords['time']))
+        station_dim = len(coords['station_name'])
+        predictions = np.empty(probabilities.shape[0], dtype=np.int64)
+
+        def season_name(month):
+            if month in (12, 1, 2):
+                return 'DJF'
+            if month in (3, 4, 5):
+                return 'MAM'
+            if month in (6, 7, 8):
+                return 'JJA'
+            return 'SON'
+
+        for i, ts in enumerate(time_values):
+            s_name = season_name(ts.month)
+            rec = self.airport_season_thresholds.get(s_name, {})
+            thresholds = {
+                'fog': float(rec.get('fog_th', self.airport_thresholds.get('fog', 0.5))),
+                'mist': float(rec.get('mist_th', self.airport_thresholds.get('mist', 0.5))),
+            }
+            sl = slice(i * station_dim, (i + 1) * station_dim)
+            predictions[sl] = predict_classes_from_probs(probabilities[sl], thresholds)
+        return predictions
+
     def predict(self, X_scaled, coords):
         """进行预测"""
         try:
             with torch.no_grad():
-                if self.model_type == 'airport_pmst':
+                if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
                     batch_size = int(self.config.get('batch_size', 4096))
                     probs_list = []
                     temp = max(float(self.airport_temperature), 1e-6)
@@ -2106,10 +2169,7 @@ class VisibilityForecastSystem:
                         probs = F.softmax(logits / temp, dim=1)
                         probs_list.append(probs.cpu().numpy())
                     probabilities = np.concatenate(probs_list, axis=0)
-                    predictions = predict_classes_from_probs(
-                        probabilities,
-                        self.airport_thresholds
-                    )
+                    predictions = self.predict_airport_classes(probabilities, coords)
                 else:
                     X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(self.device)
 
@@ -2141,7 +2201,7 @@ class VisibilityForecastSystem:
     def save_forecast_results(self, predictions, probabilities, coords, timestamp):
         """保存预测结果 - 修复版本"""
         try:
-            if self.model_type == 'airport_pmst':
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
                 time_dim = len(coords['time'])
                 station_names = [str(v) for v in coords['station_name']]
                 station_dim = len(station_names)
@@ -2166,7 +2226,7 @@ class VisibilityForecastSystem:
                     'station': station_names,
                     'class': ['<500m', '500-1000m', '>=1000m']
                 }, attrs={
-                    'model_type': 'airport_pmst',
+                    'model_type': self.model_type,
                     'fog_threshold': float(self.airport_thresholds.get('fog', 0.5)),
                     'mist_threshold': float(self.airport_thresholds.get('mist', 0.5)),
                     'temperature': float(self.airport_temperature),
@@ -2552,9 +2612,9 @@ def create_default_config():
     """创建默认配置文件"""
     config = {
         "data_root_dir": "/public/home/chenxi/PuTS/tianji",
-        "model_type": "airport_pmst",
-        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_best_score.pt",
-        "preprocessor_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_airport_preprocessor.pkl",
+        "model_type": "improved_dual_stream_pmst",
+        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_full_from_scratch_Airport_Full_best_score.pt",
+        "preprocessor_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_full_from_scratch_airport_preprocessor.pkl",
         "vegetation_file": "/public/home/chenxi/PuTS/tianji/data_vegtype.nc",
         "grid_data_base_dir": "/sharedata/dataset/GroupData/GD001-EC_Forcasting",
         "output_dir": "/public/home/chenxi/PuTS/tianji/forecasts",

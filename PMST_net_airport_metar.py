@@ -4,30 +4,15 @@ import argparse
 import json
 import os
 import time
-from datetime import datetime
-from typing import Dict, Mapping, Optional, Tuple
 
 import joblib
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.preprocessing import RobustScaler
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
-from airport_visibility_common import (
-    DYNAMIC_FEATURE_ORDER,
-    EXTRA_FEATURE_DIM,
-    LOCAL_TIME_OFFSET_HOURS,
-    WINDOW_SIZE,
-    airport_model_config,
-    build_airport_model,
-    get_dynamic_log_indices,
-    predict_classes_from_probs,
-    raw_rows_to_continuous_matrix,
-    visibility_to_classes,
-)
+import PMST_net_test_11_s2_pm10 as base
 
 
 BASE_PATH = "/public/home/putianshu/vis_mlp"
@@ -35,628 +20,415 @@ DEFAULT_DATA_DIR = os.path.join(BASE_PATH, "ml_dataset_airport_metar_2025_12h")
 DEFAULT_CKPT_DIR = os.path.join(BASE_PATH, "checkpoints")
 
 
-class AirportVisibilityDataset(Dataset):
-    def __init__(
-        self,
-        x_path: str,
-        y_raw: np.ndarray,
-        indices: np.ndarray,
-        scaler,
-        window_size: int,
-        dyn_vars_count: int,
-    ):
-        self.x_path = x_path
-        self.y_raw_all = np.asarray(y_raw, dtype=np.float32)
-        self.y_cls_all = visibility_to_classes(self.y_raw_all)
-        self.indices = np.asarray(indices, dtype=np.int64)
-        self.scaler = scaler
-        self.window_size = int(window_size)
-        self.dyn_vars_count = int(dyn_vars_count)
-        self.split_dyn = self.window_size * self.dyn_vars_count
-        self.log_indices = get_dynamic_log_indices(DYNAMIC_FEATURE_ORDER)
-        self.log_mask = np.zeros(self.split_dyn, dtype=bool)
-        for t in range(self.window_size):
-            for idx in self.log_indices:
-                self.log_mask[t * self.dyn_vars_count + int(idx)] = True
-        self.center = getattr(scaler, "center_", None)
-        self.scale = getattr(scaler, "scale_", None)
-        self.x_mmap = None
-
-    def __len__(self):
-        return int(len(self.indices))
-
-    def _transform_row(self, row: np.ndarray) -> np.ndarray:
-        dyn = row[: self.split_dyn].astype(np.float32, copy=True)
-        dyn[self.log_mask] = np.log1p(np.maximum(dyn[self.log_mask], 0.0))
-        station_idx = row[self.split_dyn : self.split_dyn + 1].astype(np.float32, copy=True)
-        extra = row[self.split_dyn + 1 :].astype(np.float32, copy=True)
-        cont = np.concatenate([dyn, extra]).astype(np.float32)
-        if self.center is not None and self.scale is not None:
-            cont = (cont - self.center) / (self.scale + 1e-6)
-        cont = np.clip(cont, -10.0, 10.0)
-        final = np.concatenate([cont[: self.split_dyn], station_idx, cont[self.split_dyn :]])
-        return np.nan_to_num(final, nan=0.0, posinf=10.0, neginf=-10.0).astype(np.float32)
-
-    def __getitem__(self, item):
-        if self.x_mmap is None:
-            self.x_mmap = np.load(self.x_path, mmap_mode="r")
-        real_idx = int(self.indices[item])
-        row = self.x_mmap[real_idx]
-        x = self._transform_row(row)
-        y_raw = float(max(self.y_raw_all[real_idx], 0.0))
-        y_cls = int(self.y_cls_all[real_idx])
-        y_reg = np.float32(np.log1p(y_raw))
-        return (
-            torch.from_numpy(x).float(),
-            torch.tensor(y_cls, dtype=torch.long),
-            torch.tensor(y_reg, dtype=torch.float32),
-            torch.tensor(y_raw, dtype=torch.float32),
-        )
+def airport_dyn_indices_log1p(dyn_vars_count: int):
+    """Airport dataset has no aerosol channels; log-transform precip, SW radiation, CAPE only."""
+    return [2, 4, 9]
 
 
-class AirportVisibilityLoss(nn.Module):
-    def __init__(
-        self,
-        class_weights: torch.Tensor,
-        low_vis_pos_weight: torch.Tensor,
-        alpha_binary: float = 0.5,
-        alpha_reg: float = 0.05,
-        alpha_clear_margin: float = 2.0,
-        clear_margin: float = 0.25,
-    ):
-        super().__init__()
-        self.register_buffer("class_weights", class_weights.float())
-        self.register_buffer("low_vis_pos_weight", low_vis_pos_weight.float())
-        self.alpha_binary = float(alpha_binary)
-        self.alpha_reg = float(alpha_reg)
-        self.alpha_clear_margin = float(alpha_clear_margin)
-        self.clear_margin = float(clear_margin)
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        reg_pred: torch.Tensor,
-        low_vis_logit: torch.Tensor,
-        y_cls: torch.Tensor,
-        y_reg: torch.Tensor,
-        y_raw: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        ce = F.cross_entropy(logits, y_cls, weight=self.class_weights)
-        low_target = (y_cls < 2).float()
-        bce = F.binary_cross_entropy_with_logits(
-            low_vis_logit.squeeze(-1),
-            low_target,
-            pos_weight=self.low_vis_pos_weight,
-        )
-        reg = F.smooth_l1_loss(reg_pred.squeeze(-1), y_reg)
-        probs = F.softmax(logits, dim=1)
-        clear_mask = y_cls == 2
-        if torch.any(clear_mask):
-            low_prob_clear = probs[clear_mask, 0] + probs[clear_mask, 1]
-            clear_margin = torch.relu(low_prob_clear - self.clear_margin).mean()
-        else:
-            clear_margin = torch.zeros((), device=logits.device)
-        loss = (
-            ce
-            + self.alpha_binary * bce
-            + self.alpha_reg * reg
-            + self.alpha_clear_margin * clear_margin
-        )
-        return loss, {
-            "ce": float(ce.detach().cpu()),
-            "bce": float(bce.detach().cpu()),
-            "reg": float(reg.detach().cpu()),
-            "clear_margin": float(clear_margin.detach().cpu()),
-        }
+base._dyn_indices_log1p = airport_dyn_indices_log1p
+CONFIG = base.CONFIG
 
 
-def load_metadata(data_dir: str) -> Dict:
+def load_airport_metadata(data_dir: str):
     path = os.path.join(data_dir, "dataset_metadata.json")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing dataset metadata: {path}")
+        raise FileNotFoundError(f"Missing airport dataset metadata: {path}")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def stratified_split(y_cls: np.ndarray, val_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    train_parts = []
-    val_parts = []
-    for cls in (0, 1, 2):
-        idx = np.where(y_cls == cls)[0]
-        rng.shuffle(idx)
-        n_val = int(round(len(idx) * float(val_ratio)))
-        if len(idx) > 0 and float(val_ratio) > 0.0:
-            n_val = max(1, n_val)
-        val_parts.append(idx[:n_val])
-        train_parts.append(idx[n_val:])
-    train_idx = np.concatenate(train_parts) if train_parts else np.array([], dtype=np.int64)
-    val_idx = np.concatenate(val_parts) if val_parts else np.array([], dtype=np.int64)
-    rng.shuffle(train_idx)
-    rng.shuffle(val_idx)
-    return train_idx.astype(np.int64), val_idx.astype(np.int64)
-
-
-def fit_or_load_scaler(
-    x_path: str,
-    scaler_path: str,
-    window_size: int,
-    dyn_vars_count: int,
-    max_samples: int,
-    seed: int,
-    reuse_scaler: bool,
+def load_airport_data(
+    data_dir,
+    scaler=None,
+    rank=0,
+    local_rank=0,
+    device=None,
+    reuse_scaler=False,
+    win_size=12,
+    world_size=1,
+    exp_id=None,
 ):
-    if reuse_scaler and os.path.exists(scaler_path):
+    path_x = base.copy_to_local(
+        os.path.join(data_dir, "X_train.npy"), rank, local_rank, world_size, exp_id
+    )
+    path_y = base.copy_to_local(
+        os.path.join(data_dir, "y_train.npy"), rank, local_rank, world_size, exp_id
+    )
+
+    x_shape = np.load(path_x, mmap_mode="r").shape
+    if len(x_shape) != 2:
+        raise ValueError(f"X_train.npy must be 2D [N, D], got shape={x_shape}")
+    dyn_vars_count, inferred_extra_dim = base._resolve_dyn_and_fe_dims(
+        int(x_shape[1]), win_size
+    )
+    CONFIG["DYN_VARS_COUNT"] = int(dyn_vars_count)
+    CONFIG["FE_EXTRA_DIMS"] = int(inferred_extra_dim)
+    base_dim = int(win_size * dyn_vars_count + 5 + 1)
+    if base_dim + inferred_extra_dim != int(x_shape[1]):
+        raise ValueError(
+            f"Layout check failed: dyn/static/veg base={base_dim}, "
+            f"FE={inferred_extra_dim}, total={x_shape[1]}"
+        )
+
+    y_raw = np.load(path_y)
+    y_cls = np.zeros(len(y_raw), dtype=np.int64)
+    if np.nanmax(y_raw) < 100:
+        y_raw = y_raw * 1000.0
+    y_cls[y_raw >= 500] = 1
+    y_cls[y_raw >= 1000] = 2
+
+    scaler_path = os.path.join(
+        CONFIG["SAVE_CKPT_DIR"],
+        f"robust_scaler_w{win_size}_dyn{dyn_vars_count}_airport_metar.pkl",
+    )
+
+    if scaler is None and not reuse_scaler:
+        base.safe_barrier(world_size, device)
+        if rank == 0:
+            if not os.path.exists(scaler_path):
+                print("[Airport Scaler] Fitting airport METAR scaler...", flush=True)
+                x_m = np.load(path_x, mmap_mode="r")
+                n_total = len(x_m)
+                max_samples = 200000
+                rng = np.random.default_rng(seed=42)
+                if n_total > max_samples:
+                    sample_indices = rng.choice(n_total, size=max_samples, replace=False)
+                    sample_indices.sort()
+                else:
+                    sample_indices = np.arange(n_total)
+                sub = x_m[sample_indices, : win_size * dyn_vars_count + 5].astype(np.float32)
+
+                log_mask = np.zeros(win_size * dyn_vars_count, dtype=bool)
+                for t in range(win_size):
+                    for i in airport_dyn_indices_log1p(dyn_vars_count):
+                        log_mask[t * dyn_vars_count + i] = True
+                sub[:, : win_size * dyn_vars_count] = np.where(
+                    log_mask,
+                    np.log1p(np.maximum(sub[:, : win_size * dyn_vars_count], 0)),
+                    sub[:, : win_size * dyn_vars_count],
+                )
+
+                scaler = RobustScaler(quantile_range=(5.0, 95.0)).fit(sub)
+                joblib.dump(scaler, scaler_path)
+                print(f"[Airport Scaler] Saved -> {scaler_path}", flush=True)
+            else:
+                print(f"[Airport Scaler] Loading cached scaler: {scaler_path}", flush=True)
+        base.safe_barrier(world_size, device)
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Scaler missing after barrier: {scaler_path}")
         scaler = joblib.load(scaler_path)
-        print(f"[Scaler] loaded: {scaler_path}", flush=True)
-        return scaler
 
-    x_m = np.load(x_path, mmap_mode="r")
-    n_total = len(x_m)
-    rng = np.random.default_rng(seed)
-    if n_total > max_samples:
-        sample_idx = rng.choice(n_total, size=max_samples, replace=False)
-        sample_idx.sort()
-    else:
-        sample_idx = np.arange(n_total)
-    print(f"[Scaler] fitting on {len(sample_idx)} rows...", flush=True)
-    sample_rows = x_m[sample_idx].astype(np.float32)
-    cont = raw_rows_to_continuous_matrix(sample_rows, window_size, dyn_vars_count)
-    scaler = RobustScaler(quantile_range=(5.0, 95.0)).fit(cont)
-    os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
-    joblib.dump(scaler, scaler_path)
-    print(f"[Scaler] saved: {scaler_path}", flush=True)
-    return scaler
+    n_total = len(y_cls)
+    n_val = int(n_total * CONFIG["VAL_SPLIT_RATIO"])
+    rng = np.random.default_rng(seed=42)
+    indices = rng.permutation(n_total)
 
-
-def class_weights_from_labels(y_cls: np.ndarray, indices: np.ndarray, device: torch.device):
-    labels = y_cls[indices]
-    counts = np.bincount(labels, minlength=3).astype(np.float32)
-    counts = np.maximum(counts, 1.0)
-    weights = counts.sum() / (3.0 * counts)
-    weights = np.clip(weights, 0.5, 6.0)
-    low_pos = np.maximum((labels < 2).sum(), 1)
-    low_neg = np.maximum((labels == 2).sum(), 1)
-    pos_weight = np.array([low_neg / low_pos], dtype=np.float32)
-    return (
-        torch.tensor(weights, dtype=torch.float32, device=device),
-        torch.tensor(pos_weight, dtype=torch.float32, device=device),
-        counts,
+    train_ds = base.PMSTDataset(
+        path_x,
+        y_cls,
+        y_raw,
+        scaler,
+        win_size,
+        True,
+        indices[n_val:],
+        dyn_vars_count=dyn_vars_count,
     )
-
-
-def make_weighted_sampler(y_cls: np.ndarray, train_idx: np.ndarray) -> WeightedRandomSampler:
-    labels = y_cls[train_idx]
-    counts = np.maximum(np.bincount(labels, minlength=3).astype(np.float32), 1.0)
-    class_weight = counts.sum() / counts
-    class_weight[0] *= 1.5
-    class_weight[1] *= 1.2
-    sample_weight = class_weight[labels]
-    return WeightedRandomSampler(
-        weights=torch.as_tensor(sample_weight, dtype=torch.double),
-        num_samples=len(train_idx),
-        replacement=True,
+    val_ds = base.PMSTDataset(
+        path_x,
+        y_cls,
+        y_raw,
+        scaler,
+        win_size,
+        True,
+        indices[:n_val],
+        dyn_vars_count=dyn_vars_count,
     )
+    return train_ds, val_ds, scaler
 
 
-def compute_metrics_from_predictions(
-    y_cls: np.ndarray,
-    y_raw: np.ndarray,
-    pred: np.ndarray,
-) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    total = max(len(y_cls), 1)
-    out["accuracy"] = float((pred == y_cls).sum() / total)
-    for cls, name in ((0, "fog"), (1, "mist"), (2, "clear")):
-        tp = int(((pred == cls) & (y_cls == cls)).sum())
-        fp = int(((pred == cls) & (y_cls != cls)).sum())
-        fn = int(((pred != cls) & (y_cls == cls)).sum())
-        out[f"{name}_precision"] = float(tp / max(tp + fp, 1))
-        out[f"{name}_recall"] = float(tp / max(tp + fn, 1))
-
-    true_low = y_cls < 2
-    pred_low = pred < 2
-    out["low_vis_precision"] = float(((true_low & pred_low).sum()) / max(pred_low.sum(), 1))
-    out["low_vis_recall"] = float(((true_low & pred_low).sum()) / max(true_low.sum(), 1))
-    clear = y_cls == 2
-    out["low_vis_fpr"] = float(((clear & pred_low).sum()) / max(clear.sum(), 1))
-    true_500 = y_raw < 500.0
-    true_1000 = y_raw < 1000.0
-    out["recall_500"] = float(((true_500) & (pred == 0)).sum() / max(true_500.sum(), 1))
-    out["recall_1000"] = float(((true_1000) & (pred < 2)).sum() / max(true_1000.sum(), 1))
-    return out
+def build_airport_loss(device):
+    return base.DualBranchLoss(
+        binary_pos_weight=CONFIG["S2_BINARY_POS_WEIGHT"],
+        fine_class_weight=[
+            CONFIG["S2_FINE_CLASS_WEIGHT_FOG"],
+            CONFIG["S2_FINE_CLASS_WEIGHT_MIST"],
+            CONFIG["S2_FINE_CLASS_WEIGHT_CLEAR"],
+        ],
+        loss_type="ordinal_focal",
+        gamma_per_class=[2.5, 3.0, 0.5],
+        ordinal_cost=[[0, 1, 3], [1, 0, 2], [3, 2, 0]],
+        alpha_binary=CONFIG["S2_LOSS_ALPHA_BINARY"],
+        alpha_fine=CONFIG["S2_LOSS_ALPHA_FINE"],
+        alpha_fp=CONFIG["S2_LOSS_ALPHA_FP"],
+        alpha_fog_boost=CONFIG["S2_LOSS_ALPHA_FOG_BOOST"],
+        alpha_mist_boost=CONFIG["S2_LOSS_ALPHA_MIST_BOOST"],
+        alpha_clear_margin=CONFIG["S2_LOSS_ALPHA_CLEAR_MARGIN"],
+        clear_margin=CONFIG["S2_CLEAR_MARGIN"],
+        alpha_pair_margin=CONFIG["S2_LOSS_ALPHA_PAIR_MARGIN"],
+        pair_margin=CONFIG["S2_PAIR_MARGIN"],
+    ).to(device)
 
 
-def target_score(metrics: Mapping[str, float]) -> float:
-    score = (
-        min(metrics["recall_500"] / 0.65, 1.0) * 0.30
-        + min(metrics["recall_1000"] / 0.75, 1.0) * 0.25
-        + min(metrics["accuracy"] / 0.95, 1.0) * 0.20
-        + min(metrics["low_vis_precision"] / 0.20, 1.0) * 0.15
-        + min(metrics["mist_recall"] / 0.20, 1.0) * 0.10
+def build_full_optimizer(raw_model, local_rank, world_size, rank):
+    for param in raw_model.parameters():
+        param.requires_grad = True
+
+    head_names = {"fine_classifier", "low_vis_detector", "reg_head"}
+    head_params = []
+    backbone_params = []
+    for name, param in raw_model.named_parameters():
+        if name.split(".")[0] in head_names:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    if rank == 0:
+        print(
+            f"[Airport Optim] Full training from scratch. "
+            f"backbone={sum(p.numel() for p in backbone_params)/1e6:.3f}M, "
+            f"heads={sum(p.numel() for p in head_params)/1e6:.3f}M",
+            flush=True,
+        )
+        print(
+            f"[Airport Optim] LR backbone={CONFIG['AIRPORT_LR_BACKBONE']:.1e}, "
+            f"LR head={CONFIG['AIRPORT_LR_HEAD']:.1e}",
+            flush=True,
+        )
+
+    model = base.wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
+    optimizer = optim.AdamW(
+        [
+            {"params": backbone_params, "lr": CONFIG["AIRPORT_LR_BACKBONE"]},
+            {"params": head_params, "lr": CONFIG["AIRPORT_LR_HEAD"]},
+        ],
+        weight_decay=CONFIG["S2_WEIGHT_DECAY"],
     )
-    return float(score - 0.05 * metrics["low_vis_fpr"])
+    return model, optimizer
 
 
-def search_thresholds(
-    probabilities: np.ndarray,
-    y_cls: np.ndarray,
-    y_raw: np.ndarray,
-    fog_min: float = 0.20,
-    fog_max: float = 0.85,
-    mist_min: float = 0.20,
-    mist_max: float = 0.85,
-    step: float = 0.03,
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    best_score = -1e9
-    best_thresholds = {"fog": 0.50, "mist": 0.50}
-    best_metrics = compute_metrics_from_predictions(
-        y_cls, y_raw, predict_classes_from_probs(probabilities, best_thresholds)
-    )
-    fog_grid = np.arange(fog_min, fog_max + 1e-6, step)
-    mist_grid = np.arange(mist_min, mist_max + 1e-6, step)
-    for fog_th in fog_grid:
-        for mist_th in mist_grid:
-            thresholds = {"fog": float(fog_th), "mist": float(mist_th)}
-            pred = predict_classes_from_probs(probabilities, thresholds)
-            metrics = compute_metrics_from_predictions(y_cls, y_raw, pred)
-            score = target_score(metrics)
-            if score > best_score:
-                best_score = score
-                best_thresholds = thresholds
-                best_metrics = metrics
-    best_metrics["target_score"] = float(best_score)
-    return best_thresholds, best_metrics
-
-
-@torch.no_grad()
-def collect_probabilities(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    temperature: float = 1.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model.eval()
-    probs_all = []
-    y_cls_all = []
-    y_raw_all = []
-    temp = max(float(temperature), 1e-6)
-    for x, y_cls, _y_reg, y_raw in loader:
-        x = x.to(device, non_blocking=True)
-        logits, _reg, _low = model(x)
-        probs = F.softmax(logits / temp, dim=1)
-        probs_all.append(probs.detach().cpu().numpy())
-        y_cls_all.append(y_cls.numpy())
-        y_raw_all.append(y_raw.numpy())
-    return (
-        np.concatenate(probs_all, axis=0),
-        np.concatenate(y_cls_all, axis=0),
-        np.concatenate(y_raw_all, axis=0),
-    )
-
-
-def save_training_artifacts(
-    model: nn.Module,
-    checkpoint_path: str,
-    preprocessor_path: str,
+def save_airport_inference_artifacts(
+    raw_model,
     scaler,
-    metadata: Mapping,
-    model_config: Mapping,
-    train_config: Mapping,
-    thresholds: Mapping[str, float],
-    metrics: Optional[Mapping[str, float]],
-) -> None:
-    station_order = [str(s) for s in metadata["station_order"]]
-    station_to_idx = {name: i for i, name in enumerate(station_order)}
-    state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-    payload = {
-        "model_state_dict": state,
-        "model_config": dict(model_config),
-        "config": dict(model_config),
-        "train_config": dict(train_config),
-        "thresholds": dict(thresholds),
-        "temperature": 1.0,
-        "metrics": dict(metrics or {}),
-        "station_order": station_order,
-        "station_to_idx": station_to_idx,
-        "dynamic_feature_order": DYNAMIC_FEATURE_ORDER,
-        "fill_values": dict(metadata.get("fill_values", {})),
-        "saved_at": datetime.utcnow().isoformat() + "Z",
+    metadata,
+    run_exp_id,
+    temperature,
+    season_thresholds,
+    rank,
+):
+    if rank != 0:
+        return
+
+    model_config = {
+        "model_type": "improved_dual_stream_pmst",
+        "window_size": int(CONFIG["WINDOW_SIZE"]),
+        "dyn_vars_count": int(CONFIG["DYN_VARS_COUNT"]),
+        "static_cont_dim": 5,
+        "veg_num_classes": 21,
+        "hidden_dim": int(CONFIG["MODEL_HIDDEN_DIM"]),
+        "num_classes": int(CONFIG["MODEL_NUM_CLASSES"]),
+        "extra_feat_dim": int(CONFIG["FE_EXTRA_DIMS"]),
+        "dropout": float(CONFIG["MODEL_DROPOUT"]),
     }
-    torch.save(payload, checkpoint_path)
+    payload = {
+        "model_state_dict": raw_model.state_dict(),
+        "model_config": model_config,
+        "config": model_config,
+        "temperature": float(temperature),
+        "season_thresholds": season_thresholds,
+        "dynamic_feature_order": metadata.get("dynamic_feature_order", []),
+        "station_order": metadata.get("station_order", []),
+        "station_static": metadata.get("station_static", {}),
+        "fill_values": metadata.get("fill_values", {}),
+        "dataset_metadata": metadata,
+    }
+    package_path = os.path.join(CONFIG["SAVE_CKPT_DIR"], f"{run_exp_id}_airport_inference_package.pt")
+    torch.save(payload, package_path)
 
     preprocessor = {
         "scaler": scaler,
-        "model_type": "airport_pmst",
-        "model_config": dict(model_config),
-        "thresholds": dict(thresholds),
-        "temperature": 1.0,
-        "station_order": station_order,
-        "station_to_idx": station_to_idx,
-        "dynamic_feature_order": DYNAMIC_FEATURE_ORDER,
-        "fill_values": dict(metadata.get("fill_values", {})),
-        "window_size": int(model_config["window_size"]),
-        "dyn_vars_count": int(model_config["dyn_vars_count"]),
-        "extra_feature_dim": int(model_config["extra_feat_dim"]),
-        "local_time_offset_hours": float(
-            train_config.get("local_time_offset_hours", LOCAL_TIME_OFFSET_HOURS)
-        ),
-        "use_source_zenith": bool(train_config.get("use_source_zenith", False)),
+        "model_type": "improved_dual_stream_pmst",
+        "model_config": model_config,
+        "temperature": float(temperature),
+        "season_thresholds": season_thresholds,
+        "dynamic_feature_order": metadata.get("dynamic_feature_order", []),
+        "station_order": metadata.get("station_order", []),
+        "station_static": metadata.get("station_static", {}),
+        "fill_values": metadata.get("fill_values", {}),
+        "window_size": int(CONFIG["WINDOW_SIZE"]),
+        "dyn_vars_count": int(CONFIG["DYN_VARS_COUNT"]),
+        "extra_feature_dim": int(CONFIG["FE_EXTRA_DIMS"]),
+        "local_time_offset_hours": float(metadata.get("local_time_offset_hours", 8)),
+        "use_source_zenith": True,
     }
+    preprocessor_path = os.path.join(CONFIG["SAVE_CKPT_DIR"], f"{run_exp_id}_airport_preprocessor.pkl")
     joblib.dump(preprocessor, preprocessor_path)
+    print(f"[Airport Save] Inference package -> {package_path}", flush=True)
+    print(f"[Airport Save] Preprocessor      -> {preprocessor_path}", flush=True)
 
 
-def train(args) -> None:
-    os.makedirs(args.save_ckpt_dir, exist_ok=True)
-    metadata = load_metadata(args.data_dir)
-    x_path = os.path.join(args.data_dir, "X_train.npy")
-    y_path = os.path.join(args.data_dir, "y_train.npy")
-    if not os.path.exists(x_path) or not os.path.exists(y_path):
-        raise FileNotFoundError(
-            f"Missing X_train.npy/y_train.npy in {args.data_dir}; run s2_data_airport_metar.py first."
-        )
-
-    y_raw = np.load(y_path).astype(np.float32)
-    y_cls = visibility_to_classes(y_raw)
-    dyn_vars_count = int(metadata.get("dyn_vars_count", len(DYNAMIC_FEATURE_ORDER)))
-    window_size = int(metadata.get("window_size", args.window_size))
-    x_shape = np.load(x_path, mmap_mode="r").shape
-    expected_dim = window_size * dyn_vars_count + 1 + int(metadata.get("extra_feature_dim", EXTRA_FEATURE_DIM))
-    if x_shape[1] != expected_dim:
-        raise ValueError(f"X shape mismatch: got {x_shape}, expected feature dim {expected_dim}")
-
-    scaler_path = os.path.join(
-        args.save_ckpt_dir,
-        f"{args.exp_id}_airport_scaler_w{window_size}_dyn{dyn_vars_count}.pkl",
+def configure(args):
+    CONFIG.update(
+        {
+            "EXPERIMENT_ID": args.exp_id,
+            "S2_RUN_SUFFIX": args.run_suffix,
+            "BASE_PATH": BASE_PATH,
+            "S2_DATA_DIR": args.data_dir,
+            "SAVE_CKPT_DIR": args.save_ckpt_dir,
+            "WINDOW_SIZE": args.window_size,
+            "NUM_WORKERS": args.num_workers,
+            "VAL_SPLIT_RATIO": args.val_ratio,
+            "S1_BEST_CKPT_PATH": None,
+            "DYN_VARS_COUNT": 25,
+            "FE_EXTRA_DIMS": 36,
+            "AIRPORT_TOTAL_STEPS": args.total_steps,
+            "AIRPORT_LR_BACKBONE": args.lr_backbone,
+            "AIRPORT_LR_HEAD": args.lr_head,
+            "S2_BATCH_SIZE": args.batch_size,
+            "S2_GRAD_ACCUM": args.grad_accum,
+            "S2_VAL_INTERVAL": args.val_interval,
+            "S2_ES_PATIENCE": args.patience,
+            "S2_FOG_RATIO": args.fog_ratio,
+            "S2_MIST_RATIO": args.mist_ratio,
+            "S2_WARMUP_STEPS": args.warmup_steps,
+        }
     )
-    preprocessor_path = os.path.join(args.save_ckpt_dir, f"{args.exp_id}_airport_preprocessor.pkl")
-    scaler = fit_or_load_scaler(
-        x_path=x_path,
-        scaler_path=scaler_path,
-        window_size=window_size,
-        dyn_vars_count=dyn_vars_count,
-        max_samples=args.scaler_max_samples,
-        seed=args.seed,
-        reuse_scaler=args.reuse_scaler,
-    )
-
-    train_idx, val_idx = stratified_split(y_cls, args.val_ratio, args.seed)
-    print(
-        f"[Data] total={len(y_raw)}, train={len(train_idx)}, val={len(val_idx)}, "
-        f"class_counts={np.bincount(y_cls, minlength=3).tolist()}",
-        flush=True,
-    )
-    if len(train_idx) == 0:
-        raise ValueError("No training samples after split")
-
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    model_config = airport_model_config(
-        station_count=len(metadata["station_order"]),
-        window_size=window_size,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        station_emb_dim=args.station_emb_dim,
-    )
-    model = build_airport_model(model_config).to(device)
-
-    class_weights, low_vis_pos_weight, train_counts = class_weights_from_labels(
-        y_cls, train_idx, device
-    )
-    print(
-        f"[Loss] train class counts={train_counts.tolist()}, "
-        f"class_weights={class_weights.detach().cpu().numpy().round(3).tolist()}, "
-        f"low_vis_pos_weight={float(low_vis_pos_weight.item()):.3f}",
-        flush=True,
-    )
-    loss_fn = AirportVisibilityLoss(
-        class_weights=class_weights,
-        low_vis_pos_weight=low_vis_pos_weight,
-        alpha_binary=args.alpha_binary,
-        alpha_reg=args.alpha_reg,
-        alpha_clear_margin=args.alpha_clear_margin,
-        clear_margin=args.clear_margin,
-    )
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.05
-    )
-
-    train_ds = AirportVisibilityDataset(
-        x_path, y_raw, train_idx, scaler, window_size, dyn_vars_count
-    )
-    val_ds = AirportVisibilityDataset(
-        x_path, y_raw, val_idx, scaler, window_size, dyn_vars_count
-    ) if len(val_idx) else None
-    sampler = make_weighted_sampler(y_cls, train_idx) if args.weighted_sampler else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    ) if val_ds is not None else None
-
-    train_config = {
-        "exp_id": args.exp_id,
-        "data_dir": args.data_dir,
-        "save_ckpt_dir": args.save_ckpt_dir,
-        "scaler_path": scaler_path,
-        "preprocessor_path": preprocessor_path,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "val_ratio": args.val_ratio,
-        "local_time_offset_hours": float(metadata.get("local_time_offset_hours", LOCAL_TIME_OFFSET_HOURS)),
-        "use_source_zenith": False,
-    }
-
-    best_score = -1e9
-    best_thresholds = {"fog": 0.50, "mist": 0.50}
-    best_metrics: Dict[str, float] = {}
-    latest_path = os.path.join(args.save_ckpt_dir, f"{args.exp_id}_latest.pt")
-    best_path = os.path.join(args.save_ckpt_dir, f"{args.exp_id}_best_score.pt")
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        t0 = time.time()
-        running_loss = 0.0
-        running_parts = {"ce": 0.0, "bce": 0.0, "reg": 0.0, "clear_margin": 0.0}
-        n_seen = 0
-        optimizer.zero_grad(set_to_none=True)
-        for step, (x, yb, yreg, yraw) in enumerate(train_loader, start=1):
-            x = x.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            yreg = yreg.to(device, non_blocking=True)
-            yraw = yraw.to(device, non_blocking=True)
-            logits, reg_pred, low_logit = model(x)
-            loss, parts = loss_fn(logits, reg_pred, low_logit, yb, yreg, yraw)
-            loss.backward()
-            if args.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
-            bs = int(x.size(0))
-            running_loss += float(loss.detach().cpu()) * bs
-            for key in running_parts:
-                running_parts[key] += parts[key] * bs
-            n_seen += bs
-
-        scheduler.step()
-        train_loss = running_loss / max(n_seen, 1)
-        part_msg = ", ".join(
-            f"{k}={running_parts[k] / max(n_seen, 1):.4f}" for k in running_parts
-        )
-
-        if val_loader is not None and (epoch % args.eval_every == 0 or epoch == args.epochs):
-            probs, val_y_cls, val_y_raw = collect_probabilities(model, val_loader, device)
-            thresholds, metrics = search_thresholds(
-                probs,
-                val_y_cls,
-                val_y_raw,
-                fog_min=args.fog_threshold_min,
-                fog_max=args.fog_threshold_max,
-                mist_min=args.mist_threshold_min,
-                mist_max=args.mist_threshold_max,
-                step=args.threshold_step,
-            )
-            score = float(metrics["target_score"])
-            print(
-                f"[Epoch {epoch:03d}] loss={train_loss:.4f} ({part_msg}) "
-                f"score={score:.4f} acc={metrics['accuracy']:.3f} "
-                f"R500={metrics['recall_500']:.3f} R1000={metrics['recall_1000']:.3f} "
-                f"lowP={metrics['low_vis_precision']:.3f} lowFPR={metrics['low_vis_fpr']:.3f} "
-                f"th=({thresholds['fog']:.2f},{thresholds['mist']:.2f}) "
-                f"time={time.time() - t0:.1f}s",
-                flush=True,
-            )
-            if score > best_score:
-                best_score = score
-                best_thresholds = thresholds
-                best_metrics = metrics
-                save_training_artifacts(
-                    model,
-                    best_path,
-                    preprocessor_path,
-                    scaler,
-                    metadata,
-                    model_config,
-                    train_config,
-                    best_thresholds,
-                    best_metrics,
-                )
-                print(f"[Save] best -> {best_path}", flush=True)
-        else:
-            print(
-                f"[Epoch {epoch:03d}] loss={train_loss:.4f} ({part_msg}) "
-                f"time={time.time() - t0:.1f}s",
-                flush=True,
-            )
-
-        save_training_artifacts(
-            model,
-            latest_path,
-            preprocessor_path,
-            scaler,
-            metadata,
-            model_config,
-            train_config,
-            best_thresholds,
-            best_metrics,
-        )
-
-    if best_score <= -1e8:
-        save_training_artifacts(
-            model,
-            best_path,
-            preprocessor_path,
-            scaler,
-            metadata,
-            model_config,
-            train_config,
-            best_thresholds,
-            best_metrics,
-        )
-    print("[Done] training finished", flush=True)
-    print(f"  best checkpoint: {best_path}", flush=True)
-    print(f"  preprocessor:    {preprocessor_path}", flush=True)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train AirportPMSTNet on METAR visibility data.")
-    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
-    parser.add_argument("--save-ckpt-dir", default=DEFAULT_CKPT_DIR)
-    parser.add_argument("--exp-id", default="airport_metar_2025")
-    parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--eval-batch-size", type=int, default=4096)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--hidden-dim", type=int, default=384)
-    parser.add_argument("--station-emb-dim", type=int, default=32)
-    parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--val-ratio", type=float, default=0.10)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--scaler-max-samples", type=int, default=200000)
-    parser.add_argument("--reuse-scaler", action="store_true")
-    parser.add_argument("--weighted-sampler", action="store_true", default=True)
-    parser.add_argument("--no-weighted-sampler", dest="weighted_sampler", action="store_false")
-    parser.add_argument("--eval-every", type=int, default=1)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--alpha-binary", type=float, default=0.5)
-    parser.add_argument("--alpha-reg", type=float, default=0.05)
-    parser.add_argument("--alpha-clear-margin", type=float, default=2.0)
-    parser.add_argument("--clear-margin", type=float, default=0.25)
-    parser.add_argument("--fog-threshold-min", type=float, default=0.20)
-    parser.add_argument("--fog-threshold-max", type=float, default=0.85)
-    parser.add_argument("--mist-threshold-min", type=float, default=0.20)
-    parser.add_argument("--mist-threshold-max", type=float, default=0.85)
-    parser.add_argument("--threshold-step", type=float, default=0.03)
-    parser.add_argument("--cpu", action="store_true")
-    return parser.parse_args()
+    os.makedirs(CONFIG["SAVE_CKPT_DIR"], exist_ok=True)
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    train(args)
+    configure(args)
+
+    local_rank, global_rank, world_size = base.init_distributed()
+    device = torch.device(f"cuda:{local_rank}")
+    base_exp_id = CONFIG["EXPERIMENT_ID"]
+    run_exp_id = base.build_s2_run_exp_id(base_exp_id, CONFIG.get("S2_RUN_SUFFIX", ""))
+    metadata = load_airport_metadata(CONFIG["S2_DATA_DIR"])
+
+    if global_rank == 0:
+        print("[Airport] Full training from scratch; no S1 pretraining is loaded.", flush=True)
+        print(f"[Airport] Run ID: {run_exp_id}", flush=True)
+        print(f"[Airport] World size: {world_size}", flush=True)
+
+    base.safe_barrier(world_size, device)
+    dyn_res, fe_res = base.resolve_feature_layout_from_x_train(
+        CONFIG["S2_DATA_DIR"], CONFIG["WINDOW_SIZE"]
+    )
+    CONFIG["DYN_VARS_COUNT"] = int(dyn_res)
+    CONFIG["FE_EXTRA_DIMS"] = int(fe_res)
+    if global_rank == 0:
+        print(
+            f"[Airport] Feature layout: dyn={dyn_res}, static=5, veg=1, FE={fe_res}",
+            flush=True,
+        )
+
+    raw_model = base.ImprovedDualStreamPMSTNet(
+        window_size=CONFIG["WINDOW_SIZE"],
+        hidden_dim=CONFIG["MODEL_HIDDEN_DIM"],
+        num_classes=CONFIG["MODEL_NUM_CLASSES"],
+        extra_feat_dim=CONFIG["FE_EXTRA_DIMS"],
+        dyn_vars_count=CONFIG["DYN_VARS_COUNT"],
+    ).to(device)
+    if global_rank == 0:
+        print(f"[Airport Model] Params={sum(p.numel() for p in raw_model.parameters())/1e6:.2f}M", flush=True)
+
+    train_ds, val_ds, scaler = load_airport_data(
+        CONFIG["S2_DATA_DIR"],
+        None,
+        global_rank,
+        local_rank,
+        device,
+        False,
+        CONFIG["WINDOW_SIZE"],
+        world_size,
+        run_exp_id,
+    )
+    if global_rank == 0:
+        print(f"[Airport Data] Train={len(train_ds)}, Val={len(val_ds)}", flush=True)
+
+    model, optimizer = build_full_optimizer(raw_model, local_rank, world_size, global_rank)
+    loss_fn = build_airport_loss(device)
+
+    base.train_stage(
+        tag="Airport_Full",
+        model=model,
+        tr_ds=train_ds,
+        val_ds=val_ds,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=device,
+        rank=global_rank,
+        world_size=world_size,
+        total_steps=CONFIG["AIRPORT_TOTAL_STEPS"],
+        val_int=CONFIG["S2_VAL_INTERVAL"],
+        batch_size=CONFIG["S2_BATCH_SIZE"],
+        grad_accum=CONFIG["S2_GRAD_ACCUM"],
+        fog_ratio=CONFIG["S2_FOG_RATIO"],
+        mist_ratio=CONFIG["S2_MIST_RATIO"],
+        exp_id=run_exp_id,
+        patience=CONFIG["S2_ES_PATIENCE"],
+        pretrained_state=None,
+        l2sp_alpha=0.0,
+    )
+
+    raw_final = base.rewrap_ddp(model, world_size)
+    best_path = os.path.join(CONFIG["SAVE_CKPT_DIR"], f"{run_exp_id}_Airport_Full_best_score.pt")
+    if os.path.exists(best_path):
+        base.load_checkpoint(raw_final, best_path, global_rank, world_size, device)
+    elif global_rank == 0:
+        print(f"[Airport] WARNING: best checkpoint not found, using last in-memory weights: {best_path}", flush=True)
+
+    def worker_init_fn(worker_id):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_info.dataset.X = None
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=CONFIG["S2_BATCH_SIZE"],
+        shuffle=False,
+        num_workers=CONFIG["NUM_WORKERS"],
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+    )
+
+    optimal_temp = base.calibrate_temperature(raw_final, val_loader, device, CONFIG, rank=global_rank)
+    season_thresholds = base.evaluate_per_season(
+        raw_final, val_loader, device, CONFIG, rank=global_rank, temperature=optimal_temp
+    )
+    save_airport_inference_artifacts(
+        raw_final, scaler, metadata, run_exp_id, optimal_temp, season_thresholds, global_rank
+    )
+
+    base.cleanup_temp_files(run_exp_id)
+    if world_size > 1:
+        base.dist.destroy_process_group()
+    if global_rank == 0:
+        print("[Airport] Job finished.", flush=True)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train the original multi-GPU PMST model on airport METAR visibility data."
+    )
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument("--save-ckpt-dir", default=DEFAULT_CKPT_DIR)
+    parser.add_argument("--exp-id", default="airport_metar_2025")
+    parser.add_argument("--run-suffix", default="full_from_scratch")
+    parser.add_argument("--window-size", type=int, default=12)
+    parser.add_argument("--total-steps", type=int, default=60000)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--grad-accum", type=int, default=2)
+    parser.add_argument("--val-interval", type=int, default=500)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--val-ratio", type=float, default=0.10)
+    parser.add_argument("--lr-backbone", type=float, default=1e-4)
+    parser.add_argument("--lr-head", type=float, default=2e-4)
+    parser.add_argument("--fog-ratio", type=float, default=0.18)
+    parser.add_argument("--mist-ratio", type=float, default=0.22)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

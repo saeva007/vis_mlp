@@ -34,6 +34,11 @@ DEFAULT_WEATHER_FILE = os.path.join(
     BASE_PATH, "merged_station_weather_data_20250101_20251231.nc"
 )
 DEFAULT_OUTPUT_DIR = os.path.join(BASE_PATH, "ml_dataset_airport_metar_2025_12h")
+DEFAULT_STATION_FILE = "/public/home/putianshu/vis_diffusion/test_data/178_stations_renumbered.csv"
+DEFAULT_VEG_FILE = "/public/home/putianshu/vis_cnn/data_vegtype.nc"
+DEFAULT_ORO_FILE = "/public/home/putianshu/vis_cnn/data_orography.nc"
+
+UNIQUE_VEG_IDS = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20])
 
 
 def open_dataset_auto(path: str) -> xr.Dataset:
@@ -75,6 +80,95 @@ def get_common_time_station(
     return common_times, common_stations
 
 
+def load_station_table(path: str, station_order) -> pd.DataFrame:
+    table = pd.read_csv(path)
+    required = {"station_name", "station_lon", "station_lat"}
+    missing_cols = required - set(table.columns)
+    if missing_cols:
+        raise ValueError(f"Station table is missing columns: {sorted(missing_cols)}")
+    table["station_name"] = table["station_name"].astype(str)
+    table = table.set_index("station_name", drop=False)
+
+    order = [str(s) for s in station_order]
+    missing = [s for s in order if s not in table.index]
+    if missing:
+        raise ValueError(f"Station table missing {len(missing)} stations: {missing[:10]}")
+    return table.loc[order].reset_index(drop=True)
+
+
+def calculate_zenith_angle(latitudes, longitudes, times):
+    try:
+        import pvlib
+
+        times_pd = pd.DatetimeIndex(pd.to_datetime(times))
+        if times_pd.tz is None:
+            times_pd = times_pd.tz_localize("UTC")
+        else:
+            times_pd = times_pd.tz_convert("UTC")
+        n_times, n_stations = len(times_pd), len(latitudes)
+        b_times = np.repeat(times_pd, n_stations)
+        b_lats = np.tile(latitudes, n_times)
+        b_lons = np.tile(longitudes, n_times)
+        sp = pvlib.solarposition.get_solarposition(b_times, b_lats, b_lons)
+        return sp["apparent_zenith"].values.reshape(n_times, n_stations).astype(np.float32)
+    except Exception as exc:
+        print(f"[WARN] zenith calculation failed ({exc}); using local-time proxy.", flush=True)
+        from airport_visibility_common import zenith_proxy_from_time
+
+        return zenith_proxy_from_time(times, len(latitudes))
+
+
+def get_nearest_veg_indices(latitudes, longitudes, veg_ds):
+    veg = veg_ds.sortby("latitude").sortby("longitude")
+    veg_raw = veg.sel(
+        latitude=xr.DataArray(latitudes, dims="station"),
+        longitude=xr.DataArray(longitudes, dims="station"),
+        method="nearest",
+    )["htcc"].values
+    type_to_idx = {v: i for i, v in enumerate(UNIQUE_VEG_IDS)}
+    return np.array([type_to_idx.get(v, 0) for v in veg_raw], dtype=np.float32)
+
+
+def extract_terrain_features(latitudes, longitudes, oro_ds, r=2):
+    h = oro_ds["h"].values
+    lat_values = oro_ds.latitude.values
+    lon_values = oro_ds.longitude.values
+    lats_idx = np.abs(lat_values[:, None] - latitudes).argmin(axis=0)
+    lons_idx = np.abs(lon_values[:, None] - (longitudes % 360.0)).argmin(axis=0)
+    max_r, max_c = h.shape
+    feats = []
+    for r_idx, c_idx in zip(lats_idx, lons_idx):
+        window = h[
+            max(0, r_idx - r) : min(max_r, r_idx + r + 1),
+            max(0, c_idx - r) : min(max_c, c_idx + r + 1),
+        ]
+        center = h[r_idx, c_idx]
+        feats.append([center, center - np.nanmean(window), np.nanstd(window)])
+    return np.asarray(feats, dtype=np.float32)
+
+
+def build_static_features(station_table: pd.DataFrame, veg_file: str, oro_file: str):
+    latitudes = station_table["station_lat"].to_numpy(dtype=np.float32)
+    longitudes = station_table["station_lon"].to_numpy(dtype=np.float32)
+    print(f"[Static] loading vegetation: {veg_file}", flush=True)
+    print(f"[Static] loading orography:  {oro_file}", flush=True)
+    veg_ds = open_dataset_auto(veg_file)
+    oro_ds = open_dataset_auto(oro_file)
+    veg_idx = get_nearest_veg_indices(latitudes, longitudes, veg_ds)
+    terrain = extract_terrain_features(latitudes, longitudes, oro_ds)
+    veg_ds.close()
+    oro_ds.close()
+    static_cont = np.concatenate(
+        [
+            (latitudes[:, None] / 90.0).astype(np.float32),
+            (longitudes[:, None] / 180.0).astype(np.float32),
+            terrain,
+        ],
+        axis=1,
+    )
+    return static_cont.astype(np.float32), veg_idx.astype(np.float32), latitudes, longitudes
+
+
 def write_dataset(args) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -101,12 +195,21 @@ def write_dataset(args) -> None:
 
     weather_ds = weather_ds.sel(time=common_times, station=common_stations)
     vis_da = vis_ds[visibility_var].sel(time=common_times, station=common_stations)
+    station_table = load_station_table(args.station_file, common_stations)
+    static_cont, veg_idx, latitudes, longitudes = build_static_features(
+        station_table, args.vegetation_file, args.orography_file
+    )
+
+    zenith = calculate_zenith_angle(latitudes, longitudes, common_times)
+    weather_ds = weather_ds.assign(
+        ZENITH_PROXY=(("time", "station"), zenith.astype(np.float32))
+    )
 
     print("[Feature] extracting dynamic weather cube...", flush=True)
     cube, times, stations = extract_dynamic_cube(
         weather_ds,
         local_time_offset_hours=args.local_time_offset_hours,
-        use_source_zenith=False,
+        use_source_zenith=True,
     )
     fill_values = compute_fill_values(cube)
     cube = fill_dynamic_cube(cube, fill_values)
@@ -143,7 +246,8 @@ def write_dataset(args) -> None:
         raise ValueError("No valid visibility samples after filtering")
 
     split_dyn = args.window_size * dyn_vars
-    total_dim = split_dyn + 1 + EXTRA_FEATURE_DIM
+    static_dim = static_cont.shape[1]
+    total_dim = split_dyn + static_dim + 1 + EXTRA_FEATURE_DIM
     x_path = os.path.join(args.output_dir, "X_train.npy")
     y_path = os.path.join(args.output_dir, "y_train.npy")
     meta_path = os.path.join(args.output_dir, "meta_train.csv")
@@ -157,7 +261,6 @@ def write_dataset(args) -> None:
     )
 
     station_order = [str(s) for s in stations]
-    station_indices = np.arange(ns, dtype=np.float32)
     write_pos = 0
 
     print(
@@ -185,8 +288,9 @@ def write_dataset(args) -> None:
             local_time_offset_hours=args.local_time_offset_hours,
         )
         extra = np.concatenate([fog_features, cyc], axis=1).astype(np.float32)
-        station_col = np.tile(station_indices, local_count).reshape(-1, 1)
-        raw_rows = np.concatenate([dyn_flat, station_col, extra], axis=1).astype(np.float32)
+        static_tile = np.tile(static_cont, (local_count, 1))
+        veg_col = np.tile(veg_idx, local_count).reshape(-1, 1)
+        raw_rows = np.concatenate([dyn_flat, static_tile, veg_col, extra], axis=1).astype(np.float32)
 
         row0, row1 = w0 * ns, w1 * ns
         keep = valid_mask[row0:row1]
@@ -196,7 +300,7 @@ def write_dataset(args) -> None:
             write_pos += n_keep
             x_mm.flush()
 
-        del cube_sl, raw, wins, x_chunk_win, dyn_flat, fog_features, cyc, extra, raw_rows
+        del cube_sl, raw, wins, x_chunk_win, dyn_flat, fog_features, cyc, extra, static_tile, veg_col, raw_rows
         gc.collect()
 
     del x_mm
@@ -207,12 +311,16 @@ def write_dataset(args) -> None:
 
     all_times = np.repeat(sample_times.to_numpy(), ns)
     all_stations = np.tile(np.asarray(station_order, dtype=object), n_wins)
-    all_station_idx = np.tile(np.arange(ns, dtype=np.int32), n_wins)
+    all_station_idx = np.tile(station_table["num_station"].to_numpy(dtype=np.int32), n_wins) if "num_station" in station_table else np.tile(np.arange(ns, dtype=np.int32), n_wins)
+    all_lats = np.tile(latitudes, n_wins)
+    all_lons = np.tile(longitudes, n_wins)
     meta_df = pd.DataFrame(
         {
             "time": all_times[valid_mask],
             "station": all_stations[valid_mask],
             "station_idx": all_station_idx[valid_mask],
+            "lat": all_lats[valid_mask],
+            "lon": all_lons[valid_mask],
         }
     )
     meta_df.to_csv(meta_path, index=False)
@@ -222,6 +330,9 @@ def write_dataset(args) -> None:
         "created_at": datetime.utcnow().isoformat() + "Z",
         "visibility_file": args.visibility_file,
         "weather_file": args.weather_file,
+        "station_file": args.station_file,
+        "vegetation_file": args.vegetation_file,
+        "orography_file": args.orography_file,
         "visibility_variable": visibility_var,
         "visibility_unit_handling": visibility_unit,
         "output_dir": args.output_dir,
@@ -233,14 +344,25 @@ def write_dataset(args) -> None:
         "dyn_vars_count": int(dyn_vars),
         "extra_feature_dim": int(EXTRA_FEATURE_DIM),
         "layout": {
-            "X": "dyn_window_flat, station_idx, engineered_features",
+            "X": "dyn_window_flat, static_continuous_5, vegetation_index, engineered_features",
             "dyn_window_flat_dim": int(split_dyn),
-            "station_idx_dim": 1,
+            "static_continuous_dim": int(static_dim),
+            "vegetation_index_dim": 1,
             "engineered_feature_dim": int(EXTRA_FEATURE_DIM),
             "total_dim": int(total_dim),
         },
         "fill_values": fill_values,
         "station_order": station_order,
+        "station_static": {
+            str(row.station_name): {
+                "num_station": int(row.num_station) if "num_station" in station_table.columns else int(i),
+                "lat": float(row.station_lat),
+                "lon": float(row.station_lon),
+                "static_continuous": [float(v) for v in static_cont[i]],
+                "vegetation_index": int(veg_idx[i]),
+            }
+            for i, row in station_table.iterrows()
+        },
         "n_times_aligned": int(nt),
         "n_stations": int(ns),
         "n_windows": int(n_wins),
@@ -271,6 +393,9 @@ def parse_args():
     parser.add_argument("--visibility-file", default=DEFAULT_VISIBILITY_FILE)
     parser.add_argument("--weather-file", default=DEFAULT_WEATHER_FILE)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--station-file", default=DEFAULT_STATION_FILE)
+    parser.add_argument("--vegetation-file", default=DEFAULT_VEG_FILE)
+    parser.add_argument("--orography-file", default=DEFAULT_ORO_FILE)
     parser.add_argument("--visibility-var", default="visibility")
     parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     parser.add_argument("--step-size", type=int, default=1)
