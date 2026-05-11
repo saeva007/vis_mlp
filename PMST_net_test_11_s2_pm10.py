@@ -36,7 +36,7 @@ CONFIG = {
     # ========== 实验控制 ==========
     # 建议：S1 训练完成后将 S1_BEST_CKPT_PATH 指向对应 best_score.pt（勿重复定义 EXPERIMENT_ID）
     'EXPERIMENT_ID':           'exp_1776227576',
-    'S2_RUN_SUFFIX':           'pm10_more_temp_search',
+    'S2_RUN_SUFFIX':           'pm10_more_temp_search_utc',
     'BASE_PATH':              BASE_PATH,
     'WINDOW_SIZE':            TARGET_WINDOW_SIZE,
     'S1_DATA_DIR':            S1_DIR,
@@ -982,9 +982,10 @@ def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
 
     # 与无 pm10 的 S2 区分开，避免混用 scaler
     # include dyn_vars_count in scaler cache filename to prevent stale shape mismatch
+    scaler_tag = str(exp_id or CONFIG.get('EXPERIMENT_ID', 's2')).replace(os.sep, "_")
     scaler_path = os.path.join(
         CONFIG['SAVE_CKPT_DIR'],
-        f'robust_scaler_w{win_size}_dyn{dyn_vars_count}_s2_48h_pm10.pkl'
+        f'robust_scaler_{scaler_tag}_w{win_size}_dyn{dyn_vars_count}_s2_48h_pm10.pkl'
     )
 
     if scaler is None and not reuse_scaler:
