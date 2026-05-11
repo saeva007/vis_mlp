@@ -279,7 +279,7 @@ def main():
         ds_vis = xr.open_dataset(VIS_SOURCE_NC, engine="h5netcdf")
         if "vis" in ds_vis:
             ds_vis = ds_vis.rename({"vis": "visibility"})
-        ds_vis = ds_vis.assign_coords(time=ds_vis.time - pd.Timedelta(hours=8))
+        print("[Time Alignment] Visibility source raw time is UTC; no shift applied.", flush=True)
         vis_da = ds_vis["visibility"]
 
     run_list = get_run_list_from_current_48h()

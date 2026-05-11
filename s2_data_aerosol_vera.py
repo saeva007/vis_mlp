@@ -640,8 +640,10 @@ def main():
     data_veg = xr.open_dataset(VEG_FILE, engine="h5netcdf")
     data_oro = xr.open_dataset(ORO_FILE, engine="h5netcdf")
     ds_in = xr.open_dataset(INPUT_FILE, engine="h5netcdf")
-    print("[Time Alignment] Tianji (BJT) -> UTC...", flush=True)
-    ds_in = ds_in.assign_coords(time=ds_in.time - pd.Timedelta(hours=8))
+    print(
+        "[Time Alignment] merged_final_all_vars.nc raw time is UTC; no shift applied.",
+        flush=True,
+    )
 
     pm10_da = load_pm10_dataarray()
     pm25_da = load_pm25_dataarray()

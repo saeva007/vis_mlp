@@ -303,8 +303,7 @@ def main():
     data_oro = xr.open_dataset(ORO_FILE, engine='h5netcdf')
     ds_in = xr.open_dataset(INPUT_FILE, engine='h5netcdf')
 
-    print("[Time Alignment] Tianji (BJT) -> UTC...")
-    ds_in = ds_in.assign_coords(time=ds_in.time - pd.Timedelta(hours=8))
+    print("[Time Alignment] merged_final_all_vars.nc raw time is UTC; no shift applied.")
 
     # 合并 PM10 变量（如存在），按 (time, station_id) 对齐
     if os.path.isdir(PM10_DIR):
