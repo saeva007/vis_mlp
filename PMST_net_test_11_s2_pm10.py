@@ -46,10 +46,10 @@ CONFIG = {
     'SAVE_CKPT_DIR':          os.path.join(BASE_PATH, 'checkpoints'),
 
     # ========== Stage 1 已完成，指定要加载的 S1 最优权重路径 ==========
-    # 使用 PMST_net_test_10_s1_pm10.py 训练得到的 S1 best_score.pt（或设为 None 随机初始化）
+    # 使用最新 s1.py / PMST_net_test_10_s1_pm10.py 训练得到的 S1 best_score.pt（或设为 None 随机初始化）
     #'S1_BEST_CKPT_PATH': '/public/home/putianshu/vis_mlp/checkpoints/exp_1773802782_S1_best_score.pt',
     #'S1_BEST_CKPT_PATH': '/public/home/putianshu/vis_mlp/checkpoints/exp_1774062853_S1_best_score.pt',
-     'S1_BEST_CKPT_PATH': '/public/home/putianshu/vis_mlp/checkpoints/exp_1776227576_S1_best_score.pt',
+     'S1_BEST_CKPT_PATH': '/public/home/putianshu/vis_mlp/checkpoints/exp_1778563813_S1_best_score.pt',
 
     # ==========================================
     # Stage 2 Phase A1 配置 (Exp4: 3-phase unfreezing)
