@@ -38,7 +38,7 @@ CONFIG = {
     # ========== 实验控制 ==========
     # 建议：S1 训练完成后将 S1_BEST_CKPT_PATH 指向对应 best_score.pt（勿重复定义 EXPERIMENT_ID）
     'EXPERIMENT_ID':           'exp_1776227576',
-    'S2_RUN_SUFFIX':           'pm10_pm25_mistfix_monthtail',
+    'S2_RUN_SUFFIX':           'pm10_pm25_mist_csi_guard_monthtail',
     'BASE_PATH':              BASE_PATH,
     'WINDOW_SIZE':            TARGET_WINDOW_SIZE,
     'S1_DATA_DIR':            S1_DIR,
@@ -73,10 +73,11 @@ CONFIG = {
     # ==========================================
     # [修改] 采样比例：降低雾/薄雾过采样比例，使批次中晴天样本占比上升
     # 根因：原25/20%的过采样配合高类别权重，造成模型极度偏向低能见度预测
-    # 修复：调回18/18%，批次中晴天样本占~64%，与现实分布更接近
+    # CSI guard: keep the original stronger Mist sampling pressure so the
+    # threshold search has usable Mist probability mass to work with.
     # ==========================================
     'S2_FOG_RATIO':            0.18,
-    'S2_MIST_RATIO':           0.18,    # Mist false alarms high in test_11; reduce oversampling pressure.
+    'S2_MIST_RATIO':           0.22,    # Restore Mist sampling pressure; precision is handled by score/threshold guards.
 
     # ==========================================
     # Stage 2 Phase B 配置
@@ -106,16 +107,16 @@ CONFIG = {
     'S2_BINARY_POS_WEIGHT':     1.5,
 
     # S2专用细粒度类别权重 (Exp1: 重新平衡，大幅提升mist权重)
-    'S2_FINE_CLASS_WEIGHT_FOG':   1.6,
-    'S2_FINE_CLASS_WEIGHT_MIST':  1.5,
-    'S2_FINE_CLASS_WEIGHT_CLEAR': 1.0,
+    'S2_FINE_CLASS_WEIGHT_FOG':   1.8,
+    'S2_FINE_CLASS_WEIGHT_MIST':  2.0,
+    'S2_FINE_CLASS_WEIGHT_CLEAR': 0.8,
 
     # S2专用损失系数
     'S2_LOSS_ALPHA_BINARY':    0.7,
     'S2_LOSS_ALPHA_FINE':      1.0,
     'S2_LOSS_ALPHA_FP':        5.0,
     'S2_LOSS_ALPHA_FOG_BOOST': 0.4,     # Exp1: was 0.3
-    'S2_LOSS_ALPHA_MIST_BOOST':0.35,    # Reduce clear->mist false alarms; keep some recall support.
+    'S2_LOSS_ALPHA_MIST_BOOST':0.6,     # Keep Mist recall pressure; avoid the near-zero Mist-R collapse.
 
     # 晴天边界校准损失
     'S2_CLEAR_MARGIN':              0.20,   # Exp1: was 0.25 (更紧的边界)
@@ -126,22 +127,22 @@ CONFIG = {
     'S2_LOSS_ALPHA_PAIR_MARGIN':    0.3,
 
     # ========== 评估约束条件 ==========
-    'MIN_FOG_PRECISION':      0.18,
+    'MIN_FOG_PRECISION':      0.14,
     'MIN_FOG_RECALL':         0.50,
-    'MIN_MIST_PRECISION':     0.16,
+    'MIN_MIST_PRECISION':     0.10,
     'MIN_MIST_RECALL':        0.20,
     'MIN_CLEAR_ACC':          0.92,
     # 季节阈值搜索：分级精确率 + Mist_R 保底 + mist_th 上限，避免 JJA 被压死召回
-    'SEASON_MIST_PRECISION_STRICT':  0.20,
-    'SEASON_MIST_PRECISION_RELAXED': 0.20,
-    'SEASON_MIST_PRECISION_BY_SEASON': {'DJF': 0.20, 'MAM': 0.18, 'JJA': 0.14, 'SON': 0.18},
-    'SEASON_MIST_RECALL_MIN_BY_SEASON': {'DJF': 0.10, 'MAM': 0.08, 'JJA': 0.08, 'SON': 0.08},
+    'SEASON_MIST_PRECISION_STRICT':  0.12,
+    'SEASON_MIST_PRECISION_RELAXED': 0.10,
+    'SEASON_MIST_PRECISION_BY_SEASON': {'DJF': 0.12, 'MAM': 0.11, 'JJA': 0.10, 'SON': 0.11},
+    'SEASON_MIST_RECALL_MIN_BY_SEASON': {'DJF': 0.16, 'MAM': 0.12, 'JJA': 0.10, 'SON': 0.12},
     'SEASON_MIST_THRESHOLD_MAX_BY_SEASON': {'DJF': 0.70, 'MAM': 0.70, 'JJA': 0.70, 'SON': 0.70},
-    'SEASON_MIST_PRECISION_DJF':     0.20,
-    'SEASON_MIST_PRECISION_MAM':     0.18,
-    'SEASON_MIST_PRECISION_JJA':     0.14,
-    'SEASON_MIST_PRECISION_SON':     0.18,
-    'SEASON_MIST_RECALL_DJF':        0.20,
+    'SEASON_MIST_PRECISION_DJF':     0.12,
+    'SEASON_MIST_PRECISION_MAM':     0.11,
+    'SEASON_MIST_PRECISION_JJA':     0.10,
+    'SEASON_MIST_PRECISION_SON':     0.11,
+    'SEASON_MIST_RECALL_DJF':        0.16,
     'SEASON_MIST_RECALL_MAM':        0.12,
     'SEASON_MIST_RECALL_JJA':        0.08,
     'SEASON_MIST_RECALL_SON':        0.12,
@@ -201,24 +202,28 @@ CONFIG = {
     'VAL_SPLIT_RATIO':        0.0,  # Unused: S2 month-tail val/test files are loaded explicitly.
 
     # ========== target_achievement 权重 ==========
-    # Mist-fix: rank checkpoints by F-beta/F1 skill and false-alarm control,
-    # not by recall-only targets that accept Mist_P≈0.10.  Beta=1.5 keeps
-    # recall important while still penalising the false alarms hurting Mist.
+    # Mist CSI guard: rank checkpoints by recall-sensitive F-beta plus CSI.
+    # FPR is a penalty only when it exceeds the business guardrail; otherwise
+    # the score does not reward the degenerate "predict almost no Mist" solution.
     'TARGET_FBETA_BETA':         1.5,
     'TARGET_FOG_FBETA_GOAL':     0.45,
-    'TARGET_MIST_FBETA_GOAL':    0.25,
+    'TARGET_MIST_FBETA_GOAL':    0.20,
+    'TARGET_FOG_CSI_GOAL':       0.20,
+    'TARGET_MIST_CSI_GOAL':      0.09,
     'TARGET_LOW_VIS_F1_GOAL':    0.32,
     'TARGET_MIST_RECALL_GOAL':   0.45,
-    'TARGET_FPR_GOAL':           0.06,
-    'TARGET_W_FOG_FBETA':        0.25,
-    'TARGET_W_MIST_FBETA':       0.35,
-    'TARGET_W_LOW_VIS_F1':       0.20,
-    'TARGET_W_MIST_RECALL':      0.05,
-    'TARGET_W_FPR':              0.15,
+    'TARGET_FPR_GOAL':           0.08,
+    'TARGET_W_FOG_FBETA':        0.12,
+    'TARGET_W_MIST_FBETA':       0.22,
+    'TARGET_W_FOG_CSI':          0.10,
+    'TARGET_W_MIST_CSI':         0.20,
+    'TARGET_W_LOW_VIS_F1':       0.10,
+    'TARGET_W_MIST_RECALL':      0.21,
+    'TARGET_W_FPR_PENALTY':      0.12,
 
     # ========== Inference gating / threshold selection ==========
-    'USE_BINARY_GATE_FOR_EVAL':  True,
-    'BINARY_GATE_THRESHOLD':     0.50,
+    'USE_BINARY_GATE_FOR_EVAL':  False,
+    'BINARY_GATE_THRESHOLD':     0.45,
     'SEASON_SCORE_MIN_DELTA':    0.005,
     'SEASON_REQUIRE_MIST_CSI_NOT_WORSE': True,
 
@@ -1136,14 +1141,17 @@ def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
 
 def compute_target_achievement(metrics: dict, cfg: dict) -> float:
     fpr_goal = max(float(cfg['TARGET_FPR_GOAL']), 1e-6)
-    ta = (
+    skill = (
         min(metrics['Fog_Fbeta']       / cfg['TARGET_FOG_FBETA_GOAL'],   1.0) * cfg['TARGET_W_FOG_FBETA'] +
         min(metrics['Mist_Fbeta']      / cfg['TARGET_MIST_FBETA_GOAL'],  1.0) * cfg['TARGET_W_MIST_FBETA'] +
+        min(metrics['Fog_CSI']         / cfg['TARGET_FOG_CSI_GOAL'],     1.0) * cfg['TARGET_W_FOG_CSI'] +
+        min(metrics['Mist_CSI']        / cfg['TARGET_MIST_CSI_GOAL'],    1.0) * cfg['TARGET_W_MIST_CSI'] +
         min(metrics['low_vis_f1']      / cfg['TARGET_LOW_VIS_F1_GOAL'],  1.0) * cfg['TARGET_W_LOW_VIS_F1'] +
-        min(metrics['Mist_R']          / cfg['TARGET_MIST_RECALL_GOAL'], 1.0) * cfg['TARGET_W_MIST_RECALL'] +
-        max(0.0, 1.0 - metrics['false_positive_rate'] / fpr_goal) * cfg['TARGET_W_FPR']
+        min(metrics['Mist_R']          / cfg['TARGET_MIST_RECALL_GOAL'], 1.0) * cfg['TARGET_W_MIST_RECALL']
     )
-    return float(ta)
+    fpr_excess = max(0.0, metrics['false_positive_rate'] - fpr_goal) / fpr_goal
+    penalty = fpr_excess * cfg.get('TARGET_W_FPR_PENALTY', 0.0)
+    return float(max(0.0, skill - penalty))
 
 
 class ComprehensiveMetrics:
@@ -3068,14 +3076,26 @@ def main():
                 'TARGET_FBETA_BETA': CONFIG['TARGET_FBETA_BETA'],
                 'TARGET_FOG_FBETA_GOAL': CONFIG['TARGET_FOG_FBETA_GOAL'],
                 'TARGET_MIST_FBETA_GOAL': CONFIG['TARGET_MIST_FBETA_GOAL'],
+                'TARGET_FOG_CSI_GOAL': CONFIG['TARGET_FOG_CSI_GOAL'],
+                'TARGET_MIST_CSI_GOAL': CONFIG['TARGET_MIST_CSI_GOAL'],
                 'TARGET_LOW_VIS_F1_GOAL': CONFIG['TARGET_LOW_VIS_F1_GOAL'],
                 'TARGET_MIST_RECALL_GOAL': CONFIG['TARGET_MIST_RECALL_GOAL'],
                 'TARGET_FPR_GOAL': CONFIG['TARGET_FPR_GOAL'],
+                'TARGET_W_FOG_FBETA': CONFIG['TARGET_W_FOG_FBETA'],
+                'TARGET_W_MIST_FBETA': CONFIG['TARGET_W_MIST_FBETA'],
+                'TARGET_W_FOG_CSI': CONFIG['TARGET_W_FOG_CSI'],
+                'TARGET_W_MIST_CSI': CONFIG['TARGET_W_MIST_CSI'],
+                'TARGET_W_LOW_VIS_F1': CONFIG['TARGET_W_LOW_VIS_F1'],
+                'TARGET_W_MIST_RECALL': CONFIG['TARGET_W_MIST_RECALL'],
+                'TARGET_W_FPR_PENALTY': CONFIG['TARGET_W_FPR_PENALTY'],
                 'MIN_FOG_PRECISION': CONFIG['MIN_FOG_PRECISION'],
                 'MIN_MIST_PRECISION': CONFIG['MIN_MIST_PRECISION'],
                 'MIN_CLEAR_ACC': CONFIG['MIN_CLEAR_ACC'],
                 'USE_BINARY_GATE_FOR_EVAL': CONFIG['USE_BINARY_GATE_FOR_EVAL'],
                 'BINARY_GATE_THRESHOLD': CONFIG['BINARY_GATE_THRESHOLD'],
+                'S2_MIST_RATIO': CONFIG['S2_MIST_RATIO'],
+                'S2_FINE_CLASS_WEIGHT_MIST': CONFIG['S2_FINE_CLASS_WEIGHT_MIST'],
+                'S2_LOSS_ALPHA_MIST_BOOST': CONFIG['S2_LOSS_ALPHA_MIST_BOOST'],
             },
         }), decision_path)
         print(f"  [Save] Decision thresholds + final test metrics -> {decision_path}", flush=True)
