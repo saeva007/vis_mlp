@@ -108,9 +108,10 @@ CONFIG = {
     'MODEL_NUM_CLASSES':      3,
     'USE_FEATURE_ENGINEERING':True,
     # dyn feature count per timestep:
-    # - existing ERA5 derived dyn vars = 25
-    # - appended pm10 as the last dyn var => +1
-    'DYN_VARS_COUNT':          26,
+    # - current PM10+PM2.5 data is usually 27 dims
+    #   (24 base vars + zenith + PM10 + PM2.5)
+    # - load_data() still re-infers this from X_train.npy.
+    'DYN_VARS_COUNT':          27,
     # NOTE:
     # - PMST_s1_data_pm10.ipynb 会在 fe_with_time(=compute_fog_features + time_feat) 之后
     #   额外拼接 1 维 pm10，因此 extra_dim 实际应为 37（32+4+1）。
@@ -120,9 +121,8 @@ CONFIG = {
     'FE_EXTRA_DIMS':          36,
     'GRAD_CLIP_NORM':         0.5,
     'REG_LOSS_ALPHA':         0.1,
-    # 已弃用：验证集为数据目录中的 X_val.npy / y_val.npy
     # 已弃用：验证集固定为数据目录中的 X_val.npy / y_val.npy（与 PMST_s1_data_pm10.ipynb 月内划分一致）
-    'VAL_SPLIT_RATIO':        0.1,
+    'VAL_SPLIT_RATIO':        0.0,
 
     # ========== target_achievement 权重 ==========
     'TARGET_RECALL_500_GOAL':    0.65,
@@ -614,10 +614,15 @@ class ImprovedDualStreamPMSTNet(nn.Module):
         super().__init__()
         self.dyn_vars = dyn_vars_count
         self.window   = window_size
-        # 与 S2 对齐的时序变量子集（包含 dpd/inversion 等边界分离信息）
-        # temporal inputs for GRU (order matters only by selection)
-        # pm10 is appended as the last dyn var (index dyn_vars_count-1).
-        self.temporal_var_indices = [0, 1, 2, 4, 6, 10, 22, 23, 12, 11, 13, 15, 14, self.dyn_vars - 1]
+        # 与 S2 对齐的时序变量子集（包含 dpd/inversion 等边界分离信息）。
+        # 27 维 PM10+PM2.5 布局下，末两维分别为 PM10 与 PM2.5，二者都进入 GRU。
+        aerosol_indices = [self.dyn_vars - 1]
+        if self.dyn_vars >= 27:
+            aerosol_indices = [self.dyn_vars - 2, self.dyn_vars - 1]
+        self.temporal_var_indices = [
+            0, 1, 2, 4, 6, 10, 22, 23, 12, 11, 13, 15, 14,
+            *aerosol_indices
+        ]
 
         # 静态分支
         self.veg_embedding = nn.Embedding(veg_num_classes, 16)
