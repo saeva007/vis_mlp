@@ -196,7 +196,7 @@ CONFIG = {
     'FE_EXTRA_DIMS':          36,
     'GRAD_CLIP_NORM':         0.5,
     'REG_LOSS_ALPHA':         0.1,
-    'VAL_SPLIT_RATIO':        0.1,
+    'VAL_SPLIT_RATIO':        0.0,  # Unused: S2 month-tail val files are loaded explicitly.
 
     # ========== target_achievement 权重 ==========
     'TARGET_RECALL_500_GOAL':    0.65,
@@ -759,8 +759,14 @@ class ImprovedDualStreamPMSTNet(nn.Module):
         super().__init__()
         self.dyn_vars = dyn_vars_count
         self.window   = window_size
-        # temporal inputs for GRU (append pm10 as the last dyn var)
-        self.temporal_var_indices = [0, 1, 2, 4, 6, 10, 22, 23, 12, 11, 13, 15, 14, self.dyn_vars - 1]
+        # temporal inputs for GRU; include both PM10 and PM2.5 for the 27-dim layout.
+        aerosol_indices = [self.dyn_vars - 1]
+        if self.dyn_vars >= 27:
+            aerosol_indices = [self.dyn_vars - 2, self.dyn_vars - 1]
+        self.temporal_var_indices = [
+            0, 1, 2, 4, 6, 10, 22, 23, 12, 11, 13, 15, 14,
+            *aerosol_indices
+        ]
 
         self.veg_embedding = nn.Embedding(veg_num_classes, 16)
         self.static_encoder = nn.Sequential(
@@ -948,17 +954,60 @@ def resolve_feature_layout_from_x_train(data_dir: str, win_size: int):
     return _resolve_dyn_and_fe_dims(int(X_m_shape[1]), win_size)
 
 
+def _labels_from_raw_visibility(y_raw):
+    y_raw = np.asarray(y_raw, dtype=np.float32)
+    if len(y_raw) > 0 and np.nanmax(y_raw) < 100:
+        y_raw = y_raw * 1000.0
+    y_cls = np.zeros(len(y_raw), dtype=np.int64)
+    y_cls[y_raw >= 500] = 1
+    y_cls[y_raw >= 1000] = 2
+    return y_cls, y_raw
+
+
+def _copy_split_files(data_dir, split, rank, local_rank, world_size, exp_id):
+    path_x_src = os.path.join(data_dir, f'X_{split}.npy')
+    path_y_src = os.path.join(data_dir, f'y_{split}.npy')
+    if not os.path.isfile(path_x_src) or not os.path.isfile(path_y_src):
+        raise FileNotFoundError(
+            f"Missing explicit month-tail split files for '{split}' under {data_dir}. "
+            f"Expected X_{split}.npy and y_{split}.npy."
+        )
+    path_x = copy_to_local(path_x_src, rank, local_rank, world_size, exp_id)
+    path_y = copy_to_local(path_y_src, rank, local_rank, world_size, exp_id)
+    return path_x, path_y
+
+
+def _validate_feature_layout(path_X, split, win_size, expected_dyn=None, expected_fe=None):
+    x_shape = np.load(path_X, mmap_mode='r').shape
+    if len(x_shape) != 2:
+        raise ValueError(f"X_{split}.npy must be 2D [N, D], got shape={x_shape}")
+    dyn_vars_count, inferred_extra_dim = _resolve_dyn_and_fe_dims(int(x_shape[1]), win_size)
+    if expected_dyn is not None and dyn_vars_count != expected_dyn:
+        raise ValueError(
+            f"X_{split}.npy dyn layout mismatch: got dyn={dyn_vars_count}, expected {expected_dyn}"
+        )
+    if expected_fe is not None and inferred_extra_dim != expected_fe:
+        raise ValueError(
+            f"X_{split}.npy FE layout mismatch: got FE={inferred_extra_dim}, expected {expected_fe}"
+        )
+    return dyn_vars_count, inferred_extra_dim
+
+
 def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
               reuse_scaler=False, win_size=12, world_size=1, exp_id=None):
-    path_X = copy_to_local(os.path.join(data_dir, 'X_train.npy'), rank, local_rank, world_size, exp_id)
-    path_y = copy_to_local(os.path.join(data_dir, 'y_train.npy'), rank, local_rank, world_size, exp_id)
+    path_X_tr, path_y_tr = _copy_split_files(
+        data_dir, 'train', rank, local_rank, world_size, exp_id
+    )
+    path_X_val, path_y_val = _copy_split_files(
+        data_dir, 'val', rank, local_rank, world_size, exp_id
+    )
 
     # ---- 运行时 shape 校验：保证 extra 维度与模型一致 ----
-    X_m_shape = np.load(path_X, mmap_mode='r').shape
-    if len(X_m_shape) != 2:
-        raise ValueError(f"X_train.npy must be 2D [N, D], got shape={X_m_shape}")
-    total_dim = int(X_m_shape[1])
-    dyn_vars_count, inferred_extra_dim = _resolve_dyn_and_fe_dims(total_dim, win_size)
+    dyn_vars_count, inferred_extra_dim = _validate_feature_layout(
+        path_X_tr, 'train', win_size
+    )
+    _validate_feature_layout(path_X_val, 'val', win_size, dyn_vars_count, inferred_extra_dim)
+
     if rank == 0 and int(CONFIG.get('DYN_VARS_COUNT', dyn_vars_count)) != dyn_vars_count:
         print(
             f"[Data] DYN_VARS_COUNT: CONFIG={CONFIG.get('DYN_VARS_COUNT')} "
@@ -968,17 +1017,14 @@ def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
     CONFIG['DYN_VARS_COUNT'] = int(dyn_vars_count)
     CONFIG['FE_EXTRA_DIMS'] = int(inferred_extra_dim)
     base_dim = int(win_size * dyn_vars_count + 5 + 1)
+    total_dim = int(np.load(path_X_tr, mmap_mode='r').shape[1])
     if base_dim + inferred_extra_dim != total_dim:
         raise ValueError(
             f"Layout check failed: {base_dim}+{inferred_extra_dim} != {total_dim}"
         )
 
-    y_raw = np.load(path_y)
-    y_cls = np.zeros(len(y_raw), dtype=np.int64)
-    if np.max(y_raw) < 100:
-        y_raw = y_raw * 1000
-    y_cls[y_raw >= 500]  = 1
-    y_cls[y_raw >= 1000] = 2
+    y_cls_tr, y_raw_tr = _labels_from_raw_visibility(np.load(path_y_tr))
+    y_cls_val, y_raw_val = _labels_from_raw_visibility(np.load(path_y_val))
 
     # 与无 pm10 的 S2 区分开，避免混用 scaler
     # include dyn_vars_count in scaler cache filename to prevent stale shape mismatch
@@ -994,7 +1040,7 @@ def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
         if rank == 0:
             if not os.path.exists(scaler_path):
                 print("[Scaler] Fitting (first time, will be cached)...", flush=True)
-                X_m = np.load(path_X, mmap_mode='r')
+                X_m = np.load(path_X_tr, mmap_mode='r')
                 n_total     = len(X_m)
                 max_samples = 200000
                 rng_scaler  = np.random.default_rng(seed=42)
@@ -1038,19 +1084,27 @@ def load_data(data_dir, scaler=None, rank=0, local_rank=0, device=None,
 
         scaler = joblib.load(scaler_path)
 
-    n_total = len(y_cls)
-    n_val   = int(n_total * CONFIG['VAL_SPLIT_RATIO'])
-    rng     = np.random.default_rng(seed=42)
-    indices = rng.permutation(n_total)
-
     tr_ds  = PMSTDataset(
-        path_X, y_cls, y_raw, scaler, win_size, True, indices[n_val:],
+        path_X_tr, y_cls_tr, y_raw_tr, scaler, win_size, True, None,
         dyn_vars_count=dyn_vars_count
     )
     val_ds = PMSTDataset(
-        path_X, y_cls, y_raw, scaler, win_size, True, indices[:n_val],
+        path_X_val, y_cls_val, y_raw_val, scaler, win_size, True, None,
         dyn_vars_count=dyn_vars_count
     )
+
+    if rank == 0:
+        for split, y_cls in [('train', y_cls_tr), ('val', y_cls_val)]:
+            counts = np.bincount(y_cls, minlength=3)
+            total = max(int(counts.sum()), 1)
+            ratios = counts / total
+            print(
+                f"[Data] {split}: N={total} | "
+                f"Fog={counts[0]} ({ratios[0]:.4%}) "
+                f"Mist={counts[1]} ({ratios[1]:.4%}) "
+                f"Clear={counts[2]} ({ratios[2]:.4%})",
+                flush=True,
+            )
 
     return tr_ds, val_ds, scaler
 
