@@ -35,7 +35,7 @@ S2_DIR = f"/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_mon
 CONFIG = {
     # ========== 实验控制 ==========
     # 建议：S1 训练完成后将 S1_BEST_CKPT_PATH 指向对应 best_score.pt（勿重复定义 EXPERIMENT_ID）
-    'EXPERIMENT_ID':           'exp_1776227576',
+    'EXPERIMENT_ID':           'exp_1778563813',
     'S2_RUN_SUFFIX':           'pm10_more_temp_search_utc',
     'BASE_PATH':              BASE_PATH,
     'WINDOW_SIZE':            TARGET_WINDOW_SIZE,
