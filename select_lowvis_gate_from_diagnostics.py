@@ -54,7 +54,11 @@ def resolve_diag_dir(path: Path) -> Path:
     if len(matches) == 1:
         return matches[0].parent
     if not matches:
-        raise FileNotFoundError(f"No binary_gate_multiclass_sweep.csv found under {path}")
+        raise FileNotFoundError(
+            f"No binary_gate_multiclass_sweep.csv found under {path}. "
+            "Run diagnose_lowvis_checkpoint_pm10_pm25.py on the validation split first, "
+            "or pass DIAG_DIR/--diag-dir for an exploratory single-directory check."
+        )
     raise RuntimeError(f"Multiple diagnostic directories found under {path}; pass one explicitly.")
 
 
