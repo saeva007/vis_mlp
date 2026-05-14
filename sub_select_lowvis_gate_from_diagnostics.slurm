@@ -22,6 +22,7 @@
 # Useful overrides:
 #   sbatch --export=ALL,RUN_ID=exp_1778563813_pm10_more_temp_search_utc sub_select_lowvis_gate_from_diagnostics.slurm
 #   sbatch --export=ALL,VAL_DIR=diagnostics/my_val_diag,TEST_DIR=diagnostics/my_test_diag sub_select_lowvis_gate_from_diagnostics.slurm
+#   sbatch --export=ALL,DIAG_DIR=/public/home/putianshu/vis_mlp/diagnostics/exp_1778563813_pm10_more_temp_search_utc_test_lowvis_diag sub_select_lowvis_gate_from_diagnostics.slurm
 #   sbatch --export=ALL,MAX_FPR=0.05,GOAL_MIST_RECALL=0.45 sub_select_lowvis_gate_from_diagnostics.slurm
 
 set -euo pipefail
@@ -55,10 +56,11 @@ export MKL_NUM_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 
 RUN_ID="${RUN_ID:-exp_1778563813_pm10_more_temp_search_utc}"
+DIAGNOSTICS_ROOT="${DIAGNOSTICS_ROOT:-/public/home/putianshu/vis_mlp/diagnostics}"
 DIAG_DIR="${DIAG_DIR:-}"
-VAL_DIR="${VAL_DIR:-diagnostics/${RUN_ID}_val_lowvis_diag}"
-TEST_DIR="${TEST_DIR:-diagnostics/${RUN_ID}_test_lowvis_diag}"
-OUT_DIR="${OUT_DIR:-diagnostics/${RUN_ID}_lowvis_gate_selection}"
+VAL_DIR="${VAL_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_val_lowvis_diag}"
+TEST_DIR="${TEST_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_test_lowvis_diag}"
+OUT_DIR="${OUT_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_lowvis_gate_selection}"
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -85,6 +87,7 @@ mkdir -p /public/home/putianshu/vis_mlp/train/logs
 
 echo "SCRIPT_DIR      : ${SCRIPT_DIR}"
 echo "RUN_ID          : ${RUN_ID}"
+echo "DIAGNOSTICS_ROOT: ${DIAGNOSTICS_ROOT}"
 echo "DIAG_DIR        : ${DIAG_DIR:-<unused>}"
 echo "VAL_DIR         : ${VAL_DIR}"
 echo "TEST_DIR        : ${TEST_DIR}"
@@ -93,6 +96,27 @@ echo "DRY_RUN         : ${DRY_RUN}"
 echo "Objective       : lowvis_R=${W_LOWVIS_RECALL}, mist_R=${W_MIST_RECALL}, fog_R=${W_FOG_RECALL}, max_FPR=${MAX_FPR}"
 
 cd "${SCRIPT_DIR}" || exit 1
+
+if [ -n "${DIAG_DIR}" ]; then
+    if [ ! -f "${DIAG_DIR}/binary_gate_multiclass_sweep.csv" ]; then
+        echo "Missing ${DIAG_DIR}/binary_gate_multiclass_sweep.csv"
+        echo "DIAG_DIR mode is only for exploratory scoring of an existing diagnostic directory."
+        exit 2
+    fi
+else
+    if [ ! -f "${VAL_DIR}/binary_gate_multiclass_sweep.csv" ]; then
+        echo "Missing ${VAL_DIR}/binary_gate_multiclass_sweep.csv"
+        echo "Run validation diagnostics before gate selection:"
+        echo "  sbatch --export=ALL,SPLIT=val,OUT_DIR=${VAL_DIR} sub_diagnose_lowvis_checkpoint_pm10_pm25.slurm"
+        exit 2
+    fi
+    if [ -n "${TEST_DIR}" ] && [ ! -f "${TEST_DIR}/binary_gate_multiclass_sweep.csv" ]; then
+        echo "Missing ${TEST_DIR}/binary_gate_multiclass_sweep.csv"
+        echo "Run test diagnostics before applying the validation-selected gate to test:"
+        echo "  sbatch --export=ALL,SPLIT=test,OUT_DIR=${TEST_DIR} sub_diagnose_lowvis_checkpoint_pm10_pm25.slurm"
+        exit 2
+    fi
+fi
 
 args=()
 if [ -n "${DIAG_DIR}" ]; then
