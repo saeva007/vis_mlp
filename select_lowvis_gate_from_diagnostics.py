@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -107,10 +107,40 @@ def score_gate_rows(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         - out["lowvis_precision_penalty"]
         - out["mist_precision_penalty"]
     )
+    out["constraint_fpr_ok"] = out["false_positive_rate"].astype(float) <= args.max_fpr
+    out["constraint_lowvis_precision_ok"] = out["low_vis_precision"].astype(float) >= args.min_lowvis_precision
+    out["constraint_mist_precision_ok"] = out["Mist_P"].astype(float) >= args.min_mist_precision
+    out["constraint_satisfied"] = (
+        out["constraint_fpr_ok"]
+        & out["constraint_lowvis_precision_ok"]
+        & out["constraint_mist_precision_ok"]
+    )
     return out.sort_values(
         ["selection_score", "low_vis_recall", "Mist_R", "low_vis_csi"],
         ascending=[False, False, False, False],
     )
+
+
+def select_validation_row(
+    val_scored: pd.DataFrame, args: argparse.Namespace
+) -> Tuple[pd.Series, str, bool, Optional[str]]:
+    if not args.hard_constraints:
+        selected = val_scored.iloc[0]
+        return selected, "soft_penalty", bool(selected["constraint_satisfied"]), None
+
+    constrained = val_scored[val_scored["constraint_satisfied"]]
+    if not constrained.empty:
+        return constrained.iloc[0], "hard_constraints", True, None
+
+    fallback_reason = (
+        "no validation rows satisfied hard constraints: "
+        f"false_positive_rate <= {args.max_fpr}, "
+        f"low_vis_precision >= {args.min_lowvis_precision}, "
+        f"Mist_P >= {args.min_mist_precision}; "
+        "selected by soft-penalty score instead"
+    )
+    selected = val_scored.iloc[0]
+    return selected, "soft_penalty_fallback", False, fallback_reason
 
 
 def nearest_threshold_row(df: pd.DataFrame, threshold: float) -> pd.Series:
@@ -121,7 +151,13 @@ def nearest_threshold_row(df: pd.DataFrame, threshold: float) -> pd.Series:
 def row_to_dict(row: pd.Series) -> Dict[str, object]:
     out: Dict[str, object] = {}
     for key, value in row.to_dict().items():
-        if isinstance(value, (np.integer, np.floating)):
+        if pd.isna(value):
+            out[key] = None
+        elif isinstance(value, np.bool_):
+            out[key] = bool(value)
+        elif isinstance(value, np.integer):
+            out[key] = int(value)
+        elif isinstance(value, np.floating):
             out[key] = float(value)
         else:
             out[key] = value
@@ -135,6 +171,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--diag-dir", type=Path, default=None, help="Single diagnostic directory for exploratory scoring.")
     ap.add_argument("--out-dir", type=Path, default=None, help="Output directory. Defaults to val/test diag parent.")
     ap.add_argument("--dry-run", action="store_true", help="Print the selection without writing files.")
+    ap.add_argument("--experiment-id", default="", help="Run id written into selected_lowvis_gate.json.")
+    ap.add_argument(
+        "--hard-constraints",
+        action="store_true",
+        help=(
+            "First select only validation rows satisfying max FPR and precision floors; "
+            "fallback to the soft-penalty score if none satisfy them."
+        ),
+    )
 
     ap.add_argument("--goal-lowvis-recall", type=float, default=0.75)
     ap.add_argument("--goal-mist-recall", type=float, default=0.40)
@@ -171,13 +216,18 @@ def main() -> None:
     test_dir: Optional[Path] = resolve_diag_dir(args.test_dir) if args.test_dir else None
 
     val_scored = score_gate_rows(load_gate_sweep(val_dir), args)
-    selected_val = val_scored.iloc[0]
+    selected_val, selection_mode, constraint_satisfied, fallback_reason = select_validation_row(val_scored, args)
     selected_th = float(selected_val["binary_th"])
 
     result = {
+        "experiment_id": args.experiment_id or None,
+        "selection_mode": selection_mode,
+        "constraint_satisfied": constraint_satisfied,
+        "fallback_reason": fallback_reason,
         "selection_source": str(val_dir),
         "selected_binary_threshold": selected_th,
         "selection_objective": {
+            "hard_constraints": args.hard_constraints,
             "goal_lowvis_recall": args.goal_lowvis_recall,
             "goal_mist_recall": args.goal_mist_recall,
             "goal_fog_recall": args.goal_fog_recall,
@@ -196,6 +246,7 @@ def main() -> None:
             },
         },
         "selected_val_row": row_to_dict(selected_val),
+        "applied_test_row": None,
     }
 
     rows = [selected_val]

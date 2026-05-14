@@ -24,6 +24,7 @@
 #   sbatch --export=ALL,VAL_DIR=diagnostics/my_val_diag,TEST_DIR=diagnostics/my_test_diag sub_select_lowvis_gate_from_diagnostics.slurm
 #   sbatch --export=ALL,DIAG_DIR=/public/home/putianshu/vis_mlp/diagnostics/exp_1778563813_pm10_more_temp_search_utc_test_lowvis_diag sub_select_lowvis_gate_from_diagnostics.slurm
 #   sbatch --export=ALL,MAX_FPR=0.05,GOAL_MIST_RECALL=0.45 sub_select_lowvis_gate_from_diagnostics.slurm
+#   sbatch --export=ALL,HARD_CONSTRAINTS=0 sub_select_lowvis_gate_from_diagnostics.slurm
 
 set -euo pipefail
 
@@ -62,6 +63,7 @@ VAL_DIR="${VAL_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_val_lowvis_diag}"
 TEST_DIR="${TEST_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_test_lowvis_diag}"
 OUT_DIR="${OUT_DIR:-${DIAGNOSTICS_ROOT}/${RUN_ID}_lowvis_gate_selection}"
 DRY_RUN="${DRY_RUN:-0}"
+HARD_CONSTRAINTS="${HARD_CONSTRAINTS:-1}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 GOAL_LOWVIS_RECALL="${GOAL_LOWVIS_RECALL:-0.75}"
@@ -93,7 +95,9 @@ echo "VAL_DIR         : ${VAL_DIR}"
 echo "TEST_DIR        : ${TEST_DIR}"
 echo "OUT_DIR         : ${OUT_DIR}"
 echo "DRY_RUN         : ${DRY_RUN}"
-echo "Objective       : lowvis_R=${W_LOWVIS_RECALL}, mist_R=${W_MIST_RECALL}, fog_R=${W_FOG_RECALL}, max_FPR=${MAX_FPR}"
+echo "HARD_CONSTRAINTS: ${HARD_CONSTRAINTS}"
+echo "Goals           : lowvis_R=${GOAL_LOWVIS_RECALL}, mist_R=${GOAL_MIST_RECALL}, fog_R=${GOAL_FOG_RECALL}, max_FPR=${MAX_FPR}"
+echo "Weights         : lowvis_R=${W_LOWVIS_RECALL}, mist_R=${W_MIST_RECALL}, fog_R=${W_FOG_RECALL}"
 
 cd "${SCRIPT_DIR}" || exit 1
 
@@ -129,6 +133,7 @@ else
 fi
 
 args+=(--out-dir "${OUT_DIR}")
+args+=(--experiment-id "${RUN_ID}")
 args+=(--goal-lowvis-recall "${GOAL_LOWVIS_RECALL}")
 args+=(--goal-mist-recall "${GOAL_MIST_RECALL}")
 args+=(--goal-fog-recall "${GOAL_FOG_RECALL}")
@@ -146,6 +151,10 @@ args+=(--w-mist-csi "${W_MIST_CSI}")
 args+=(--w-precision "${W_PRECISION}")
 args+=(--w-fpr-penalty "${W_FPR_PENALTY}")
 args+=(--w-precision-penalty "${W_PRECISION_PENALTY}")
+
+if [[ "${HARD_CONSTRAINTS}" == "1" ]]; then
+    args+=(--hard-constraints)
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     args+=(--dry-run)
