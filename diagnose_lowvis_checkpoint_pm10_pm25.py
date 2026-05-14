@@ -26,6 +26,7 @@ import json
 import math
 import os
 import pickle
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -223,6 +224,57 @@ def load_torch_payload(path: Path):
         return torch.load(path, map_location="cpu")
 
 
+def setup_runtime(args) -> Dict[str, object]:
+    torch, _ = ensure_torch()
+    env_world = int(os.environ.get("WORLD_SIZE", "1"))
+    env_rank = int(os.environ.get("RANK", "0"))
+    env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = bool(args.distributed or env_world > 1)
+
+    if distributed:
+        if env_world <= 1:
+            raise RuntimeError("--distributed was set but WORLD_SIZE<=1; launch with torchrun.")
+        local_rank = args.local_rank if args.local_rank is not None else env_local_rank
+        if args.device == "cpu" or not torch.cuda.is_available():
+            device = torch.device("cpu")
+            backend = "gloo"
+        else:
+            n_dev = max(torch.cuda.device_count(), 1)
+            torch.cuda.set_device(local_rank % n_dev)
+            device = torch.device("cuda", local_rank % n_dev)
+            backend = "nccl"
+        import torch.distributed as dist
+
+        dist.init_process_group(backend=backend, init_method="env://")
+        return {
+            "distributed": True,
+            "rank": env_rank,
+            "world_size": env_world,
+            "local_rank": local_rank,
+            "device": device,
+            "dist": dist,
+        }
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    return {
+        "distributed": False,
+        "rank": 0,
+        "world_size": 1,
+        "local_rank": 0,
+        "device": device,
+        "dist": None,
+    }
+
+
+def shard_bounds(n_total: int, rank: int, world_size: int) -> Tuple[int, int]:
+    start = (int(n_total) * int(rank)) // int(world_size)
+    end = (int(n_total) * (int(rank) + 1)) // int(world_size)
+    return start, end
+
+
 def run_inference(
     x_path: Path,
     scaler,
@@ -232,19 +284,22 @@ def run_inference(
     window_size: int,
     dyn_vars_count: int,
     extra_feat_dim: int,
-    limit_samples: int,
+    start_index: int,
+    end_index: int,
     temperature: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     torch, F = ensure_torch()
     X = np.load(x_path, mmap_mode="r")
-    n = len(X) if not limit_samples or limit_samples <= 0 else min(int(limit_samples), len(X))
+    start_index = int(start_index)
+    end_index = int(end_index)
+    n = max(0, end_index - start_index)
     probs_out: List[np.ndarray] = []
     low_out: List[np.ndarray] = []
     model.eval()
     temp = max(float(temperature), 1e-6)
 
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
+    for start in range(start_index, end_index, batch_size):
+        end = min(start + batch_size, end_index)
         rows = np.asarray(X[start:end], dtype=np.float32)
         final = prepare_batch_rows(rows, scaler, window_size, dyn_vars_count, extra_feat_dim)
         x = torch.from_numpy(final).float().to(device, non_blocking=(device.type == "cuda"))
@@ -254,8 +309,9 @@ def run_inference(
             low_prob = torch.sigmoid(low_logit).reshape(-1)
         probs_out.append(probs.detach().cpu().numpy().astype(np.float32))
         low_out.append(low_prob.detach().cpu().numpy().astype(np.float32))
-        if start == 0 or end == n or (start // max(batch_size, 1)) % 20 == 0:
-            print(f"[inference] {end:,}/{n:,}", flush=True)
+        done = end - start_index
+        if start == start_index or end == end_index or (done // max(batch_size, 1)) % 20 == 0:
+            print(f"[inference] local {done:,}/{n:,} global {end:,}", flush=True)
 
     if not probs_out:
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
@@ -495,6 +551,74 @@ def load_months(data_dir: Path, split: str, X, window_size: int, dyn: int, fe: i
     return month
 
 
+def load_months_from_features(X, start: int, end: int, window_size: int, dyn: int, fe: int) -> np.ndarray:
+    split_dyn = window_size * dyn
+    extra_start = split_dyn + 6
+    if fe < 4:
+        raise ValueError("FE dim < 4; cannot recover month_sin/month_cos from feature block.")
+    month_sin = np.asarray(X[start:end, extra_start + fe - 4], dtype=np.float64)
+    month_cos = np.asarray(X[start:end, extra_start + fe - 3], dtype=np.float64)
+    angle = np.arctan2(month_sin, month_cos)
+    angle = np.where(angle < 0, angle + 2 * np.pi, angle)
+    month = np.round(angle * 6 / np.pi).astype(np.int64)
+    return np.where(month == 0, 12, month)
+
+
+def load_months_slice(data_dir: Path, split: str, X, window_size: int, dyn: int, fe: int, start: int, end: int) -> np.ndarray:
+    for name in (f"month_{split}.npy", f"months_{split}.npy"):
+        path = data_dir / name
+        if path.exists():
+            return np.asarray(np.load(path, mmap_mode="r")[start:end], dtype=np.int64)
+    return load_months_from_features(X, start, end, window_size, dyn, fe)
+
+
+def write_rank_part(
+    part_dir: Path,
+    rank: int,
+    probs: np.ndarray,
+    low_prob: np.ndarray,
+    y_cls: np.ndarray,
+    y_raw: np.ndarray,
+    months: np.ndarray,
+) -> Path:
+    part_dir.mkdir(parents=True, exist_ok=True)
+    path = part_dir / f"rank_{rank:05d}.npz"
+    np.savez(
+        path,
+        probs=probs,
+        low_prob=low_prob,
+        y_cls=y_cls,
+        y_raw=y_raw,
+        months=months,
+    )
+    return path
+
+
+def read_rank_parts(part_dir: Path, world_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    probs_l, low_l, cls_l, raw_l, months_l = [], [], [], [], []
+    missing = []
+    for rank in range(world_size):
+        path = part_dir / f"rank_{rank:05d}.npz"
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        with np.load(path) as z:
+            probs_l.append(np.asarray(z["probs"], dtype=np.float32))
+            low_l.append(np.asarray(z["low_prob"], dtype=np.float32))
+            cls_l.append(np.asarray(z["y_cls"], dtype=np.int64))
+            raw_l.append(np.asarray(z["y_raw"], dtype=np.float32))
+            months_l.append(np.asarray(z["months"], dtype=np.int64))
+    if missing:
+        raise FileNotFoundError("Missing distributed rank part files: " + ", ".join(missing[:5]))
+    return (
+        np.concatenate(probs_l, axis=0),
+        np.concatenate(low_l, axis=0),
+        np.concatenate(cls_l, axis=0),
+        np.concatenate(raw_l, axis=0),
+        np.concatenate(months_l, axis=0),
+    )
+
+
 def load_season_thresholds(path: Optional[Path]) -> Tuple[Optional[dict], Optional[float]]:
     if path is None or not path.exists():
         return None, None
@@ -686,12 +810,19 @@ def parse_args():
     ap.add_argument("--threshold-rule", choices=["mutual", "default", "joint", "argmax"], default="mutual")
     ap.add_argument("--use-calibration", action="store_true", help="Use temperature from --season-th-path when present.")
     ap.add_argument("--skip-fine-grid", action="store_true", help="Skip 676-combination fine-threshold sweep.")
+    ap.add_argument("--distributed", action="store_true", help="Shard inference across torchrun ranks.")
+    ap.add_argument("--local-rank", "--local_rank", type=int, default=None, help="Local rank supplied by torchrun.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
     torch, _ = ensure_torch()
+    runtime = setup_runtime(args)
+    rank = int(runtime["rank"])
+    world_size = int(runtime["world_size"])
+    device = runtime["device"]
+    dist = runtime["dist"]
     base = Path(args.base)
     data_dir = abs_under_base(base, args.data_dir)
     ckpt_path = abs_under_base(base, args.ckpt_path)
@@ -702,6 +833,12 @@ def main():
         model_py = abs_under_base(base, args.model_py)
     out_dir = abs_under_base(base, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    part_dir = out_dir / "_rank_parts"
+    if world_size > 1:
+        assert dist is not None
+        if rank == 0 and part_dir.exists():
+            shutil.rmtree(part_dir)
+        dist.barrier()
 
     x_path = data_dir / f"X_{args.split}.npy"
     y_path = data_dir / f"y_{args.split}.npy"
@@ -709,25 +846,16 @@ def main():
         raise FileNotFoundError(f"Missing split files: {x_path} / {y_path}")
 
     X = np.load(x_path, mmap_mode="r")
-    n = len(X) if not args.limit_samples or args.limit_samples <= 0 else min(int(args.limit_samples), len(X))
+    n_total = len(X) if not args.limit_samples or args.limit_samples <= 0 else min(int(args.limit_samples), len(X))
     dyn, fe = infer_feature_layout(int(X.shape[1]), args.window_size, args.dyn_vars_count, args.extra_feat_dim)
-    y_cls, y_raw = visibility_to_class(np.load(y_path, mmap_mode="r")[:n])
-    valid = y_cls >= 0
-    if not np.all(valid):
-        print(f"[warn] dropping invalid labels: {int((~valid).sum())}", flush=True)
-
-    months = load_months(data_dir, args.split, X, args.window_size, dyn, fe, n)
-    months = months[:n]
+    start_idx, end_idx = shard_bounds(n_total, rank, world_size)
+    y_cls_part, y_raw_part = visibility_to_class(np.load(y_path, mmap_mode="r")[start_idx:end_idx])
+    months_part = load_months_slice(data_dir, args.split, X, args.window_size, dyn, fe, start_idx, end_idx)
     season_thresholds, season_temp = load_season_thresholds(season_path)
     temperature = float(season_temp) if args.use_calibration and season_temp is not None else 1.0
 
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
-
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
 
     model_cls = import_model_class(model_py)
     model = model_cls(
@@ -740,11 +868,12 @@ def main():
     load_checkpoint_into_model(model, ckpt_path, device)
 
     print(
-        f"[setup] split={args.split} n={n:,} dyn={dyn} fe={fe} "
-        f"device={device} temp={temperature:.4f}",
+        f"[setup rank={rank}/{world_size}] split={args.split} n_total={n_total:,} "
+        f"shard=[{start_idx:,},{end_idx:,}) dyn={dyn} fe={fe} device={device} "
+        f"temp={temperature:.4f}",
         flush=True,
     )
-    probs, low_prob = run_inference(
+    probs_part, low_prob_part = run_inference(
         x_path,
         scaler,
         model,
@@ -753,14 +882,32 @@ def main():
         args.window_size,
         dyn,
         fe,
-        args.limit_samples,
+        start_idx,
+        end_idx,
         temperature,
     )
-    probs = probs[valid]
-    low_prob = low_prob[valid]
-    y_cls = y_cls[valid]
-    y_raw = y_raw[valid]
-    months = months[valid]
+
+    valid_part = y_cls_part >= 0
+    if not np.all(valid_part):
+        print(f"[warn rank={rank}] dropping invalid labels: {int((~valid_part).sum())}", flush=True)
+    probs_part = probs_part[valid_part]
+    low_prob_part = low_prob_part[valid_part]
+    y_cls_part = y_cls_part[valid_part]
+    y_raw_part = y_raw_part[valid_part]
+    months_part = months_part[valid_part]
+
+    if world_size > 1:
+        write_rank_part(part_dir, rank, probs_part, low_prob_part, y_cls_part, y_raw_part, months_part)
+        assert dist is not None
+        dist.barrier()
+        if rank != 0:
+            dist.destroy_process_group()
+            print(f"[done rank={rank}] wrote shard and exited after rank0 barrier", flush=True)
+            return
+        probs, low_prob, y_cls, y_raw, months = read_rank_parts(part_dir, world_size)
+    else:
+        probs, low_prob, y_cls, y_raw, months = probs_part, low_prob_part, y_cls_part, y_raw_part, months_part
+
     fine_low_mass = np.clip(probs[:, 0] + probs[:, 1], 0.0, 1.0)
 
     current_pred = pred_from_rule(probs, args.fog_th, args.mist_th, args.threshold_rule)
@@ -878,12 +1025,16 @@ def main():
         "mist_threshold": args.mist_th,
         "threshold_rule": args.threshold_rule,
         "output_dir": str(out_dir),
+        "world_size": world_size,
+        "rank_parts_dir": str(part_dir) if world_size > 1 else None,
     }
     with open(out_dir / "diagnostic_summary.json", "w", encoding="utf-8") as f:
         json.dump(json_clean(summary), f, indent=2)
 
     write_report(out_dir, args, summary, metric_df, mist_breakdown, binary_df, gate_df, season_df)
     print(f"[done] diagnostics written to {out_dir}", flush=True)
+    if world_size > 1 and dist is not None:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
