@@ -224,6 +224,31 @@ def load_torch_payload(path: Path):
         return torch.load(path, map_location="cpu")
 
 
+def load_scaler(path: Path):
+    joblib_error = None
+    try:
+        import joblib
+
+        scaler = joblib.load(path)
+        loader = "joblib"
+    except Exception as exc:
+        joblib_error = exc
+        try:
+            with open(path, "rb") as f:
+                scaler = pickle.load(f)
+            loader = "pickle"
+        except Exception as pickle_error:
+            raise RuntimeError(
+                f"Failed to load scaler {path}. "
+                f"joblib.load error: {joblib_error!r}; pickle.load error: {pickle_error!r}"
+            ) from pickle_error
+
+    if not hasattr(scaler, "center_") or not hasattr(scaler, "scale_"):
+        raise TypeError(f"Loaded scaler from {path} with {loader}, but it lacks center_/scale_.")
+    print(f"[scaler] loaded with {loader}: {path}", flush=True)
+    return scaler
+
+
 def setup_runtime(args) -> Dict[str, object]:
     torch, _ = ensure_torch()
     env_world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -242,7 +267,9 @@ def setup_runtime(args) -> Dict[str, object]:
             n_dev = max(torch.cuda.device_count(), 1)
             torch.cuda.set_device(local_rank % n_dev)
             device = torch.device("cuda", local_rank % n_dev)
-            backend = "nccl"
+            backend = "nccl" if args.dist_backend == "nccl" else "gloo"
+        if args.dist_backend == "nccl" and device.type != "cuda":
+            raise RuntimeError("--dist-backend nccl requires a CUDA/DCU device.")
         import torch.distributed as dist
 
         dist.init_process_group(backend=backend, init_method="env://")
@@ -267,6 +294,22 @@ def setup_runtime(args) -> Dict[str, object]:
         "device": device,
         "dist": None,
     }
+
+
+def dist_barrier(dist, device) -> None:
+    if dist is None:
+        return
+    try:
+        backend = dist.get_backend()
+    except Exception:
+        backend = ""
+    if backend == "nccl" and getattr(device, "type", None) == "cuda":
+        try:
+            dist.barrier(device_ids=[int(device.index or 0)])
+            return
+        except TypeError:
+            pass
+    dist.barrier()
 
 
 def shard_bounds(n_total: int, rank: int, world_size: int) -> Tuple[int, int]:
@@ -811,6 +854,7 @@ def parse_args():
     ap.add_argument("--use-calibration", action="store_true", help="Use temperature from --season-th-path when present.")
     ap.add_argument("--skip-fine-grid", action="store_true", help="Skip 676-combination fine-threshold sweep.")
     ap.add_argument("--distributed", action="store_true", help="Shard inference across torchrun ranks.")
+    ap.add_argument("--dist-backend", choices=["gloo", "nccl"], default="gloo", help="torch.distributed backend for rank barriers.")
     ap.add_argument("--local-rank", "--local_rank", type=int, default=None, help="Local rank supplied by torchrun.")
     return ap.parse_args()
 
@@ -838,7 +882,7 @@ def main():
         assert dist is not None
         if rank == 0 and part_dir.exists():
             shutil.rmtree(part_dir)
-        dist.barrier()
+        dist_barrier(dist, device)
 
     x_path = data_dir / f"X_{args.split}.npy"
     y_path = data_dir / f"y_{args.split}.npy"
@@ -854,8 +898,7 @@ def main():
     season_thresholds, season_temp = load_season_thresholds(season_path)
     temperature = float(season_temp) if args.use_calibration and season_temp is not None else 1.0
 
-    with open(scaler_path, "rb") as f:
-        scaler = pickle.load(f)
+    scaler = load_scaler(scaler_path)
 
     model_cls = import_model_class(model_py)
     model = model_cls(
@@ -899,7 +942,7 @@ def main():
     if world_size > 1:
         write_rank_part(part_dir, rank, probs_part, low_prob_part, y_cls_part, y_raw_part, months_part)
         assert dist is not None
-        dist.barrier()
+        dist_barrier(dist, device)
         if rank != 0:
             dist.destroy_process_group()
             print(f"[done rank={rank}] wrote shard and exited after rank0 barrier", flush=True)
@@ -1026,6 +1069,7 @@ def main():
         "threshold_rule": args.threshold_rule,
         "output_dir": str(out_dir),
         "world_size": world_size,
+        "dist_backend": dist.get_backend() if dist is not None else None,
         "rank_parts_dir": str(part_dir) if world_size > 1 else None,
     }
     with open(out_dir / "diagnostic_summary.json", "w", encoding="utf-8") as f:

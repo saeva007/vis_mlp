@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -J lowvis_diag_pm10pm25
 #SBATCH -p kshdexclu01
-# Match the S2 launcher: each allocated node must use all 4 DCUs.
-#SBATCH -N 5
+# Single full-node diagnostic: one node, all 4 DCUs on that node.
+#SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=dcu:4
@@ -29,7 +29,11 @@ DCUS_PER_NODE=4
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 
 echo "JobId=${SLURM_JOB_ID} Node=$(hostname) Started=$(date)"
-echo "Partition=${SLURM_JOB_PARTITION:-kshdexclu01} Nodes=${SLURM_NNODES:-5} CPUs=${CPUS_PER_TASK} DCUs/node=${DCUS_PER_NODE}"
+echo "Partition=${SLURM_JOB_PARTITION:-kshdexclu01} Nodes=${SLURM_NNODES:-1} CPUs=${CPUS_PER_TASK} DCUs/node=${DCUS_PER_NODE}"
+if [ "${SLURM_NNODES:-1}" -ne 1 ]; then
+    echo "Refusing to launch: this diagnostic script is intentionally single-node, but SLURM_NNODES=${SLURM_NNODES:-unset}."
+    exit 1
+fi
 
 SCRIPT_DIR="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 
@@ -106,6 +110,7 @@ BATCH_SIZE="${BATCH_SIZE:-8192}"
 LIMIT_SAMPLES="${LIMIT_SAMPLES:-0}"
 SKIP_FINE_GRID="${SKIP_FINE_GRID:-0}"
 USE_CALIBRATION="${USE_CALIBRATION:-0}"
+DIST_BACKEND="${DIST_BACKEND:-gloo}"
 
 EXTRA_ARGS=""
 if [[ "${SKIP_FINE_GRID}" == "1" ]]; then
@@ -122,6 +127,7 @@ echo "MASTER_ADDR     : ${MASTER_ADDR}"
 echo "RDZV_PORT       : ${RDZV_PORT}       (torchrun rendezvous)"
 echo "SLURM_NNODES    : ${SLURM_NNODES}"
 echo "Total DCUs      : $((SLURM_NNODES * DCUS_PER_NODE))"
+echo "DIST_BACKEND    : ${DIST_BACKEND}"
 echo "RUN_ID          : ${RUN_ID}"
 echo "SPLIT           : ${SPLIT}"
 echo "OUT_DIR         : ${OUT_DIR}"
@@ -170,6 +176,7 @@ srun --nodes=${SLURM_NNODES} \
              --batch-size \"${BATCH_SIZE}\" \
              --limit-samples \"${LIMIT_SAMPLES}\" \
              --device auto \
+             --dist-backend \"${DIST_BACKEND}\" \
              ${EXTRA_ARGS}
      " 2>&1 | tee "/public/home/putianshu/vis_mlp/log/lowvis_diag/${SLURM_JOB_ID}_${SLURM_JOB_NAME}.log"
 
