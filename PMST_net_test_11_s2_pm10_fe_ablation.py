@@ -95,6 +95,21 @@ ABLATION_MODES: Dict[str, str] = {
 }
 
 
+def assert_base_script_is_current() -> None:
+    required = ("_copy_split_files", "_validate_feature_layout", "_dyn_indices_log1p")
+    missing = [name for name in required if not hasattr(base, name)]
+    if missing:
+        raise RuntimeError(
+            "The imported PMST_net_test_11_s2_pm10.py is missing current S2 data-layout "
+            f"fixes: {missing}. Sync the base training script before running FE ablations."
+        )
+    if float(base.CONFIG.get("VAL_SPLIT_RATIO", 1.0)) != 0.0:
+        raise RuntimeError(
+            "FE ablation must inherit the explicit month-tail validation split from the "
+            "base S2 script; VAL_SPLIT_RATIO is not zero."
+        )
+
+
 def _bounded(indices: Iterable[int], fe_dim: int) -> List[int]:
     return sorted({int(i) for i in indices if 0 <= int(i) < int(fe_dim)})
 
@@ -329,6 +344,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
 
     run_exp_id = apply_config_overrides(args)
+    assert_base_script_is_current()
     base.PMSTDataset = FeatureAblationPMSTDataset
 
     print("[FE-Ablation] Training wrapper active.", flush=True)
