@@ -106,5 +106,24 @@ OUT_DIR=${DIAGNOSTICS_ROOT}/${FT_RUN_ID}_test_lowvis_diag,SKIP_FINE_GRID=1 \
 Then repeat the gate selection on `${FT_RUN_ID}` so the paper evaluation uses a
 validation-selected threshold for the fine-tuned checkpoint.
 
+## 5. No-Training Post-Hoc Gate Diagnosis
+
+Use this when validation/test diagnostics already contain `_rank_parts`. It
+does not run inference or training. It selects `fine_low_mass` and `hybrid_or`
+rules on validation, then applies the same rule to test:
+
+```bash
+sbatch --export=ALL,RUN_ID=${RUN_ID},DIAGNOSTICS_ROOT=${DIAGNOSTICS_ROOT},\
+MAX_FPR=0.045,MIN_LOWVIS_PRECISION=0.12,MIN_MIST_PRECISION=0.06,\
+OUT_DIR=${DIAGNOSTICS_ROOT}/${RUN_ID}_posthoc_lowvis_gate_selection \
+  ${REPO}/sub_select_posthoc_lowvis_gate_from_diagnostics.slurm
+```
+
+Key output:
+
+```bash
+${DIAGNOSTICS_ROOT}/${RUN_ID}_posthoc_lowvis_gate_selection/selected_posthoc_lowvis_gate.json
+```
+
 This README is a runbook only; performance numbers must come from the generated
 diagnostic CSV/JSON files.
