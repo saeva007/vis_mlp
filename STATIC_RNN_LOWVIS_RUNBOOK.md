@@ -145,7 +145,8 @@ validation:
 - `recall_csi` selection rewards fog/mist recall while retaining precision,
   clear recall, and CSI constraints.
 
-The script stores the selected fog and mist thresholds in each checkpoint.
+The script stores the selected fog and mist thresholds in checkpoint metadata
+and in the stage history JSON.
 
 ## Tree Baselines
 

@@ -704,11 +704,11 @@ def unwrap(model: nn.Module) -> nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
-def save_checkpoint(model: nn.Module, path: str, rank: int) -> None:
+def save_checkpoint(model: nn.Module, path: str, rank: int, metadata: Optional[Dict] = None) -> None:
     if rank != 0:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(unwrap(model).state_dict(), path)
+    torch.save({"state_dict": unwrap(model).state_dict(), "metadata": metadata or {}}, path)
     print(f"[Ckpt] saved {path}", flush=True)
 
 
@@ -930,7 +930,16 @@ def train_stage(
         if step % args.val_interval == 0 or step == total_steps:
             score, th, metrics = evaluate(args, model, val_loader, device, rank, world_size, len(val_ds))
             model.train()
-            save_checkpoint(model, ckpt_latest, rank)
+            ckpt_meta = {
+                "run_id": args.run_id,
+                "tag": tag,
+                "step": step,
+                "score": score,
+                "thresholds": th,
+                "metrics": metrics,
+                "selection_metric": args.selection_metric,
+            }
+            save_checkpoint(model, ckpt_latest, rank, ckpt_meta)
             if rank == 0:
                 row = {"step": step, "score": score, "thresholds": th, **metrics}
                 history.append(row)
@@ -946,7 +955,7 @@ def train_stage(
                 if score > best_score:
                     best_score = score
                     no_improve = 0
-                    save_checkpoint(model, ckpt_best, rank)
+                    save_checkpoint(model, ckpt_best, rank, ckpt_meta)
                 else:
                     no_improve += 1
             if world_size > 1:
