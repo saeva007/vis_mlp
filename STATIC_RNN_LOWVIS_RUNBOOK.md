@@ -131,6 +131,11 @@ The Slurm scripts follow the stable PMST S2/DDP pattern:
 - gradient clipping;
 - Stage 2 phase A trains only head/fusion/normalization/attention-style
   parameters, then phase B unfreezes all parameters with lower backbone LR;
+- Stage 2 phase A uses DDP unused-parameter detection and Phase B rewraps DDP
+  after unfreezing, matching the staged-freeze safety pattern in the stable
+  PMST training stack;
+- when `--aux-reg-weight 0` is used, the auxiliary regression head is kept in
+  the zero-weight autograd path so DDP does not treat it as an abandoned branch;
 - L2-SP regularization is available in both Stage 2 phases.
 
 ## Validation and Threshold Search

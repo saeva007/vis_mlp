@@ -557,7 +557,9 @@ def combined_loss(
     p_low = torch.clamp(probs[:, 0] + probs[:, 1], 0.0, 1.0)
     l_fp = torch.mean((p_low ** 2) * clear)
     l_boost = torch.mean(((1.0 - probs[:, 0]) ** 2) * fog) + torch.mean(((1.0 - probs[:, 1]) ** 2) * mist)
-    l_reg = F.mse_loss(reg, y_reg) if args.aux_reg_weight > 0 else logits.new_tensor(0.0)
+    # Keep the auxiliary head in the autograd graph even when the auxiliary
+    # objective is disabled; otherwise DDP reports reg_head as an unused branch.
+    l_reg = F.mse_loss(reg, y_reg) if args.aux_reg_weight > 0 else reg.sum() * 0.0
     total = l_cls + args.alpha_clear_fp * l_fp + args.alpha_recall_boost * l_boost + args.aux_reg_weight * l_reg
     return total, {"cls": float(l_cls.detach()), "fp": float(l_fp.detach()), "boost": float(l_boost.detach()), "reg": float(l_reg.detach())}
 
@@ -694,9 +696,11 @@ def evaluate(
     return -1.0, {"fog": 0.5, "mist": 0.5}, {}
 
 
-def wrap_ddp(model: nn.Module, local_rank: int, world_size: int) -> nn.Module:
+def wrap_ddp(model: nn.Module, local_rank: int, world_size: int, find_unused: bool = False) -> nn.Module:
     if world_size > 1:
-        return DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        device = torch.device(f"cuda:{local_rank}")
+        safe_barrier(world_size, device)
+        return DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused)
     return model
 
 
@@ -1011,7 +1015,8 @@ def main() -> None:
     if args.mode in ("s1", "both"):
         tr, va, layout, _ = load_data(args, args.s1_data_dir, "s1", use_fe, use_pm, rank, local_rank, world_size, device)
         model = build_model(args, layout, use_fe, device)
-        ddp_model = wrap_ddp(model, local_rank, world_size)
+        set_trainable(model, "all")
+        ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=False)
         rank0(rank, f"[Model:S1] params={sum(p.numel() for p in model.parameters()) / 1e6:.3f}M")
         s1_best = train_stage(
             args, "S1", ddp_model, tr, va, device, rank, world_size,
@@ -1026,8 +1031,9 @@ def main() -> None:
         pretrained = args.pretrained_ckpt or s1_best
         if pretrained:
             load_compatible_checkpoint(model, pretrained, rank, device)
-        ddp_model = wrap_ddp(model, local_rank, world_size)
-        l2_ref = clone_state(ddp_model, device) if pretrained else None
+        l2_ref = clone_state(model, device) if pretrained else None
+        set_trainable(model, "head")
+        ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=True)
         rank0(rank, f"[Model:S2] params={sum(p.numel() for p in unwrap(ddp_model).parameters()) / 1e6:.3f}M pretrained={pretrained or 'none'}")
 
         phase_a_best = train_stage(
@@ -1036,8 +1042,15 @@ def main() -> None:
             args.s2_lr_head_a, None, "head", l2_ref, args.l2sp_alpha_a,
         )
         safe_barrier(world_size, device)
+        raw_model = unwrap(ddp_model)
+        if world_size > 1:
+            del ddp_model
+            torch.cuda.empty_cache()
+            safe_barrier(world_size, device)
         if phase_a_best:
-            load_compatible_checkpoint(ddp_model, phase_a_best, rank, device)
+            load_compatible_checkpoint(raw_model, phase_a_best, rank, device)
+        set_trainable(raw_model, "all")
+        ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
         train_stage(
             args, "S2_PhaseB", ddp_model, tr, va, device, rank, world_size,
             args.s2_phase_b_steps, args.fog_ratio_s2, args.mist_ratio_s2,
