@@ -24,8 +24,8 @@ experiments.
 
 The script uses the current 12-hour stage datasets by default:
 
-- Stage 1: `/public/home/putianshu/vis_mlp/ml_dataset_pmst_s1_12h_aerosol_all`
-- Stage 2: `/public/home/putianshu/vis_mlp/ml_dataset_pmst_s2_12h_aerosol_all`
+- Stage 1: `/public/home/putianshu/vis_mlp/ml_dataset_pmst_v5_aligned_12h_pm10_pm25`
+- Stage 2: `/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2`
 
 It does not rebuild `.npy` files. If data processing changes, rebuild with the
 existing Stage 1 and Stage 2 data scripts first, then run this model script.
