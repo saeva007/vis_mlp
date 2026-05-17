@@ -76,17 +76,20 @@ sequentially inside that allocation. This keeps the world size, global batch,
 sampling regime, and validation schedule comparable across ablations while
 avoiding one queue wait per experiment.
 
+The main GRU model is intentionally not included here; keep running it through
+`sub_static_rnn_lowvis_main.slurm` so the paper candidate remains a separate,
+cleanly named training job.
+
 To run only selected experiments, pass a colon-separated id list:
 
 ```bash
-sbatch --export=ALL,LOWVIS_RNN_EXPERIMENTS=0:1:2,LOWVIS_RNN_PRETRAINED_CKPT=/public/home/putianshu/vis_mlp/checkpoints/<run_id>_S1_best_score.pt sub_static_rnn_lowvis_matrix.slurm
+sbatch --export=ALL,LOWVIS_RNN_EXPERIMENTS=1:2:3,LOWVIS_RNN_PRETRAINED_CKPT=/public/home/putianshu/vis_mlp/checkpoints/<run_id>_S1_best_score.pt sub_static_rnn_lowvis_matrix.slurm
 ```
 
 The matrix contains:
 
 | Task ID | Experiment | Purpose |
 |---:|---|---|
-| 0 | `static_mlp_gru_main` | Main paper candidate |
 | 1 | `static_mlp_lstm` | GRU vs LSTM dynamic encoder |
 | 2 | `static_mlp_gru_no_fe` | Remove engineered physical features |
 | 3 | `static_mlp_gru_no_pm` | Remove PM/aerosol information while preserving layout |

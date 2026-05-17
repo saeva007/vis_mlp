@@ -23,10 +23,6 @@ cd "${SCRIPT_DIR}"
 
 get_experiment() {
     case "$1" in
-        0)
-            EXP_NAME="static_mlp_gru_main"
-            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
-            ;;
         1)
             EXP_NAME="static_mlp_lstm"
             MODEL_ARGS="--encoder lstm --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
@@ -128,7 +124,7 @@ export LOWVIS_RNN_NUM_WORKERS="${LOWVIS_RNN_NUM_WORKERS:-0}"
 export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-10}"
 export LOWVIS_RNN_PRETRAINED_CKPT="${LOWVIS_RNN_PRETRAINED_CKPT:-}"
 export LOWVIS_RNN_EXTRA_ARGS="${LOWVIS_RNN_EXTRA_ARGS:-}"
-export LOWVIS_RNN_EXPERIMENTS="${LOWVIS_RNN_EXPERIMENTS:-0 1 2 3 4 5 6 7}"
+export LOWVIS_RNN_EXPERIMENTS="${LOWVIS_RNN_EXPERIMENTS:-1 2 3 4 5 6 7}"
 EXPERIMENT_LIST="${LOWVIS_RNN_EXPERIMENTS//,/ }"
 EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
 export LOWVIS_RNN_RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-${LOWVIS_RNN_RUN_ID:-exp_${SLURM_JOB_ID}_static_rnn_matrix}}"
