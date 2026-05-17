@@ -8,9 +8,8 @@
 #SBATCH --mem=0
 #SBATCH -t 240:00:00
 #SBATCH -D /public/home/putianshu/vis_mlp/train
-#SBATCH -o /public/home/putianshu/vis_mlp/train/logs/%A_%a_%x.out
-#SBATCH -e /public/home/putianshu/vis_mlp/train/logs/%A_%a_%x.err
-#SBATCH --array=0-7
+#SBATCH -o /public/home/putianshu/vis_mlp/train/logs/%j_%x.out
+#SBATCH -e /public/home/putianshu/vis_mlp/train/logs/%j_%x.err
 #SBATCH --exclusive
 
 set -euo pipefail
@@ -22,49 +21,49 @@ CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 mkdir -p "${SCRIPT_DIR}/logs"
 cd "${SCRIPT_DIR}"
 
-case "${SLURM_ARRAY_TASK_ID}" in
-    0)
-        EXP_NAME="static_mlp_gru_main"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
-        ;;
-    1)
-        EXP_NAME="static_mlp_lstm"
-        MODEL_ARGS="--encoder lstm --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
-        ;;
-    2)
-        EXP_NAME="static_mlp_gru_no_fe"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --no-fe"
-        ;;
-    3)
-        EXP_NAME="static_mlp_gru_no_pm"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --no-pm"
-        ;;
-    4)
-        EXP_NAME="static_mlp_gru_aux_reg"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --aux-reg-weight 0.05"
-        ;;
-    5)
-        EXP_NAME="static_mlp_gru_attention"
-        MODEL_ARGS="--encoder gru --pooling attention --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
-        ;;
-    6)
-        EXP_NAME="static_mlp_bigru"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 192 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --bidirectional"
-        ;;
-    7)
-        EXP_NAME="static_mlp_gru_csi_select"
-        MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric csi"
-        ;;
-    *)
-        echo "Unknown SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}" >&2
-        exit 2
-        ;;
-esac
+get_experiment() {
+    case "$1" in
+        0)
+            EXP_NAME="static_mlp_gru_main"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
+            ;;
+        1)
+            EXP_NAME="static_mlp_lstm"
+            MODEL_ARGS="--encoder lstm --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
+            ;;
+        2)
+            EXP_NAME="static_mlp_gru_no_fe"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --no-fe"
+            ;;
+        3)
+            EXP_NAME="static_mlp_gru_no_pm"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --no-pm"
+            ;;
+        4)
+            EXP_NAME="static_mlp_gru_aux_reg"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --aux-reg-weight 0.05"
+            ;;
+        5)
+            EXP_NAME="static_mlp_gru_attention"
+            MODEL_ARGS="--encoder gru --pooling attention --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi"
+            ;;
+        6)
+            EXP_NAME="static_mlp_bigru"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 192 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric recall_csi --bidirectional"
+            ;;
+        7)
+            EXP_NAME="static_mlp_gru_csi_select"
+            MODEL_ARGS="--encoder gru --pooling mean --rnn-layers 1 --hidden-dim 256 --static-hidden-dim 96 --fusion-hidden-dim 256 --dropout 0.2 --selection-metric csi"
+            ;;
+        *)
+            echo "Unknown experiment id: $1" >&2
+            exit 2
+            ;;
+    esac
+}
 
-echo "Job started at: $(date)"
+echo "Matrix job started at: $(date)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
-echo "ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
-echo "EXP_NAME=${EXP_NAME}"
 echo "Nodes=${SLURM_NNODES} CPUs/task=${CPUS_PER_TASK} DCUs/node=${DCUS_PER_NODE}"
 
 module purge
@@ -116,13 +115,8 @@ if [ -z "$MASTER_ADDR" ]; then
 fi
 
 BASE_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
-RDZV_PORT=${BASE_PORT}
-DIST_STORE_PORT=$(expr ${BASE_PORT} + 1)
 
 export MASTER_ADDR
-export DIST_STORE_PORT
-
-export LOWVIS_RNN_RUN_ID="${LOWVIS_RNN_RUN_ID:-exp_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}_${EXP_NAME}}"
 export LOWVIS_RNN_MODE="${LOWVIS_RNN_MODE:-s2}"
 export LOWVIS_RNN_S1_STEPS="${LOWVIS_RNN_S1_STEPS:-15000}"
 export LOWVIS_RNN_S2_A_STEPS="${LOWVIS_RNN_S2_A_STEPS:-8000}"
@@ -134,48 +128,83 @@ export LOWVIS_RNN_NUM_WORKERS="${LOWVIS_RNN_NUM_WORKERS:-0}"
 export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-10}"
 export LOWVIS_RNN_PRETRAINED_CKPT="${LOWVIS_RNN_PRETRAINED_CKPT:-}"
 export LOWVIS_RNN_EXTRA_ARGS="${LOWVIS_RNN_EXTRA_ARGS:-}"
+export LOWVIS_RNN_EXPERIMENTS="${LOWVIS_RNN_EXPERIMENTS:-0 1 2 3 4 5 6 7}"
+EXPERIMENT_LIST="${LOWVIS_RNN_EXPERIMENTS//,/ }"
+EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
+export LOWVIS_RNN_RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-${LOWVIS_RNN_RUN_ID:-exp_${SLURM_JOB_ID}_static_rnn_matrix}}"
+export LOWVIS_RNN_SLEEP_BETWEEN="${LOWVIS_RNN_SLEEP_BETWEEN:-15}"
 
 echo "Head Node       : ${head_node}"
 echo "MASTER_ADDR     : ${MASTER_ADDR}"
-echo "RDZV_PORT       : ${RDZV_PORT}       (torchrun rendezvous)"
-echo "DIST_STORE_PORT : ${DIST_STORE_PORT} (Python dist.TCPStore)"
-echo "RUN_ID          : ${LOWVIS_RNN_RUN_ID}"
+echo "BASE_PORT       : ${BASE_PORT}"
 echo "MODE            : ${LOWVIS_RNN_MODE}"
 echo "PRETRAINED_CKPT : ${LOWVIS_RNN_PRETRAINED_CKPT}"
-echo "MODEL_ARGS      : ${MODEL_ARGS}"
+echo "RUN_PREFIX      : ${LOWVIS_RNN_RUN_PREFIX}"
+echo "EXPERIMENTS     : ${EXPERIMENT_LIST}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
-echo "Cleaning /dev/shm on all allocated nodes..."
-srun --nodes=${SLURM_NNODES} \
-     --ntasks=${SLURM_NNODES} \
-     --ntasks-per-node=1 \
-     bash -c "rm -rf /dev/shm/torch_* /dev/shm/*static_rnn_lowvis* /dev/shm/*lowvis_rnn* 2>/dev/null; \
-              echo \"\$(hostname) SHM Cleaned\""
+run_one_experiment() {
+    local exp_id="$1"
+    get_experiment "${exp_id}"
 
-srun --nodes=${SLURM_NNODES} \
-     --ntasks=${SLURM_NNODES} \
-     --ntasks-per-node=1 \
-     --cpus-per-task=${CPUS_PER_TASK} \
-     bash -c "
-         set -euo pipefail
-         cd \"${SCRIPT_DIR}\"
-         export MIOPEN_USER_DB_PATH=/tmp/miopen-\${USER}-\${SLURM_JOB_ID}-\${SLURM_NODEID}
-         mkdir -p \${MIOPEN_USER_DB_PATH}
+    local rdzv_port
+    local dist_store_port
+    local run_id
+    rdzv_port=$(expr ${BASE_PORT} + ${exp_id} \* 2)
+    dist_store_port=$(expr ${rdzv_port} + 1)
+    run_id="${LOWVIS_RNN_RUN_PREFIX}_${exp_id}_${EXP_NAME}"
 
-         torchrun \
-             --nnodes=${SLURM_NNODES} \
-             --nproc_per_node=${DCUS_PER_NODE} \
-             --node_rank=\${SLURM_NODEID} \
-             --rdzv_backend=static \
-             --rdzv_endpoint=${MASTER_ADDR}:${RDZV_PORT} \
-             --rdzv_id=${SLURM_JOBID} \
-             --max_restarts=0 \
-             \"${SCRIPT_DIR}/train_static_rnn_lowvis.py\" \
-             --mode \"${LOWVIS_RNN_MODE}\" \
-             --run-id \"${LOWVIS_RNN_RUN_ID}\" \
-             ${MODEL_ARGS} \
-             --pretrained-ckpt \"${LOWVIS_RNN_PRETRAINED_CKPT}\" \
-             ${LOWVIS_RNN_EXTRA_ARGS}
-     "
+    export DIST_STORE_PORT="${dist_store_port}"
 
-echo "Job finished at: $(date)"
+    echo ""
+    echo "================================================================"
+    echo "Experiment ${exp_id}: ${EXP_NAME}"
+    echo "Started at       : $(date)"
+    echo "RUN_ID           : ${run_id}"
+    echo "RDZV_PORT        : ${rdzv_port}       (torchrun rendezvous)"
+    echo "DIST_STORE_PORT  : ${DIST_STORE_PORT} (Python dist.TCPStore)"
+    echo "MODEL_ARGS       : ${MODEL_ARGS}"
+    echo "================================================================"
+
+    echo "Cleaning /dev/shm on all allocated nodes before ${EXP_NAME}..."
+    srun --nodes=${SLURM_NNODES} \
+         --ntasks=${SLURM_NNODES} \
+         --ntasks-per-node=1 \
+         bash -c "rm -rf /dev/shm/torch_* /dev/shm/*static_rnn_lowvis* /dev/shm/*lowvis_rnn* 2>/dev/null; \
+                  echo \"\$(hostname) SHM Cleaned\""
+
+    srun --nodes=${SLURM_NNODES} \
+         --ntasks=${SLURM_NNODES} \
+         --ntasks-per-node=1 \
+         --cpus-per-task=${CPUS_PER_TASK} \
+         bash -c "
+             set -euo pipefail
+             cd \"${SCRIPT_DIR}\"
+             export MIOPEN_USER_DB_PATH=/tmp/miopen-\${USER}-\${SLURM_JOB_ID}-${exp_id}-\${SLURM_NODEID}
+             mkdir -p \${MIOPEN_USER_DB_PATH}
+
+             torchrun \
+                 --nnodes=${SLURM_NNODES} \
+                 --nproc_per_node=${DCUS_PER_NODE} \
+                 --node_rank=\${SLURM_NODEID} \
+                 --rdzv_backend=static \
+                 --rdzv_endpoint=${MASTER_ADDR}:${rdzv_port} \
+                 --rdzv_id=${SLURM_JOBID}_${exp_id} \
+                 --max_restarts=0 \
+                 \"${SCRIPT_DIR}/train_static_rnn_lowvis.py\" \
+                 --mode \"${LOWVIS_RNN_MODE}\" \
+                 --run-id \"${run_id}\" \
+                 ${MODEL_ARGS} \
+                 --pretrained-ckpt \"${LOWVIS_RNN_PRETRAINED_CKPT}\" \
+                 ${LOWVIS_RNN_EXTRA_ARGS}
+         "
+
+    echo "Experiment ${exp_id}: ${EXP_NAME} finished at $(date)"
+    sleep "${LOWVIS_RNN_SLEEP_BETWEEN}"
+}
+
+for exp_id in ${EXPERIMENT_LIST}; do
+    run_one_experiment "${exp_id}"
+done
+
+echo "Matrix job finished at: $(date)"

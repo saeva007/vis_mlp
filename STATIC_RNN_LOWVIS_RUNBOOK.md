@@ -71,7 +71,18 @@ submit the matrix:
 sbatch --export=ALL,LOWVIS_RNN_PRETRAINED_CKPT=/public/home/putianshu/vis_mlp/checkpoints/<run_id>_S1_best_score.pt sub_static_rnn_lowvis_matrix.slurm
 ```
 
-The array contains:
+This script requests one 5-node allocation and then runs the experiments
+sequentially inside that allocation. This keeps the world size, global batch,
+sampling regime, and validation schedule comparable across ablations while
+avoiding one queue wait per experiment.
+
+To run only selected experiments, pass a colon-separated id list:
+
+```bash
+sbatch --export=ALL,LOWVIS_RNN_EXPERIMENTS=0:1:2,LOWVIS_RNN_PRETRAINED_CKPT=/public/home/putianshu/vis_mlp/checkpoints/<run_id>_S1_best_score.pt sub_static_rnn_lowvis_matrix.slurm
+```
+
+The matrix contains:
 
 | Task ID | Experiment | Purpose |
 |---:|---|---|
