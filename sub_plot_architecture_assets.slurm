@@ -21,15 +21,21 @@
 #   DATA_DIR=/path/to/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2
 #   OUT_DIR=/path/to/architecture_map_assets
 #   DYNAMIC_VARS=RH2M,T2M,PM10,PM2.5
-#   FE_VARS=near_saturation_proxy,night_clear_sky_cooling,fog_potential_index,ventilation_proxy
+#   DYNAMIC_LAGS=-11,-7,-3,0
+#   STATIC_VARS=terrain_h,terrain_anomaly
+#   FE_VARS=near_saturation_proxy,ventilation_proxy
 #   VALID_TIME="2025-10-31 15:00"
 #   OUTPUT_TIMES=4
+#   OUTPUT_MIN_LOWVIS=40
+#   OUTPUT_MIN_PRECISION=0.22
+#   OUTPUT_MIN_RECALL=0.35
 #   EVAL_CSV=/public/home/putianshu/vis_mlp/paper_eval_results_pm10_pm25_journal/per_sample_eval.csv
 #   MAX_POINTS=0
 #
-# 示例:
-#   sbatch --export=ALL,DYNAMIC_VARS=RH2M,T2M,PM10,PM2.5,OUTPUT_TIMES=6 \
-#     /public/home/putianshu/vis_mlp/train/sub_plot_architecture_assets.slurm
+# 示例（逗号变量建议先 export，避免 Slurm --export 把逗号当变量分隔符）:
+#   export DYNAMIC_VARS="RH2M,T2M,PM10,PM2.5"
+#   export DYNAMIC_LAGS="-11,-7,-3,0"
+#   sbatch /public/home/putianshu/vis_mlp/train/sub_plot_architecture_assets.slurm
 #
 set -euo pipefail
 
@@ -52,10 +58,15 @@ SHP_PATH="${SHP_PATH:-/public/home/putianshu/中华人民共和国/中华人民�
 ORO_PATH="${ORO_PATH:-/public/home/putianshu/vis_cnn/data_orography.nc}"
 OUT_DIR="${OUT_DIR:-/public/home/putianshu/vis_mlp/architecture_map_assets}"
 DYNAMIC_VARS="${DYNAMIC_VARS:-RH2M,T2M,PM10}"
-FE_VARS="${FE_VARS:-near_saturation_proxy,night_clear_sky_cooling,fog_potential_index,ventilation_proxy}"
+DYNAMIC_LAGS="${DYNAMIC_LAGS:--11,-7,-3,0}"
+STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly}"
+FE_VARS="${FE_VARS:-near_saturation_proxy,ventilation_proxy}"
 VALID_TIME="${VALID_TIME:-}"
 OUTPUT_TIMES="${OUTPUT_TIMES:-4}"
-EVAL_CSV="${EVAL_CSV:-}"
+OUTPUT_MIN_LOWVIS="${OUTPUT_MIN_LOWVIS:-40}"
+OUTPUT_MIN_PRECISION="${OUTPUT_MIN_PRECISION:-0.22}"
+OUTPUT_MIN_RECALL="${OUTPUT_MIN_RECALL:-0.35}"
+EVAL_CSV="${EVAL_CSV:-/public/home/putianshu/vis_mlp/paper_eval_results_pm10_pm25_journal/per_sample_eval.csv}"
 MAX_POINTS="${MAX_POINTS:-0}"
 DPI="${DPI:-220}"
 
@@ -65,8 +76,13 @@ args=(
   --oro "${ORO_PATH}"
   --out_dir "${OUT_DIR}"
   --dynamic_vars "${DYNAMIC_VARS}"
+  --dynamic_lags "${DYNAMIC_LAGS}"
+  --static_vars "${STATIC_VARS}"
   --fe_vars "${FE_VARS}"
   --output_times "${OUTPUT_TIMES}"
+  --output_min_lowvis "${OUTPUT_MIN_LOWVIS}"
+  --output_min_precision "${OUTPUT_MIN_PRECISION}"
+  --output_min_recall "${OUTPUT_MIN_RECALL}"
   --max_points "${MAX_POINTS}"
   --dpi "${DPI}"
 )

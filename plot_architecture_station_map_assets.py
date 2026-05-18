@@ -5,14 +5,12 @@ Create China station-map assets for the PMST low-visibility architecture figure.
 
 This script is intended to run on the remote project machine, not locally.  It
 uses the S2 month-tail test set and the existing China shapefile to create
-stackable PNG layers similar in spirit to the NeuralGCM architecture schematic:
+clean, annotation-free PNG layers for an architecture schematic:
 
-  - 12 dynamic-input station maps for selected dynamic variables.
-  - static terrain assets from both the gridded orography file and the model's
-    station-level static terrain input.
-  - several feature-engineering station maps.
-  - output station maps for observed target classes, and optional PMST
-    prediction/probability maps if a per-sample evaluation CSV is supplied.
+  - compact dynamic-input station stacks at selected lags, default t-11/t-7/t-3/t.
+  - one static/feature-engineering station stack.
+  - several three-class output maps selected for adequate low-visibility count
+    and high low-visibility precision/recall when evaluation CSV is available.
 
 The script avoids importing the training model; it only visualizes data already
 saved by s2_data.py.
@@ -34,7 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import BoundaryNorm, ListedColormap, Normalize
+from matplotlib.colors import BoundaryNorm, ListedColormap
 
 
 BASE_PATH = Path("/public/home/putianshu/vis_mlp")
@@ -44,7 +42,7 @@ DEFAULT_ORO = Path("/public/home/putianshu/vis_cnn/data_orography.nc")
 DEFAULT_OUT = BASE_PATH / "architecture_map_assets"
 
 WINDOW_SIZE = 12
-CHINA_EXTENT = (73.0, 136.0, 17.0, 54.5)
+CHINA_EXTENT = (73.0, 136.0, 3.0, 54.8)
 
 BASE_DYN_NAMES = [
     "RH2M",
@@ -132,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamic_vars",
         default="RH2M,T2M,PM10",
-        help="Comma-separated dynamic variables to draw as 12-layer input stacks, e.g. RH2M,T2M,PM10.",
+        help="Comma-separated representative dynamic variables to draw, e.g. RH2M,T2M,PM10.",
     )
     parser.add_argument(
         "--dynamic_var",
@@ -140,20 +138,48 @@ def parse_args() -> argparse.Namespace:
         help="Backward-compatible single dynamic variable option; appended to --dynamic_vars if set.",
     )
     parser.add_argument(
+        "--dynamic_lags",
+        default="-11,-7,-3,0",
+        help="Comma-separated window lags to draw for dynamic stacks. Default: -11,-7,-3,0.",
+    )
+    parser.add_argument(
+        "--static_vars",
+        default="terrain_h,terrain_anomaly",
+        help="Comma-separated static station inputs to draw: terrain_h,terrain_anomaly,terrain_std,lat,lon,veg.",
+    )
+    parser.add_argument(
         "--fe_vars",
-        default="near_saturation_proxy,night_clear_sky_cooling,fog_potential_index,ventilation_proxy",
-        help="Comma-separated FE variables to draw as a stack.",
+        default="near_saturation_proxy,ventilation_proxy",
+        help="Comma-separated FE variables to include in the static/FE stack.",
     )
     parser.add_argument(
         "--output_times",
         type=int,
         default=4,
-        help="Number of consecutive available test valid times to draw for output class stack.",
+        help="Number of output class maps to draw.",
+    )
+    parser.add_argument(
+        "--output_min_lowvis",
+        type=int,
+        default=40,
+        help="Preferred minimum observed low-visibility station count when selecting output times.",
+    )
+    parser.add_argument(
+        "--output_min_precision",
+        type=float,
+        default=0.22,
+        help="Preferred minimum low-visibility precision when selecting output times from eval_csv.",
+    )
+    parser.add_argument(
+        "--output_min_recall",
+        type=float,
+        default=0.35,
+        help="Preferred minimum low-visibility recall when selecting output times from eval_csv.",
     )
     parser.add_argument(
         "--eval_csv",
         default="",
-        help="Optional per_sample_eval.csv. If supplied, also draw PMST prediction/probability output maps.",
+        help="Optional per-sample evaluation CSV used to choose and draw high-skill PMST output maps.",
     )
     parser.add_argument(
         "--max_points",
@@ -163,7 +189,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dpi", type=int, default=220)
     parser.add_argument("--asset_width", type=float, default=3.0)
-    parser.add_argument("--asset_height", type=float, default=2.45)
+    parser.add_argument("--asset_height", type=float, default=3.05)
+    parser.add_argument(
+        "--draw_grid_orography",
+        action="store_true",
+        help="Also draw a gridded terrain map. Off by default to keep architecture assets frameless.",
+    )
+    parser.add_argument(
+        "--write_sheets",
+        action="store_true",
+        help="Also write unlabeled contact sheets for quick inspection.",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +225,28 @@ def dynamic_names(dyn_count: int) -> List[str]:
     while len(names) < dyn_count:
         names.append(f"DYN_{len(names)}")
     return names[:dyn_count]
+
+
+def parse_dynamic_lags(spec: str, window: int) -> List[int]:
+    """Convert lag strings such as -11,-7,-3,0 into zero-based window indices."""
+    out: List[int] = []
+    for raw in str(spec).split(","):
+        s = raw.strip().lower().replace("t", "")
+        if not s:
+            continue
+        lag = int(s)
+        idx = window - 1 + lag if lag <= 0 else lag
+        if idx < 0 or idx >= window:
+            raise ValueError(f"Dynamic lag/index {raw!r} is outside a {window}-hour window")
+        if idx not in out:
+            out.append(idx)
+    if not out:
+        raise ValueError("No valid dynamic lags were provided")
+    return out
+
+
+def split_items(spec: str) -> List[str]:
+    return [x.strip() for x in str(spec).replace(";", ",").split(",") if x.strip()]
 
 
 def read_shp_segments(shp_path: Path) -> Optional[List[Tuple[np.ndarray, np.ndarray]]]:
@@ -259,17 +317,13 @@ def style_map_ax(ax, boundary, compact: bool = True) -> None:
     ax.set_xlim(CHINA_EXTENT[0], CHINA_EXTENT[1])
     ax.set_ylim(CHINA_EXTENT[2], CHINA_EXTENT[3])
     ax.set_aspect("equal", adjustable="box")
-    ax.set_facecolor("#F5F6F3")
+    ax.set_facecolor("none")
     draw_boundary(ax, boundary, color="#242424", lw=0.45, zorder=6)
     if compact:
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(False)
-    else:
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        ax.grid(True, color="#D9DED8", linewidth=0.35, zorder=0)
 
 
 def robust_limits(values: np.ndarray, symmetric: bool = False) -> Tuple[float, float]:
@@ -294,21 +348,22 @@ def draw_station_value_map(
     value: np.ndarray,
     out_path: Path,
     boundary,
-    title: str,
+    title: str = "",
     cmap: str = "viridis",
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     dpi: int = 220,
     figsize: Tuple[float, float] = (3.0, 2.45),
-    colorbar: bool = False,
+    annotate: bool = False,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
+    fig.patch.set_alpha(0)
     style_map_ax(ax, boundary, compact=True)
     vals = np.asarray(value, dtype=float)
     valid = np.isfinite(vals) & np.isfinite(df["lon"].to_numpy(float)) & np.isfinite(df["lat"].to_numpy(float))
     if valid.any():
-        sc = ax.scatter(
+        ax.scatter(
             df.loc[valid, "lon"],
             df.loc[valid, "lat"],
             c=vals[valid],
@@ -320,10 +375,6 @@ def draw_station_value_map(
             alpha=0.92,
             zorder=4,
         )
-        if colorbar:
-            cb = fig.colorbar(sc, ax=ax, shrink=0.72, pad=0.02)
-            cb.ax.tick_params(labelsize=6)
-    ax.set_title(title, fontsize=8, pad=2)
     fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
@@ -333,12 +384,14 @@ def draw_class_map(
     classes: np.ndarray,
     out_path: Path,
     boundary,
-    title: str,
+    title: str = "",
     dpi: int = 220,
     figsize: Tuple[float, float] = (3.0, 2.45),
+    annotate: bool = False,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
+    fig.patch.set_alpha(0)
     style_map_ax(ax, boundary, compact=True)
     cls = np.asarray(classes, dtype=float)
     valid = np.isfinite(cls)
@@ -353,7 +406,6 @@ def draw_class_map(
         alpha=0.96,
         zorder=4,
     )
-    ax.set_title(title, fontsize=8, pad=2)
     fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
@@ -393,22 +445,20 @@ def draw_contact_sheet(
     ncols: int = 4,
     label_prefix: str = "",
 ) -> None:
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     if not image_paths:
         return
     imgs = [Image.open(p).convert("RGBA") for p in image_paths]
     w = max(im.width for im in imgs)
-    h = max(im.height for im in imgs) + 26
+    h = max(im.height for im in imgs)
     nrows = int(math.ceil(len(imgs) / ncols))
     sheet = Image.new("RGBA", (ncols * w, nrows * h), (255, 255, 255, 0))
-    draw = ImageDraw.Draw(sheet)
     for i, im in enumerate(imgs):
         r, c = divmod(i, ncols)
         x = c * w
         y = r * h
         sheet.alpha_composite(im, (x, y))
-        draw.text((x + 8, y + im.height + 2), f"{label_prefix}{i + 1}", fill=(30, 30, 30, 255))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out_path)
 
@@ -474,13 +524,6 @@ def time_slice(meta: pd.DataFrame, target_time: pd.Timestamp, max_points: int = 
     return idx
 
 
-def next_available_times(meta: pd.DataFrame, target_time: pd.Timestamp, n: int) -> List[pd.Timestamp]:
-    times = pd.DatetimeIndex(np.sort(meta["time"].dropna().unique()))
-    pos = int(np.searchsorted(times.values, np.datetime64(target_time)))
-    out = [pd.Timestamp(t) for t in times[pos : pos + max(n, 1)]]
-    return out
-
-
 def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> bool:
     if not oro_path.exists():
         print(f"[WARN] Orography file not found: {oro_path}", flush=True)
@@ -513,14 +556,12 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         vals = vals[np.ix_(lat_mask, lon_mask)]
         lats = lats[lat_mask]
         lons_plot = lons_plot[lon_mask]
-        fig, ax = plt.subplots(figsize=(3.3, 2.65))
+        fig, ax = plt.subplots(figsize=(3.3, 3.3))
+        fig.patch.set_alpha(0)
         style_map_ax(ax, boundary, compact=True)
         lo, hi = robust_limits(vals)
-        pc = ax.pcolormesh(lons_plot, lats, vals, cmap="terrain", shading="auto", vmin=lo, vmax=hi, zorder=1)
+        ax.pcolormesh(lons_plot, lats, vals, cmap="terrain", shading="auto", vmin=lo, vmax=hi, zorder=1)
         draw_boundary(ax, boundary, color="#202020", lw=0.5, zorder=6)
-        cb = fig.colorbar(pc, ax=ax, shrink=0.72, pad=0.02)
-        cb.ax.tick_params(labelsize=6)
-        ax.set_title("Static terrain (gridded h)", fontsize=8, pad=2)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
         plt.close(fig)
@@ -530,7 +571,7 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         return False
 
 
-def maybe_load_eval_csv(eval_csv: str, target_time: pd.Timestamp) -> Optional[pd.DataFrame]:
+def load_eval_csv(eval_csv: str) -> Optional[pd.DataFrame]:
     if not eval_csv:
         return None
     p = Path(eval_csv)
@@ -544,7 +585,162 @@ def maybe_load_eval_csv(eval_csv: str, target_time: pd.Timestamp) -> Optional[pd
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     if "station_id" in df:
         df["station_id"] = df["station_id"].astype(str)
-    return df[df["time"] == target_time].copy()
+    return df
+
+
+def attach_meta_to_eval(eval_df: Optional[pd.DataFrame], meta: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Add station coordinates to eval rows when the eval CSV omits them."""
+    if eval_df is None:
+        return None
+    out = eval_df.copy()
+    meta_ref = meta.copy()
+    if "station_id" in meta_ref:
+        meta_ref["station_id"] = meta_ref["station_id"].astype(str)
+    if len(out) == len(meta_ref):
+        for col in ("station_id", "lat", "lon"):
+            if col not in out and col in meta_ref:
+                out[col] = meta_ref[col].to_numpy()
+        if "time" not in out and "time" in meta_ref:
+            out["time"] = meta_ref["time"].to_numpy()
+    if "time" in out:
+        out["time"] = pd.to_datetime(out["time"], errors="coerce")
+    if "station_id" in out:
+        out["station_id"] = out["station_id"].astype(str)
+
+    if {"lat", "lon"}.issubset(out.columns):
+        return out
+    if {"time", "station_id"}.issubset(out.columns) and {"time", "station_id", "lat", "lon"}.issubset(meta_ref.columns):
+        coords = meta_ref[["time", "station_id", "lat", "lon"]].drop_duplicates(["time", "station_id"])
+        out = out.merge(coords, on=["time", "station_id"], how="left")
+    elif "station_id" in out and {"station_id", "lat", "lon"}.issubset(meta_ref.columns):
+        coords = meta_ref[["station_id", "lat", "lon"]].drop_duplicates("station_id")
+        out = out.merge(coords, on="station_id", how="left")
+    return out
+
+
+def eval_class_columns(eval_df: Optional[pd.DataFrame]) -> Tuple[Optional[str], Optional[str]]:
+    if eval_df is None:
+        return None, None
+    true_candidates = ("y_true", "target", "target_class", "label", "obs_class")
+    pred_candidates = ("pmst_pred", "pred_current", "pred_class", "prediction", "argmax_fine")
+    true_col = next((c for c in true_candidates if c in eval_df.columns), None)
+    pred_col = next((c for c in pred_candidates if c in eval_df.columns), None)
+    return true_col, pred_col
+
+
+def choose_output_times(
+    meta: pd.DataFrame,
+    y_cls: np.ndarray,
+    n: int,
+    eval_df: Optional[pd.DataFrame],
+    min_lowvis: int,
+    min_precision: float,
+    min_recall: float,
+) -> Tuple[List[pd.Timestamp], pd.DataFrame]:
+    """Pick visually useful output times, preferring good low-vis PMST skill."""
+    n = max(1, int(n))
+    true_col, pred_col = eval_class_columns(eval_df)
+    if eval_df is not None and true_col and pred_col and "time" in eval_df.columns:
+        tmp = eval_df[["time", true_col, pred_col]].copy()
+        tmp = tmp[tmp["time"].notna()]
+        tmp["true_low"] = tmp[true_col].astype(float) <= 1
+        tmp["pred_low"] = tmp[pred_col].astype(float) <= 1
+        tmp["hit_low"] = tmp["true_low"] & tmp["pred_low"]
+        grouped = tmp.groupby("time", sort=True).agg(
+            n_total=(true_col, "size"),
+            lowvis_count=("true_low", "sum"),
+            pred_lowvis_count=("pred_low", "sum"),
+            lowvis_hits=("hit_low", "sum"),
+        )
+        grouped["lowvis_precision"] = np.divide(
+            grouped["lowvis_hits"],
+            grouped["pred_lowvis_count"],
+            out=np.zeros(len(grouped), dtype=float),
+            where=grouped["pred_lowvis_count"].to_numpy() > 0,
+        )
+        grouped["lowvis_recall"] = np.divide(
+            grouped["lowvis_hits"],
+            grouped["lowvis_count"],
+            out=np.zeros(len(grouped), dtype=float),
+            where=grouped["lowvis_count"].to_numpy() > 0,
+        )
+        p = grouped["lowvis_precision"].to_numpy(float)
+        r = grouped["lowvis_recall"].to_numpy(float)
+        grouped["lowvis_f1"] = np.divide(
+            2 * p * r,
+            p + r,
+            out=np.zeros(len(grouped), dtype=float),
+            where=(p + r) > 0,
+        )
+        max_low = max(float(grouped["lowvis_count"].max()), 1.0)
+        grouped["count_score"] = np.sqrt(grouped["lowvis_count"].clip(lower=0).astype(float) / max_low)
+        grouped["selection_score"] = 0.78 * grouped["lowvis_f1"] + 0.22 * grouped["count_score"]
+        grouped = grouped.reset_index()
+
+        preferred = grouped[
+            (grouped["lowvis_count"] >= int(min_lowvis))
+            & (grouped["lowvis_precision"] >= float(min_precision))
+            & (grouped["lowvis_recall"] >= float(min_recall))
+        ]
+        if len(preferred) < n:
+            relaxed = grouped[
+                (grouped["lowvis_count"] >= max(5, int(round(min_lowvis * 0.5))))
+                & (grouped["lowvis_precision"] >= float(min_precision) * 0.75)
+                & (grouped["lowvis_recall"] >= float(min_recall) * 0.75)
+            ]
+            preferred = pd.concat([preferred, relaxed], ignore_index=True).drop_duplicates("time")
+        if len(preferred) < n:
+            low_count_pool = grouped[grouped["lowvis_count"] >= max(1, int(round(min_lowvis * 0.25)))]
+            preferred = pd.concat([preferred, low_count_pool], ignore_index=True).drop_duplicates("time")
+        if len(preferred) < n:
+            preferred = pd.concat([preferred, grouped], ignore_index=True).drop_duplicates("time")
+
+        selected = preferred.sort_values(
+            ["selection_score", "lowvis_count", "lowvis_precision", "lowvis_recall"],
+            ascending=False,
+        ).head(n)
+        selected = selected.assign(selection_source="eval_csv", prediction_column=pred_col, truth_column=true_col)
+        return [pd.Timestamp(t) for t in selected["time"]], selected.reset_index(drop=True)
+
+    fallback = pd.DataFrame({"time": meta["time"], "y_true": y_cls})
+    fallback = fallback[fallback["time"].notna()]
+    grouped = (
+        fallback.assign(lowvis=(fallback["y_true"].astype(float) <= 1))
+        .groupby("time", sort=True)
+        .agg(n_total=("y_true", "size"), lowvis_count=("lowvis", "sum"))
+        .reset_index()
+    )
+    grouped["selection_score"] = grouped["lowvis_count"].astype(float)
+    selected = grouped.sort_values(["lowvis_count", "time"], ascending=[False, True]).head(n)
+    selected = selected.assign(selection_source="observed_class_fallback")
+    return [pd.Timestamp(t) for t in selected["time"]], selected.reset_index(drop=True)
+
+
+def eval_slice_for_time(
+    eval_df: Optional[pd.DataFrame], target_time: pd.Timestamp, max_points: int = 0
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    _, pred_col = eval_class_columns(eval_df)
+    if eval_df is None or not pred_col or "time" not in eval_df:
+        return None, None
+    sub = eval_df[eval_df["time"].to_numpy(dtype="datetime64[ns]") == np.datetime64(target_time)].copy()
+    if sub.empty or not {"lat", "lon"}.issubset(sub.columns):
+        return None, None
+    valid = np.isfinite(sub["lat"].to_numpy(float)) & np.isfinite(sub["lon"].to_numpy(float))
+    sub = sub.loc[valid].copy()
+    if sub.empty:
+        return None, None
+    if max_points and len(sub) > max_points:
+        sub = sub.sample(n=max_points, random_state=20260514).sort_index()
+    return sub, pred_col
+
+
+def dataframe_records_for_json(df: pd.DataFrame) -> List[Dict[str, object]]:
+    if df.empty:
+        return []
+    out = df.copy()
+    if "time" in out:
+        out["time"] = out["time"].astype(str)
+    return json.loads(out.to_json(orient="records"))
 
 
 def main() -> None:
@@ -560,6 +756,7 @@ def main() -> None:
     X, y_raw, meta, dyn_count, fe_dim = load_test_data(data_dir, args.window)
     dyn_names = dynamic_names(dyn_count)
     y_cls = labels_from_visibility(y_raw)
+    eval_df = attach_meta_to_eval(load_eval_csv(args.eval_csv), meta)
     selected_time = choose_time(meta, y_cls, args.time)
     rows = time_slice(meta, selected_time, args.max_points)
     df_t = meta.iloc[rows].copy()
@@ -570,9 +767,10 @@ def main() -> None:
     dyn_seq = X_t[:, :split_dyn].reshape(len(rows), args.window, dyn_count)
     static_cont = X_t[:, split_dyn:split_static]
     fe = X_t[:, split_static + 1 : split_static + 1 + fe_dim]
+    dynamic_indices = parse_dynamic_lags(args.dynamic_lags, args.window)
 
     dyn_lookup = {name.lower(): i for i, name in enumerate(dyn_names)}
-    requested_dyn = [x.strip() for x in args.dynamic_vars.split(",") if x.strip()]
+    requested_dyn = split_items(args.dynamic_vars)
     if args.dynamic_var.strip():
         requested_dyn.append(args.dynamic_var.strip())
     seen_dyn = set()
@@ -594,16 +792,16 @@ def main() -> None:
         else:
             cmap = "YlGnBu"
         dynamic_paths: List[Path] = []
-        for t in range(args.window):
+        for t in dynamic_indices:
             lag = t - (args.window - 1)
             safe_name = dyn_names[dyn_idx].replace(".", "p")
-            p = layer_dir / "dynamic" / safe_name / f"dynamic_{safe_name}_t{t:02d}.png"
+            lag_name = f"m{abs(lag):02d}" if lag < 0 else "t00"
+            p = layer_dir / "dynamic" / safe_name / f"dynamic_{safe_name}_{lag_name}.png"
             draw_station_value_map(
                 df_t,
                 dyn_values[:, t],
                 p,
                 boundary,
-                title=f"{dyn_names[dyn_idx]}  {lag:+d} h",
                 cmap=cmap,
                 vmin=dyn_vmin,
                 vmax=dyn_vmax,
@@ -614,31 +812,52 @@ def main() -> None:
         stack_path = out_dir / f"stack_dynamic_{safe_name}.png"
         sheet_path = out_dir / f"sheet_dynamic_{safe_name}.png"
         compose_stack(dynamic_paths, stack_path)
-        draw_contact_sheet(dynamic_paths, sheet_path, ncols=4, label_prefix="t")
+        if args.write_sheets:
+            draw_contact_sheet(dynamic_paths, sheet_path, ncols=4)
         dynamic_outputs[dyn_names[dyn_idx]] = {
             "layers": [str(p) for p in dynamic_paths],
             "stack": str(stack_path),
-            "sheet": str(sheet_path),
         }
+        if args.write_sheets:
+            dynamic_outputs[dyn_names[dyn_idx]]["sheet"] = str(sheet_path)
 
-    static_station_h = static_cont[:, 2]
-    static_lo, static_hi = robust_limits(static_station_h)
-    static_station_path = layer_dir / "static" / "static_station_terrain_h.png"
-    draw_station_value_map(
-        df_t,
-        static_station_h,
-        static_station_path,
-        boundary,
-        title="Static station terrain h",
-        cmap="gist_earth",
-        vmin=static_lo,
-        vmax=static_hi,
-        dpi=args.dpi,
-        figsize=(args.asset_width, args.asset_height),
-    )
-    draw_grid_orography(oro_path, out_dir / "static_orography_china_grid.png", boundary, args.dpi)
+    static_lookup = {
+        "lat": (static_cont[:, 0], "YlGnBu"),
+        "lon": (static_cont[:, 1], "YlGnBu"),
+        "terrain_h": (static_cont[:, 2], "gist_earth"),
+        "terrain_anomaly": (static_cont[:, 3], "RdBu_r"),
+        "terrain_std": (static_cont[:, 4], "cividis"),
+        "veg": (X_t[:, split_static], "tab20"),
+    }
+    requested_static = split_items(args.static_vars)
+    static_paths: List[Path] = []
+    for name in requested_static:
+        key = name.lower()
+        if key not in static_lookup:
+            print(f"[WARN] Skip unknown static variable {name!r}", flush=True)
+            continue
+        vals, cmap = static_lookup[key]
+        lo, hi = robust_limits(vals, symmetric=(key == "terrain_anomaly"))
+        p = layer_dir / "static" / f"static_{key}.png"
+        draw_station_value_map(
+            df_t,
+            vals,
+            p,
+            boundary,
+            cmap=cmap,
+            vmin=lo,
+            vmax=hi,
+            dpi=args.dpi,
+            figsize=(args.asset_width, args.asset_height),
+        )
+        static_paths.append(p)
 
-    requested_fe = [x.strip() for x in args.fe_vars.split(",") if x.strip()]
+    grid_oro_path = out_dir / "static_orography_china_grid.png"
+    grid_oro_written = False
+    if args.draw_grid_orography:
+        grid_oro_written = draw_grid_orography(oro_path, grid_oro_path, boundary, args.dpi)
+
+    requested_fe = split_items(args.fe_vars)
     fe_lookup = {name.lower(): i for i, name in enumerate(FE_NAMES[:fe_dim])}
     fe_paths: List[Path] = []
     for name in requested_fe:
@@ -654,7 +873,6 @@ def main() -> None:
             vals,
             p,
             boundary,
-            title=FE_NAMES[idx],
             cmap="magma",
             vmin=lo,
             vmax=hi,
@@ -662,60 +880,54 @@ def main() -> None:
             figsize=(args.asset_width, args.asset_height),
         )
         fe_paths.append(p)
-    compose_stack(fe_paths, out_dir / "stack_feature_engineering.png")
-    draw_contact_sheet(fe_paths, out_dir / "sheet_feature_engineering.png", ncols=max(1, min(4, len(fe_paths))), label_prefix="FE")
+    static_fe_paths = static_paths + fe_paths
+    compose_stack(static_fe_paths, out_dir / "stack_static_feature_inputs.png")
+    if args.write_sheets:
+        draw_contact_sheet(static_fe_paths, out_dir / "sheet_static_feature_inputs.png", ncols=max(1, min(4, len(static_fe_paths))))
 
+    output_times, output_selection = choose_output_times(
+        meta,
+        y_cls,
+        args.output_times,
+        eval_df,
+        args.output_min_lowvis,
+        args.output_min_precision,
+        args.output_min_recall,
+    )
+    output_selection_csv = out_dir / "selected_output_times.csv"
+    output_selection.to_csv(output_selection_csv, index=False)
     output_paths: List[Path] = []
-    output_times = next_available_times(meta, selected_time, args.output_times)
+    used_prediction_output = False
     for t in output_times:
-        idx = time_slice(meta, t, args.max_points)
-        df_o = meta.iloc[idx].copy()
-        p = layer_dir / "outputs" / f"observed_visibility_class_{t:%Y%m%d_%H%M}.png"
-        draw_class_map(
-            df_o,
-            y_cls[idx],
-            p,
-            boundary,
-            title=f"Observed class  {t:%Y-%m-%d %H:%M} UTC",
-            dpi=args.dpi,
-            figsize=(args.asset_width, args.asset_height),
-        )
+        eval_sub, pred_col = eval_slice_for_time(eval_df, t, args.max_points)
+        if eval_sub is not None and pred_col:
+            p = layer_dir / "outputs" / f"pmst_output_class_{t:%Y%m%d_%H%M}.png"
+            draw_class_map(
+                eval_sub,
+                eval_sub[pred_col].to_numpy(),
+                p,
+                boundary,
+                dpi=args.dpi,
+                figsize=(args.asset_width, args.asset_height),
+            )
+            used_prediction_output = True
+        else:
+            idx = time_slice(meta, t, args.max_points)
+            df_o = meta.iloc[idx].copy()
+            p = layer_dir / "outputs" / f"observed_output_class_{t:%Y%m%d_%H%M}.png"
+            draw_class_map(
+                df_o,
+                y_cls[idx],
+                p,
+                boundary,
+                dpi=args.dpi,
+                figsize=(args.asset_width, args.asset_height),
+            )
         output_paths.append(p)
-    compose_stack(output_paths, out_dir / "stack_output_observed_classes.png")
-    draw_contact_sheet(output_paths, out_dir / "sheet_output_observed_classes.png", ncols=max(1, min(4, len(output_paths))), label_prefix="Y")
-
-    eval_sub = maybe_load_eval_csv(args.eval_csv, selected_time)
-    pred_paths: List[Path] = []
-    if eval_sub is not None and not eval_sub.empty:
-        for col, cmap in [("pmst_p_fog", "rocket_r"), ("pmst_p_mist", "flare"), ("pmst_pred", "")]:
-            if col not in eval_sub:
-                continue
-            p = layer_dir / "outputs" / f"{col}_{selected_time:%Y%m%d_%H%M}.png"
-            if col == "pmst_pred":
-                draw_class_map(
-                    eval_sub,
-                    eval_sub[col].to_numpy(),
-                    p,
-                    boundary,
-                    title=f"PMST predicted class  {selected_time:%Y-%m-%d %H:%M} UTC",
-                    dpi=args.dpi,
-                    figsize=(args.asset_width, args.asset_height),
-                )
-            else:
-                draw_station_value_map(
-                    eval_sub,
-                    eval_sub[col].to_numpy(),
-                    p,
-                    boundary,
-                    title=col,
-                    cmap="YlOrRd" if col == "pmst_p_fog" else "PuRd",
-                    vmin=0.0,
-                    vmax=1.0,
-                    dpi=args.dpi,
-                    figsize=(args.asset_width, args.asset_height),
-                )
-            pred_paths.append(p)
-        compose_stack(pred_paths, out_dir / "stack_output_pmst_prediction_optional.png")
+    compose_stack(output_paths, out_dir / "stack_output_classes.png")
+    if args.write_sheets:
+        draw_contact_sheet(output_paths, out_dir / "sheet_output_classes.png", ncols=max(1, min(4, len(output_paths))))
+    output_source = "pmst_prediction" if used_prediction_output else "observed_class_fallback"
 
     station_overview = meta[["station_id", "lat", "lon"]].drop_duplicates("station_id").copy()
     draw_station_value_map(
@@ -723,7 +935,6 @@ def main() -> None:
         np.ones(len(station_overview)),
         out_dir / "station_distribution_china.png",
         boundary,
-        title="Test-set stations",
         cmap="Greys",
         vmin=0.0,
         vmax=1.0,
@@ -743,15 +954,25 @@ def main() -> None:
         "dyn_vars_count": int(dyn_count),
         "fe_dim": int(fe_dim),
         "dynamic_vars": list(dynamic_outputs.keys()),
+        "dynamic_lags": [int(i - (args.window - 1)) for i in dynamic_indices],
+        "static_vars": [p.stem for p in static_paths],
         "feature_engineering_vars": [p.stem for p in fe_paths],
+        "style": {
+            "annotation_free": True,
+            "colorbar": False,
+            "axis_frame": False,
+            "extent": list(CHINA_EXTENT),
+        },
         "outputs": {
             "dynamic": dynamic_outputs,
-            "static_station_terrain": str(static_station_path),
-            "static_orography_grid": str(out_dir / "static_orography_china_grid.png"),
+            "static_layers": [str(p) for p in static_paths],
             "feature_layers": [str(p) for p in fe_paths],
-            "feature_stack": str(out_dir / "stack_feature_engineering.png"),
-            "observed_output_layers": [str(p) for p in output_paths],
-            "observed_output_stack": str(out_dir / "stack_output_observed_classes.png"),
+            "static_feature_stack": str(out_dir / "stack_static_feature_inputs.png"),
+            "output_source": output_source,
+            "output_layers": [str(p) for p in output_paths],
+            "output_stack": str(out_dir / "stack_output_classes.png"),
+            "output_selection_csv": str(output_selection_csv),
+            "output_selection": dataframe_records_for_json(output_selection),
             "station_distribution": str(out_dir / "station_distribution_china.png"),
         },
         "class_definition": {
@@ -760,9 +981,8 @@ def main() -> None:
             "2": "visibility >= 1000 m",
         },
     }
-    if pred_paths:
-        manifest["outputs"]["optional_prediction_layers"] = [str(p) for p in pred_paths]
-        manifest["outputs"]["optional_prediction_stack"] = str(out_dir / "stack_output_pmst_prediction_optional.png")
+    if grid_oro_written:
+        manifest["outputs"]["static_orography_grid"] = str(grid_oro_path)
     with open(out_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
