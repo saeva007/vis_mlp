@@ -32,7 +32,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap, ListedColormap
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path as MplPath
 
 
 BASE_PATH = Path("/public/home/putianshu/vis_mlp")
@@ -44,6 +46,14 @@ DEFAULT_OUT = BASE_PATH / "architecture_map_assets"
 WINDOW_SIZE = 12
 CHINA_EXTENT = (73.0, 136.0, 3.0, 54.8)
 MAP_BACKGROUND = "#FFFFFF"
+HUMIDITY_CMAP = "YlGnBu"
+TOPOGRAPHY_CMAP = LinearSegmentedColormap.from_list(
+    "pmst_topography",
+    ["#f7fbef", "#d9f0c7", "#8fc98b", "#c9bd7a", "#9c6b47", "#f2efe8"],
+    N=256,
+)
+TERRAIN_ANOMALY_CMAP = "BrBG"
+TERRAIN_STD_CMAP = "YlOrBr"
 
 BASE_DYN_NAMES = [
     "RH2M",
@@ -331,6 +341,42 @@ def fill_boundary_area(ax, boundary, color: str = MAP_BACKGROUND, zorder: int = 
         ax.fill(xs, ys, facecolor=color, edgecolor="none", linewidth=0, zorder=zorder)
 
 
+def make_boundary_clip_patch(ax, boundary) -> Optional[PathPatch]:
+    if boundary is None:
+        return None
+
+    vertices: List[Tuple[float, float]] = []
+    codes: List[int] = []
+
+    def add_ring(coords: Sequence[Tuple[float, float]]) -> None:
+        pts = np.asarray(coords, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+            return
+        pts = pts[:, :2]
+        if not np.all(np.isfinite(pts)):
+            pts = pts[np.isfinite(pts).all(axis=1)]
+        if pts.shape[0] < 3:
+            return
+        vertices.extend(map(tuple, pts))
+        codes.extend([MplPath.MOVETO] + [MplPath.LINETO] * (pts.shape[0] - 1))
+        vertices.append(tuple(pts[0]))
+        codes.append(MplPath.CLOSEPOLY)
+
+    if hasattr(boundary, "geometry"):
+        for geom in boundary.geometry:
+            for poly in getattr(geom, "geoms", [geom]):
+                exterior = getattr(poly, "exterior", None)
+                if exterior is not None:
+                    add_ring(list(exterior.coords))
+    else:
+        for xs, ys in boundary.get("polygons") or []:
+            add_ring(list(zip(xs, ys)))
+
+    if not vertices:
+        return None
+    return PathPatch(MplPath(vertices, codes), transform=ax.transData)
+
+
 def draw_boundary(ax, boundary, color: str = "#212529", lw: float = 0.55, zorder: int = 5) -> None:
     if boundary is None:
         return
@@ -601,7 +647,19 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         fig.patch.set_alpha(0)
         style_map_ax(ax, boundary, compact=True)
         lo, hi = robust_limits(vals)
-        ax.pcolormesh(lons_plot, lats, vals, cmap="terrain", shading="auto", vmin=lo, vmax=hi, zorder=1)
+        mesh = ax.pcolormesh(
+            lons_plot,
+            lats,
+            vals,
+            cmap=TOPOGRAPHY_CMAP,
+            shading="auto",
+            vmin=lo,
+            vmax=hi,
+            zorder=1,
+        )
+        clip_patch = make_boundary_clip_patch(ax, boundary)
+        if clip_patch is not None:
+            mesh.set_clip_path(clip_patch)
         draw_boundary(ax, boundary, color="#202020", lw=0.5, zorder=6)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(
@@ -903,7 +961,7 @@ def main() -> None:
         elif dyn_names[dyn_idx] in ("T2M", "T_925"):
             cmap = "coolwarm"
         else:
-            cmap = "YlGnBu"
+            cmap = HUMIDITY_CMAP
         dynamic_paths: List[Path] = []
         for t in dynamic_indices:
             lag = t - (args.window - 1)
@@ -935,11 +993,11 @@ def main() -> None:
             dynamic_outputs[dyn_names[dyn_idx]]["sheet"] = str(sheet_path)
 
     static_lookup = {
-        "lat": (static_cont[:, 0], "YlGnBu"),
-        "lon": (static_cont[:, 1], "YlGnBu"),
-        "terrain_h": (static_cont[:, 2], "gist_earth"),
-        "terrain_anomaly": (static_cont[:, 3], "RdBu_r"),
-        "terrain_std": (static_cont[:, 4], "cividis"),
+        "lat": (static_cont[:, 0], HUMIDITY_CMAP),
+        "lon": (static_cont[:, 1], HUMIDITY_CMAP),
+        "terrain_h": (static_cont[:, 2], TOPOGRAPHY_CMAP),
+        "terrain_anomaly": (static_cont[:, 3], TERRAIN_ANOMALY_CMAP),
+        "terrain_std": (static_cont[:, 4], TERRAIN_STD_CMAP),
         "veg": (X_t[:, split_static], "tab20"),
     }
     requested_static = split_items(args.static_vars)
@@ -995,7 +1053,7 @@ def main() -> None:
             vals,
             p,
             boundary,
-            cmap="magma",
+            cmap=HUMIDITY_CMAP,
             vmin=lo,
             vmax=hi,
             dpi=args.dpi,
@@ -1094,6 +1152,12 @@ def main() -> None:
             "transparent_outside_boundary": True,
             "china_fill_color": MAP_BACKGROUND,
             "extent": list(CHINA_EXTENT),
+            "colormaps": {
+                "relative_humidity_and_feature_engineering": HUMIDITY_CMAP,
+                "terrain_h": "pmst_topography",
+                "terrain_anomaly": TERRAIN_ANOMALY_CMAP,
+                "terrain_std": TERRAIN_STD_CMAP,
+            },
         },
         "outputs": {
             "dynamic": dynamic_outputs,
