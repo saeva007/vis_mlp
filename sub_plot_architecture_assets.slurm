@@ -43,6 +43,8 @@ echo "JobId=${SLURM_JOB_ID}  Node=$(hostname)  Started=$(date)"
 echo "Queue=${SLURM_JOB_PARTITION:-kshcexclu04} CPUs=${SLURM_CPUS_PER_TASK:-32}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
+export CONDA_NO_PLUGINS=true
+export CONDA_SOLVER=classic
 source /public/home/putianshu/miniconda3/bin/activate
 conda activate torch
 
@@ -71,24 +73,24 @@ MAX_POINTS="${MAX_POINTS:-0}"
 DPI="${DPI:-220}"
 
 args=(
-  --data_dir "${DATA_DIR}"
-  --shp "${SHP_PATH}"
-  --oro "${ORO_PATH}"
-  --out_dir "${OUT_DIR}"
-  --dynamic_vars "${DYNAMIC_VARS}"
-  --dynamic_lags "${DYNAMIC_LAGS}"
-  --static_vars "${STATIC_VARS}"
-  --fe_vars "${FE_VARS}"
-  --output_times "${OUTPUT_TIMES}"
-  --output_min_lowvis "${OUTPUT_MIN_LOWVIS}"
-  --output_min_precision "${OUTPUT_MIN_PRECISION}"
-  --output_min_recall "${OUTPUT_MIN_RECALL}"
-  --max_points "${MAX_POINTS}"
-  --dpi "${DPI}"
+  --data_dir="${DATA_DIR}"
+  --shp="${SHP_PATH}"
+  --oro="${ORO_PATH}"
+  --out_dir="${OUT_DIR}"
+  --dynamic_vars="${DYNAMIC_VARS}"
+  --dynamic_lags="${DYNAMIC_LAGS}"
+  --static_vars="${STATIC_VARS}"
+  --fe_vars="${FE_VARS}"
+  --output_times="${OUTPUT_TIMES}"
+  --output_min_lowvis="${OUTPUT_MIN_LOWVIS}"
+  --output_min_precision="${OUTPUT_MIN_PRECISION}"
+  --output_min_recall="${OUTPUT_MIN_RECALL}"
+  --max_points="${MAX_POINTS}"
+  --dpi="${DPI}"
 )
 
-[ -n "${VALID_TIME}" ] && args+=(--time "${VALID_TIME}")
-[ -n "${EVAL_CSV}" ] && args+=(--eval_csv "${EVAL_CSV}")
+[ -n "${VALID_TIME}" ] && args+=(--time="${VALID_TIME}")
+[ -n "${EVAL_CSV}" ] && args+=(--eval_csv="${EVAL_CSV}")
 
 echo "Running architecture map asset generation..."
 echo "args: ${args[*]}"
