@@ -25,7 +25,9 @@
 #   STATIC_VARS=terrain_h,terrain_anomaly,veg
 #   FE_VARS=near_saturation_proxy,ventilation_proxy
 #   VALID_TIME="2025-10-31 15:00"
-#   OUTPUT_TIMES=4
+#   OUTPUT_TIMES=3
+#   OUTPUT_MIN_GAP_HOURS=24
+#   OUTPUT_ALLOW_SAME_DAY=0
 #   OUTPUT_MIN_LOWVIS=40
 #   OUTPUT_MIN_PRECISION=0.22
 #   OUTPUT_MIN_RECALL=0.35
@@ -64,7 +66,9 @@ DYNAMIC_LAGS="${DYNAMIC_LAGS:--11,-7,-3,0}"
 STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly,veg}"
 FE_VARS="${FE_VARS:-near_saturation_proxy,ventilation_proxy}"
 VALID_TIME="${VALID_TIME:-}"
-OUTPUT_TIMES="${OUTPUT_TIMES:-4}"
+OUTPUT_TIMES="${OUTPUT_TIMES:-3}"
+OUTPUT_MIN_GAP_HOURS="${OUTPUT_MIN_GAP_HOURS:-24}"
+OUTPUT_ALLOW_SAME_DAY="${OUTPUT_ALLOW_SAME_DAY:-0}"
 OUTPUT_MIN_LOWVIS="${OUTPUT_MIN_LOWVIS:-40}"
 OUTPUT_MIN_PRECISION="${OUTPUT_MIN_PRECISION:-0.22}"
 OUTPUT_MIN_RECALL="${OUTPUT_MIN_RECALL:-0.35}"
@@ -82,6 +86,7 @@ args=(
   --static_vars="${STATIC_VARS}"
   --fe_vars="${FE_VARS}"
   --output_times="${OUTPUT_TIMES}"
+  --output_min_gap_hours="${OUTPUT_MIN_GAP_HOURS}"
   --output_min_lowvis="${OUTPUT_MIN_LOWVIS}"
   --output_min_precision="${OUTPUT_MIN_PRECISION}"
   --output_min_recall="${OUTPUT_MIN_RECALL}"
@@ -91,6 +96,9 @@ args=(
 
 [ -n "${VALID_TIME}" ] && args+=(--time="${VALID_TIME}")
 [ -n "${EVAL_CSV}" ] && args+=(--eval_csv="${EVAL_CSV}")
+case "${OUTPUT_ALLOW_SAME_DAY}" in
+  1|true|TRUE|yes|YES) args+=(--allow_same_day_outputs) ;;
+esac
 
 echo "Running architecture map asset generation..."
 echo "args: ${args[*]}"

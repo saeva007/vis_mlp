@@ -156,8 +156,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_times",
         type=int,
-        default=4,
+        default=3,
         help="Number of output class maps to draw.",
+    )
+    parser.add_argument(
+        "--output_min_gap_hours",
+        type=float,
+        default=24.0,
+        help="Preferred minimum temporal gap between selected output maps.",
+    )
+    parser.add_argument(
+        "--allow_same_day_outputs",
+        action="store_true",
+        help="Allow output maps from the same UTC date; off by default for visual diversity.",
     )
     parser.add_argument(
         "--output_min_lowvis",
@@ -653,6 +664,61 @@ def eval_class_columns(eval_df: Optional[pd.DataFrame]) -> Tuple[Optional[str], 
     return true_col, pred_col
 
 
+def select_diverse_time_rows(
+    candidates: pd.DataFrame,
+    n: int,
+    score_columns: Sequence[str],
+    min_gap_hours: float,
+    prefer_unique_dates: bool,
+) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates.head(0).copy()
+    score_columns = [c for c in score_columns if c in candidates.columns]
+    sort_by = score_columns or ["time"]
+    sort_ascending = [False] * len(sort_by) if score_columns else [True]
+    ranked = candidates.sort_values(sort_by, ascending=sort_ascending)
+    ranked = ranked.reset_index(drop=True)
+
+    chosen: List[int] = []
+    chosen_times: List[pd.Timestamp] = []
+    chosen_dates = set()
+    min_gap_seconds = max(0.0, float(min_gap_hours)) * 3600.0
+
+    def can_take(row: pd.Series, require_new_date: bool, require_gap: bool) -> bool:
+        t = pd.Timestamp(row["time"])
+        if require_new_date and t.date() in chosen_dates:
+            return False
+        if require_gap and any(abs((t - old).total_seconds()) < min_gap_seconds for old in chosen_times):
+            return False
+        return True
+
+    def take_from_ranked(require_new_date: bool, require_gap: bool) -> None:
+        for idx, row in ranked.iterrows():
+            if len(chosen) >= n:
+                return
+            if idx in chosen:
+                continue
+            if not can_take(row, require_new_date=require_new_date, require_gap=require_gap):
+                continue
+            chosen.append(int(idx))
+            t = pd.Timestamp(row["time"])
+            chosen_times.append(t)
+            chosen_dates.add(t.date())
+
+    take_from_ranked(require_new_date=prefer_unique_dates, require_gap=min_gap_seconds > 0)
+    if len(chosen) < n and prefer_unique_dates:
+        take_from_ranked(require_new_date=True, require_gap=False)
+    if len(chosen) < n and min_gap_seconds > 0:
+        take_from_ranked(require_new_date=False, require_gap=True)
+    if len(chosen) < n:
+        take_from_ranked(require_new_date=False, require_gap=False)
+
+    selected = ranked.iloc[chosen[:n]].copy()
+    selected.insert(0, "selection_rank", np.arange(1, len(selected) + 1))
+    selected["selection_date_utc"] = selected["time"].map(lambda t: str(pd.Timestamp(t).date()))
+    return selected
+
+
 def choose_output_times(
     meta: pd.DataFrame,
     y_cls: np.ndarray,
@@ -661,6 +727,8 @@ def choose_output_times(
     min_lowvis: int,
     min_precision: float,
     min_recall: float,
+    min_gap_hours: float,
+    prefer_unique_dates: bool,
 ) -> Tuple[List[pd.Timestamp], pd.DataFrame]:
     """Pick visually useful output times, preferring good low-vis PMST skill."""
     n = max(1, int(n))
@@ -720,9 +788,12 @@ def choose_output_times(
         if len(preferred) < n:
             preferred = pd.concat([preferred, grouped], ignore_index=True).drop_duplicates("time")
 
-        selected = preferred.sort_values(
+        selected = select_diverse_time_rows(
+            preferred,
+            n,
             ["selection_score", "lowvis_count", "lowvis_precision", "lowvis_recall"],
-            ascending=False,
+            min_gap_hours=min_gap_hours,
+            prefer_unique_dates=prefer_unique_dates,
         ).head(n)
         selected = selected.assign(selection_source="eval_csv", prediction_column=pred_col, truth_column=true_col)
         return [pd.Timestamp(t) for t in selected["time"]], selected.reset_index(drop=True)
@@ -736,7 +807,13 @@ def choose_output_times(
         .reset_index()
     )
     grouped["selection_score"] = grouped["lowvis_count"].astype(float)
-    selected = grouped.sort_values(["lowvis_count", "time"], ascending=[False, True]).head(n)
+    selected = select_diverse_time_rows(
+        grouped,
+        n,
+        ["lowvis_count", "selection_score"],
+        min_gap_hours=min_gap_hours,
+        prefer_unique_dates=prefer_unique_dates,
+    ).head(n)
     selected = selected.assign(selection_source="observed_class_fallback")
     return [pd.Timestamp(t) for t in selected["time"]], selected.reset_index(drop=True)
 
@@ -927,6 +1004,8 @@ def main() -> None:
         args.output_min_lowvis,
         args.output_min_precision,
         args.output_min_recall,
+        args.output_min_gap_hours,
+        not args.allow_same_day_outputs,
     )
     output_selection_csv = out_dir / "selected_output_times.csv"
     output_selection.to_csv(output_selection_csv, index=False)
@@ -989,6 +1068,11 @@ def main() -> None:
         "fe_dim": int(fe_dim),
         "dynamic_vars": list(dynamic_outputs.keys()),
         "dynamic_lags": [int(i - (args.window - 1)) for i in dynamic_indices],
+        "output_time_selection": {
+            "requested_maps": int(args.output_times),
+            "preferred_unique_dates": bool(not args.allow_same_day_outputs),
+            "preferred_min_gap_hours": float(args.output_min_gap_hours),
+        },
         "static_vars": [p.stem for p in static_paths],
         "feature_engineering_vars": [p.stem for p in fe_paths],
         "style": {
