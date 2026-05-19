@@ -50,6 +50,11 @@ WINDOW_SIZE = 12
 CHINA_EXTENT = (73.0, 136.0, 3.0, 54.8)
 MAP_BACKGROUND = "#FFFFFF"
 HUMIDITY_CMAP = "YlGnBu"
+FEATURE_ENGINEERING_CMAP = LinearSegmentedColormap.from_list(
+    "pmst_feature_clean",
+    ["#F7FCF5", "#D9F0E3", "#A6DBD5", "#67A9CF", "#2166AC"],
+    N=256,
+)
 TOPOGRAPHY_CMAP = LinearSegmentedColormap.from_list(
     "pmst_topography",
     ["#1A9850", "#66BD63", "#D9EF8B", "#C8A96A", "#8C510A", "#F7F7F2"],
@@ -1229,7 +1234,7 @@ def main() -> None:
             vals,
             p,
             boundary,
-            cmap=HUMIDITY_CMAP,
+            cmap=FEATURE_ENGINEERING_CMAP,
             vmin=lo,
             vmax=hi,
             dpi=args.dpi,
@@ -1335,7 +1340,8 @@ def main() -> None:
             "china_fill_color": MAP_BACKGROUND,
             "extent": list(CHINA_EXTENT),
             "colormaps": {
-                "relative_humidity_and_feature_engineering": HUMIDITY_CMAP,
+                "relative_humidity": HUMIDITY_CMAP,
+                "feature_engineering": "pmst_feature_clean",
                 "terrain_h": "pmst_topography",
                 "terrain_anomaly": TERRAIN_ANOMALY_CMAP,
                 "terrain_std": TERRAIN_STD_CMAP,
