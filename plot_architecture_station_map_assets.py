@@ -5,12 +5,14 @@ Create China station-map assets for the PMST low-visibility architecture figure.
 
 This script is intended to run on the remote project machine, not locally.  It
 uses the S2 month-tail test set and the existing China shapefile to create
-clean, annotation-free PNG layers for an architecture schematic:
+mostly annotation-free PNG layers for an architecture schematic:
 
   - compact dynamic-input station stacks at selected lags, default t-11/t-7/t-3/t.
+  - an angled 12-h RH2M window stack for the dynamic sequence icon.
   - one static/feature-engineering station stack.
   - several three-class output maps selected for adequate low-visibility count
     and high low-visibility precision/recall when evaluation CSV is available.
+  - a small categorical output colorbar for the three visibility classes.
 
 The script avoids importing the training model; it only visualizes data already
 saved by s2_data.py.
@@ -33,7 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap, ListedColormap
-from matplotlib.patches import PathPatch
+from matplotlib.patches import FancyBboxPatch, PathPatch
 from matplotlib.path import Path as MplPath
 
 
@@ -497,16 +499,15 @@ def draw_class_map(
     plt.close(fig)
 
 
-def compose_stack(
+def compose_stack_canvas(
     image_paths: Sequence[Path],
-    out_path: Path,
     offset: Tuple[int, int] = (28, 18),
     shadow: bool = True,
-) -> None:
+):
     from PIL import Image, ImageFilter
 
     if not image_paths:
-        return
+        return None
     imgs = [Image.open(p).convert("RGBA") for p in image_paths]
     max_w = max(im.width for im in imgs)
     max_h = max(im.height for im in imgs)
@@ -522,6 +523,142 @@ def compose_stack(
             sh.putalpha(alpha.filter(ImageFilter.GaussianBlur(2.5)))
             canvas.alpha_composite(sh, (x + 5, y + 5))
         canvas.alpha_composite(im, (x, y))
+    return canvas
+
+
+def compose_stack(
+    image_paths: Sequence[Path],
+    out_path: Path,
+    offset: Tuple[int, int] = (28, 18),
+    shadow: bool = True,
+) -> None:
+    canvas = compose_stack_canvas(image_paths, offset=offset, shadow=shadow)
+    if canvas is None:
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+
+
+def draw_output_class_colorbar(out_path: Path, dpi: int = 220) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(2.05, 0.82))
+    fig.patch.set_alpha(0)
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    ax.set_axis_off()
+    box = FancyBboxPatch(
+        (0.035, 0.075),
+        0.93,
+        0.85,
+        boxstyle="round,pad=0.02,rounding_size=0.055",
+        transform=ax.transAxes,
+        facecolor=(1.0, 1.0, 1.0, 0.94),
+        edgecolor="#9AA0A6",
+        linewidth=0.75,
+    )
+    ax.add_patch(box)
+    ys = [0.70, 0.50, 0.30]
+    for y, color, label in zip(ys, CLASS_COLORS, CLASS_NAMES):
+        ax.scatter([0.18], [y], s=34, c=[color], edgecolors="none", transform=ax.transAxes, zorder=3)
+        ax.text(
+            0.30,
+            y,
+            label,
+            transform=ax.transAxes,
+            ha="left",
+            va="center",
+            fontsize=7.8,
+            fontfamily="DejaVu Serif",
+            color="#1F2933",
+        )
+    fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.01)
+    plt.close(fig)
+
+
+def compose_stack_with_colorbar(
+    image_paths: Sequence[Path],
+    colorbar_path: Path,
+    out_path: Path,
+    offset: Tuple[int, int] = (28, 18),
+    shadow: bool = True,
+) -> None:
+    from PIL import Image
+
+    stack = compose_stack_canvas(image_paths, offset=offset, shadow=shadow)
+    if stack is None:
+        return
+    bar = Image.open(colorbar_path).convert("RGBA")
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    max_bar_w = max(1, int(stack.width * 0.62))
+    if bar.width > max_bar_w:
+        new_h = max(1, int(round(bar.height * max_bar_w / bar.width)))
+        bar = bar.resize((max_bar_w, new_h), resample)
+    pad = max(10, int(round(stack.width * 0.045)))
+    gap = max(8, int(round(stack.height * 0.035)))
+    canvas_w = max(stack.width, bar.width + pad * 2)
+    canvas_h = stack.height + gap + bar.height
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    stack_x = (canvas_w - stack.width) // 2
+    canvas.alpha_composite(stack, (stack_x, 0))
+    bar_x = min(canvas_w - bar.width - pad, max(pad, stack_x + int(round(stack.width * 0.08))))
+    canvas.alpha_composite(bar, (bar_x, stack.height + gap))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+
+
+def compose_angled_window_stack(
+    image_paths: Sequence[Path],
+    out_path: Path,
+    panel_width: int = 150,
+    x_step: int = 10,
+    y_step: int = 3,
+    shear: float = 0.18,
+    rotation: float = -5.0,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFilter
+
+    if not image_paths:
+        return
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    bicubic = getattr(getattr(Image, "Resampling", Image), "BICUBIC")
+    affine = getattr(getattr(Image, "Transform", Image), "AFFINE")
+    panels = []
+    for p in image_paths:
+        im = Image.open(p).convert("RGBA")
+        bbox = im.getbbox()
+        if bbox:
+            im = im.crop(bbox)
+        scale = panel_width / max(1, im.width)
+        im = im.resize((panel_width, max(1, int(round(im.height * scale)))), resampling)
+        pad = max(4, int(round(panel_width * 0.035)))
+        card = Image.new("RGBA", (im.width + pad * 2, im.height + pad * 2), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(card)
+        rect = [1, 1, card.width - 2, card.height - 2]
+        if hasattr(draw, "rounded_rectangle"):
+            draw.rounded_rectangle(rect, radius=4, fill=(255, 255, 255, 245), outline=(68, 135, 195, 215))
+            draw.rounded_rectangle([3, 3, card.width - 4, card.height - 4], radius=3, outline=(68, 135, 195, 135))
+        else:
+            draw.rectangle(rect, fill=(255, 255, 255, 245), outline=(68, 135, 195, 215))
+            draw.rectangle([3, 3, card.width - 4, card.height - 4], outline=(68, 135, 195, 135))
+        card.alpha_composite(im, (pad, pad))
+        skew_w = int(round(card.width + abs(shear) * card.height))
+        slanted = card.transform((skew_w, card.height), affine, (1, -shear, 0, 0, 1, 0), resample=bicubic)
+        slanted = slanted.rotate(rotation, resample=bicubic, expand=True)
+        panels.append(slanted)
+
+    max_w = max(panel.width for panel in panels)
+    max_h = max(panel.height for panel in panels)
+    margin = 10
+    canvas_w = max_w + x_step * (len(panels) - 1) + margin * 2
+    canvas_h = max_h + y_step * (len(panels) - 1) + margin * 2
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+    for i, panel in enumerate(panels):
+        x = margin + x_step * i
+        y = margin + y_step * (len(panels) - 1 - i)
+        alpha = panel.split()[-1]
+        shadow = Image.new("RGBA", panel.size, (18, 38, 64, 44))
+        shadow.putalpha(alpha.filter(ImageFilter.GaussianBlur(2.0)))
+        canvas.alpha_composite(shadow, (x + 3, y + 4))
+        canvas.alpha_composite(panel, (x, y))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
 
@@ -992,6 +1129,37 @@ def main() -> None:
         if args.write_sheets:
             dynamic_outputs[dyn_names[dyn_idx]]["sheet"] = str(sheet_path)
 
+    rh2m_window_assets: Dict[str, object] = {}
+    if "rh2m" in dyn_lookup:
+        rh_idx = dyn_lookup["rh2m"]
+        rh_values = dyn_seq[:, :, rh_idx]
+        rh_vmin, rh_vmax = robust_limits(rh_values)
+        rh_window_paths: List[Path] = []
+        for t in range(args.window):
+            lag = t - (args.window - 1)
+            lag_name = f"m{abs(lag):02d}" if lag < 0 else "t00"
+            p = layer_dir / "dynamic" / "RH2M_12h_window" / f"rh2m_window_{lag_name}.png"
+            draw_station_value_map(
+                df_t,
+                rh_values[:, t],
+                p,
+                boundary,
+                cmap=HUMIDITY_CMAP,
+                vmin=rh_vmin,
+                vmax=rh_vmax,
+                dpi=args.dpi,
+                figsize=(args.asset_width, args.asset_height),
+            )
+            rh_window_paths.append(p)
+        rh_window_stack = out_dir / "stack_dynamic_RH2M_12h_angled.png"
+        compose_angled_window_stack(rh_window_paths, rh_window_stack)
+        rh2m_window_assets = {
+            "layers": [str(p) for p in rh_window_paths],
+            "angled_stack": str(rh_window_stack),
+        }
+    else:
+        print("[WARN] RH2M is unavailable; skip RH2M 12-h angled stack.", flush=True)
+
     static_lookup = {
         "lat": (static_cont[:, 0], HUMIDITY_CMAP),
         "lon": (static_cont[:, 1], HUMIDITY_CMAP),
@@ -1106,7 +1274,12 @@ def main() -> None:
                 figsize=(args.asset_width, args.asset_height),
             )
         output_paths.append(p)
-    compose_stack(output_paths, out_dir / "stack_output_classes.png")
+    output_colorbar_path = out_dir / "output_visibility_class_colorbar.png"
+    draw_output_class_colorbar(output_colorbar_path, args.dpi)
+    output_stack_maps_only = out_dir / "stack_output_classes_maps_only.png"
+    output_stack_with_colorbar = out_dir / "stack_output_classes.png"
+    compose_stack(output_paths, output_stack_maps_only)
+    compose_stack_with_colorbar(output_paths, output_colorbar_path, output_stack_with_colorbar)
     if args.write_sheets:
         draw_contact_sheet(output_paths, out_dir / "sheet_output_classes.png", ncols=max(1, min(4, len(output_paths))))
     output_source = "pmst_prediction" if used_prediction_output else "observed_class_fallback"
@@ -1145,8 +1318,9 @@ def main() -> None:
         "static_vars": [p.stem for p in static_paths],
         "feature_engineering_vars": [p.stem for p in fe_paths],
         "style": {
-            "annotation_free": True,
-            "colorbar": False,
+            "map_layers_annotation_free": True,
+            "input_colorbars": False,
+            "output_class_colorbar": True,
             "axis_frame": False,
             "opaque_china_fill": True,
             "transparent_outside_boundary": True,
@@ -1161,12 +1335,15 @@ def main() -> None:
         },
         "outputs": {
             "dynamic": dynamic_outputs,
+            "rh2m_12h_window": rh2m_window_assets,
             "static_layers": [str(p) for p in static_paths],
             "feature_layers": [str(p) for p in fe_paths],
             "static_feature_stack": str(out_dir / "stack_static_feature_inputs.png"),
             "output_source": output_source,
             "output_layers": [str(p) for p in output_paths],
-            "output_stack": str(out_dir / "stack_output_classes.png"),
+            "output_class_colorbar": str(output_colorbar_path),
+            "output_stack_maps_only": str(output_stack_maps_only),
+            "output_stack": str(output_stack_with_colorbar),
             "output_selection_csv": str(output_selection_csv),
             "output_selection": dataframe_records_for_json(output_selection),
             "station_distribution": str(out_dir / "station_distribution_china.png"),
