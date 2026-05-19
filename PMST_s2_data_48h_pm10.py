@@ -4,9 +4,10 @@
 - 每次起报后 0–48 小时内单独划分 12h 时间窗口，不与其他起报时间合并；
 - 气象变量顺序与 stage1 (PMST_s1_data_pm10) 一致：FINAL_FEATURE_ORDER 同序（ERA5 命名不同但变量一一对应）。
 - 预报特有：lead_time、周期时间编码(月/时)、以及 PMST_s2_data 的 compute_fog_features 中多出的 7 维见下方注释。
+- 当前默认输出与 PM10+PM2.5 主模型评估配置一致：27 dyn + 36 FE，raw time 按 UTC 处理。
 
 输出目录:
-  vis_mlp/ml_dataset_fe_12h_48h_pm10
+  vis_mlp/ml_dataset_fe_12h_48h_pm10_pm25_testonly_leadtime
 
 --- Stage2 有而 Stage1 没有的特征工程（仅列出，不删除）---
 1) 周期时间编码：fe 中增加 4 维 [sin(2π*month/12), cos(2π*month/12), sin(2π*hour/24), cos(2π*hour/24)]（观测时刻）。
@@ -14,12 +15,14 @@
 3) compute_fog_features：PMST_s2_data 在 stage1 的 24 维 fog 特征之后多 8 维：
    shear_mag, dir_turning, convective_wet, daytime_mixing, ventilation, moisture_strat, omega_contrast, warm_instability。
    即 stage2 的 fog 部分为 32 维（24+8），stage1 为 24 维。
-4) 若提供 pm10 文件，将 pm10 作为动态变量追加到 dyn（并在训练端统一 log1p）。FE 总维数固定为 32+4 = 36。
+4) PM10 和 PM2.5 作为动态变量追加到 dyn 末两维（训练/评估端统一 log1p）。FE 总维数固定为 32+4 = 36。
 """
 
+import json
 import os
 import re
 import gc
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -30,9 +33,6 @@ from tqdm import tqdm
 from PMST_s2_data import (
     VAR_MAPPING,
     FINAL_FEATURE_ORDER,
-    TRAIN_RATIO,
-    VAL_RATIO,
-    GAP_HOURS,
     WINDOW_SIZE,
     STEP_SIZE,
     UNIQUE_VEG_IDS,
@@ -42,7 +42,12 @@ from PMST_s2_data import (
     calculate_zenith_angle,
     get_nearest_veg,
     extract_terrain,
-    get_monthly_split_mask,
+)
+from s2_data_aerosol import (
+    GAP_HOURS,
+    TEST_LAST_DAYS,
+    VAL_LAST_DAYS,
+    get_monthly_split_mask_last_days,
 )
 
 BASE_PATH = "/public/home/putianshu/vis_mlp"
@@ -50,9 +55,15 @@ CURRENT_48H_DIR = os.path.join(BASE_PATH, "tianji_auto_station", "current_48h")
 VIS_SOURCE_NC = os.path.join(BASE_PATH, "tianji_auto_station", "merged_final_all_vars.nc")
 VEG_FILE = "/public/home/putianshu/vis_cnn/data_vegtype.nc"
 ORO_FILE = "/public/home/putianshu/vis_cnn/data_orography.nc"
-OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, "ml_dataset_fe_12h_48h_pm10")
+OUTPUT_DATASET_DIR = os.environ.get(
+    "OUTPUT_DATASET_DIR",
+    os.path.join(BASE_PATH, "ml_dataset_fe_12h_48h_pm10_pm25_testonly_leadtime"),
+)
 
-PM10_S2_FILE = os.path.join(BASE_PATH, "pm10_station", "pm10_station_s2_2025.nc")
+PM10_S2_FILE = os.environ.get("PM10_S2_FILE", os.path.join(BASE_PATH, "pm10_station", "pm10_station_s2_2025.nc"))
+PM10_DIR = os.environ.get("PM10_DIR", os.path.join(BASE_PATH, "pm10_station"))
+PM25_S2_FILE = os.environ.get("PM25_S2_FILE", os.path.join(BASE_PATH, "pm2.5_station", "pm2p5_station_s2_2025.nc"))
+PM25_DIR = os.environ.get("PM25_DIR", os.path.join(BASE_PATH, "pm2.5_station"))
 
 # current_48h 目录中 2m 温度为 TMP2m（无 t2mz），与 VAR_MAPPING 一致
 VARIABLES_48H = [
@@ -98,6 +109,76 @@ def _load_station_latlon():
         & (station_df["station_lat"] >= 10) & (station_df["station_lat"] <= 60)
     ]
     return station_df.set_index("num_station")
+
+
+def load_station_pm_dataarray(file_path, dir_path, var_candidates, label):
+    """返回 (time, station_id) 的 PM DataArray；缺失时返回 None 并由调用处补零。"""
+    das = []
+    if os.path.isfile(file_path):
+        ds = xr.open_dataset(file_path, engine="h5netcdf")
+        var_name = next((v for v in var_candidates if v in ds), None) or list(ds.data_vars)[0]
+        da = ds[var_name].load()
+        ds.close()
+        das.append(da)
+    elif os.path.isdir(dir_path):
+        for fp in sorted(glob(os.path.join(dir_path, "*.nc"))):
+            try:
+                ds = xr.open_dataset(fp, engine="h5netcdf")
+                if "station_id" not in ds.coords and "station_id" not in ds.data_vars:
+                    for alias in ("num_station", "id", "station"):
+                        if alias in ds.coords or alias in ds.data_vars:
+                            ds = ds.rename({alias: "station_id"})
+                            break
+                var_name = next((v for v in var_candidates if v in ds), None) or list(ds.data_vars)[0]
+                da = ds[var_name].load()
+                ds.close()
+                das.append(da)
+            except Exception as exc:
+                print(f"[WARN] skip {label} file {fp}: {exc}", flush=True)
+    if not das:
+        print(f"[WARN] No {label} station files found; {label} dynamic channel will be zeros.", flush=True)
+        return None
+    da = xr.concat(das, dim="time") if len(das) > 1 else das[0]
+    if "station_id" not in da.dims:
+        raise ValueError(f"{label} DataArray must have station_id dimension")
+    return da.transpose("time", "station_id")
+
+
+def station_pm_to_ugm3_grid(pm_da, times, stations, label):
+    """将站点 PM 对齐到 48h forecast valid time/station；kg m-3 转 ug m-3。"""
+    nt_ds, ns_ds = len(times), len(stations)
+    if pm_da is None:
+        return np.zeros((nt_ds, ns_ds), dtype=np.float32)
+    pm_grid_da = pm_da
+    if set(pm_grid_da.dims) >= {"time", "station_id"}:
+        pm_grid_da = pm_grid_da.transpose("time", "station_id")
+    else:
+        raise ValueError(f"{label} dims must contain 'time' and 'station_id', got {pm_grid_da.dims}")
+    pm_grid_da = pm_grid_da.load()
+    time_vals = pm_grid_da["time"].values
+    if np.issubdtype(time_vals.dtype, np.datetime64):
+        time_index = pd.DatetimeIndex(time_vals)
+    else:
+        time_index = pd.to_datetime(time_vals, unit="s", origin="unix")
+    ds_times = pd.DatetimeIndex(times)
+    sid_index = pd.Index(pm_grid_da["station_id"].values)
+    sids = stations.astype(pm_grid_da["station_id"].dtype)
+    time_pos = time_index.get_indexer(ds_times, method="nearest")
+    sid_pos = sid_index.get_indexer(sids)
+
+    _, ns_pm = pm_grid_da.shape
+    pm_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
+    base = np.asarray(pm_grid_da.values, dtype=np.float32).reshape(-1)
+    linear_idx_grid = time_pos[:, None] * ns_pm + sid_pos[None, :]
+    ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
+    if ok_mask.any():
+        pm_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
+    pm_grid = np.maximum(pm_grid, 0.0)
+    pm_ugm3 = pm_grid * 1e12
+    median = np.nanmedian(pm_ugm3)
+    if not np.isfinite(median):
+        median = 0.0
+    return np.where(np.isfinite(pm_ugm3), pm_ugm3, median).astype(np.float32)
 
 
 def load_merged_run_ds(run_str, data_veg, data_oro):
@@ -186,7 +267,7 @@ def load_merged_run_ds(run_str, data_veg, data_oro):
     return ds, init_time
 
 
-def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da, pm10_da):
+def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da, pm10_da, pm25_da):
     """
     仅在当前 run 的 48h 时间序列内划分 12h 窗口，不跨 run。
     返回: (X_dyn_flat, X_stat_flat, fe_flat, y_flat, meta_tuple)
@@ -209,50 +290,13 @@ def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vi
     del X_met, zenith
     gc.collect()
 
-    # ========= 将 pm10 作为动态变量追加到 dyn 的最后一维 =========
-    # pm10 文件单位为 kg/m^3，这里转换为 ug/m^3 后留给训练脚本做 log1p。
-    if pm10_da is not None:
-        pm10_grid_da = pm10_da
-        if set(pm10_grid_da.dims) >= {"time", "station_id"}:
-            pm10_grid_da = pm10_grid_da.transpose("time", "station_id")
-        else:
-            raise ValueError(
-                f"pm10_da dims must contain 'time' and 'station_id', got {pm10_grid_da.dims}"
-            )
-        pm10_grid_da = pm10_grid_da.load()
-
-        time_vals = pm10_grid_da["time"].values
-        if np.issubdtype(time_vals.dtype, np.datetime64):
-            time_index = pd.DatetimeIndex(time_vals)
-        else:
-            time_index = pd.to_datetime(time_vals, unit="s", origin="unix")
-
-        ds_times = pd.DatetimeIndex(times)
-        sid_index = pd.Index(pm10_grid_da["station_id"].values)
-        sids = stations.astype(pm10_grid_da["station_id"].dtype)
-
-        time_pos = time_index.get_indexer(ds_times, method="nearest")
-        sid_pos = sid_index.get_indexer(sids)
-
-        nt_ds, ns_ds = len(ds_times), len(sids)
-        nt_pm10, ns_pm10 = pm10_grid_da.shape
-        pm10_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
-
-        base = np.asarray(pm10_grid_da.values).reshape(-1)
-        linear_idx_grid = time_pos[:, None] * ns_pm10 + sid_pos[None, :]
-        ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
-        if ok_mask.any():
-            pm10_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
-
-        pm10_grid = np.maximum(pm10_grid, 0.0)
-        pm10_ugm3 = pm10_grid * 1e12
-        pm10_median = np.nanmedian(pm10_ugm3)
-        if not np.isfinite(pm10_median):
-            pm10_median = 0.0
-        pm10_ugm3 = np.where(np.isfinite(pm10_ugm3), pm10_ugm3, pm10_median).astype(np.float32)
-
-        X_dyn = np.concatenate([X_dyn, pm10_ugm3[..., None]], axis=-1)
-        nv = X_dyn.shape[-1]
+    # ========= 将 PM10 / PM2.5 作为动态变量追加到 dyn 的最后两维 =========
+    # PM 文件单位为 kg/m^3，这里转换为 ug/m^3 后留给训练/评估脚本做 log1p。
+    pm10_ugm3 = station_pm_to_ugm3_grid(pm10_da, times, stations, "PM10")
+    pm25_ugm3 = station_pm_to_ugm3_grid(pm25_da, times, stations, "PM2.5")
+    X_dyn = np.concatenate([X_dyn, pm10_ugm3[..., None], pm25_ugm3[..., None]], axis=-1)
+    nv = X_dyn.shape[-1]
+    del pm10_ugm3, pm25_ugm3
 
     lead_time = ds["lead_time"].values
 
@@ -328,7 +372,12 @@ def save_chunked_48h(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_d
     n = len(valid_idxs)
     print(f"  Valid Samples: {n} ({n / len(mask):.1%})", flush=True)
     valid_times = pd.DatetimeIndex(times_all[valid_idxs])
-    tr_m, val_m, test_m = get_monthly_split_mask(valid_times)
+    tr_m, val_m, test_m = get_monthly_split_mask_last_days(
+        valid_times,
+        gap_hours=GAP_HOURS,
+        val_last_days=VAL_LAST_DAYS,
+        test_last_days=TEST_LAST_DAYS,
+    )
     splits = {"train": valid_idxs[tr_m], "val": valid_idxs[val_m], "test": valid_idxs[test_m]}
     dims = [X_dyn_flat.shape[1], X_stat_flat.shape[1], fe_flat.shape[1]]
     for tag, ix in splits.items():
@@ -359,6 +408,33 @@ def save_chunked_48h(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_d
         del fp
         gc.collect()
 
+    config = {
+        "builder": os.path.basename(__file__),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "output_dataset_dir": out_dir,
+        "source_current_48h_dir": CURRENT_48H_DIR,
+        "visibility_source_nc": VIS_SOURCE_NC,
+        "tianji_raw_time_alignment": "raw_utc_no_shift",
+        "split": {
+            "type": "monthly_tail_last_days",
+            "val_last_days": VAL_LAST_DAYS,
+            "test_last_days": TEST_LAST_DAYS,
+            "gap_hours": GAP_HOURS,
+        },
+        "window_size": WINDOW_SIZE,
+        "step_size": STEP_SIZE,
+        "dynamic_order": FINAL_FEATURE_ORDER + ["zenith", "PM10_ugm3", "PM25_ugm3"],
+        "dynamic_dim": int(X_dyn_flat.shape[1] // WINDOW_SIZE),
+        "static_dim": int(X_stat_flat.shape[1]),
+        "feature_engineering_dim": int(fe_flat.shape[1]),
+        "total_dim": int(X_dyn_flat.shape[1] + X_stat_flat.shape[1] + fe_flat.shape[1]),
+        "pm10_file": PM10_S2_FILE,
+        "pm25_file": PM25_S2_FILE,
+        "note": "48h evaluation dataset aligned with current PM10+PM2.5 UTC main model layout.",
+    }
+    with open(os.path.join(out_dir, "dataset_build_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
 
 def main():
     import warnings
@@ -380,12 +456,8 @@ def main():
         print("[Time Alignment] Visibility source raw time is UTC; no shift applied.", flush=True)
         vis_da = ds_vis["visibility"]
 
-    if os.path.exists(PM10_S2_FILE):
-        pm10_ds = xr.open_dataset(PM10_S2_FILE, engine="h5netcdf")
-        pm10_da = pm10_ds["pm10"]
-    else:
-        print(f"[WARN] pm10 file for s2 not found: {PM10_S2_FILE}, pm10 will be NaN.", flush=True)
-        pm10_da = None
+    pm10_da = load_station_pm_dataarray(PM10_S2_FILE, PM10_DIR, ("pm10", "PM10"), "PM10")
+    pm25_da = load_station_pm_dataarray(PM25_S2_FILE, PM25_DIR, ("pm2p5", "pm25", "pm2_5", "PM2_5"), "PM2.5")
 
     run_list = get_run_list_from_current_48h()
     print(
@@ -411,7 +483,7 @@ def main():
         else:
             vis_da_use = vis_da
         try:
-            out = build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da_use, pm10_da)
+            out = build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da_use, pm10_da, pm25_da)
         except Exception as e:
             ds_run.close()
             print(f"  Run {run_str} skip: {e}", flush=True)
@@ -459,6 +531,7 @@ def main():
         OUTPUT_DATASET_DIR,
     )
     print(f"Done. Output: {OUTPUT_DATASET_DIR}", flush=True)
+    print(f"  Dyn dim: {X_dyn_flat.shape[1] // WINDOW_SIZE} (met+zenith+PM10+PM2.5)", flush=True)
     print(f"  FE dim (fog+cyclical): {fe_flat.shape[1]}", flush=True)
 
 
