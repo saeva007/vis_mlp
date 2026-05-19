@@ -261,12 +261,13 @@ def split_items(spec: str) -> List[str]:
     return [x.strip() for x in str(spec).replace(";", ",").split(",") if x.strip()]
 
 
-def read_shp_segments(shp_path: Path) -> Optional[List[Tuple[np.ndarray, np.ndarray]]]:
+def read_shp_geometry(shp_path: Path) -> Dict[str, List[Tuple[np.ndarray, np.ndarray]]]:
     try:
         data = shp_path.read_bytes()
         if len(data) < 100:
-            return None
+            return {"segments": [], "polygons": []}
         segments: List[Tuple[np.ndarray, np.ndarray]] = []
+        polygons: List[Tuple[np.ndarray, np.ndarray]] = []
         pos = 100
         while pos + 8 <= len(data):
             content_bytes = int(struct.unpack(">i", data[pos + 4 : pos + 8])[0]) * 2
@@ -296,10 +297,12 @@ def read_shp_segments(shp_path: Path) -> Optional[List[Tuple[np.ndarray, np.ndar
                 if b > a:
                     seg = points[a:b].copy()
                     segments.append((seg[:, 0], seg[:, 1]))
-        return segments if segments else None
+                    if shape_type in (5, 15):
+                        polygons.append((seg[:, 0], seg[:, 1]))
+        return {"segments": segments, "polygons": polygons}
     except Exception as exc:
         print(f"[WARN] Pure-Python shapefile reader failed for {shp_path}: {exc}", flush=True)
-        return None
+        return {"segments": [], "polygons": []}
 
 
 def load_boundary(shp_path: Path):
@@ -312,7 +315,20 @@ def load_boundary(shp_path: Path):
         return gpd.read_file(str(shp_path))
     except Exception as exc:
         print(f"[WARN] geopandas could not read {shp_path}: {exc}", flush=True)
-    return {"segments": read_shp_segments(shp_path)}
+    return read_shp_geometry(shp_path)
+
+
+def fill_boundary_area(ax, boundary, color: str = MAP_BACKGROUND, zorder: int = 0) -> None:
+    if boundary is None:
+        return
+    if hasattr(boundary, "plot"):
+        try:
+            boundary.plot(ax=ax, facecolor=color, edgecolor="none", linewidth=0, zorder=zorder)
+            return
+        except Exception as exc:
+            print(f"[WARN] Could not fill boundary polygons with geopandas: {exc}", flush=True)
+    for xs, ys in boundary.get("polygons") or []:
+        ax.fill(xs, ys, facecolor=color, edgecolor="none", linewidth=0, zorder=zorder)
 
 
 def draw_boundary(ax, boundary, color: str = "#212529", lw: float = 0.55, zorder: int = 5) -> None:
@@ -329,7 +345,8 @@ def style_map_ax(ax, boundary, compact: bool = True) -> None:
     ax.set_xlim(CHINA_EXTENT[0], CHINA_EXTENT[1])
     ax.set_ylim(CHINA_EXTENT[2], CHINA_EXTENT[3])
     ax.set_aspect("equal", adjustable="box")
-    ax.set_facecolor(MAP_BACKGROUND)
+    ax.set_facecolor("none")
+    fill_boundary_area(ax, boundary, zorder=0)
     draw_boundary(ax, boundary, color="#242424", lw=0.45, zorder=6)
     if compact:
         ax.set_xticks([])
@@ -370,8 +387,7 @@ def draw_station_value_map(
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.patch.set_facecolor(MAP_BACKGROUND)
-    fig.patch.set_alpha(1.0)
+    fig.patch.set_alpha(0)
     style_map_ax(ax, boundary, compact=True)
     vals = np.asarray(value, dtype=float)
     valid = np.isfinite(vals) & np.isfinite(df["lon"].to_numpy(float)) & np.isfinite(df["lat"].to_numpy(float))
@@ -391,8 +407,7 @@ def draw_station_value_map(
     fig.savefig(
         out_path,
         dpi=dpi,
-        transparent=False,
-        facecolor=MAP_BACKGROUND,
+        transparent=True,
         bbox_inches="tight",
         pad_inches=0.02,
     )
@@ -411,8 +426,7 @@ def draw_class_map(
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.patch.set_facecolor(MAP_BACKGROUND)
-    fig.patch.set_alpha(1.0)
+    fig.patch.set_alpha(0)
     style_map_ax(ax, boundary, compact=True)
     cls = np.asarray(classes, dtype=float)
     valid = np.isfinite(cls)
@@ -430,8 +444,7 @@ def draw_class_map(
     fig.savefig(
         out_path,
         dpi=dpi,
-        transparent=False,
-        facecolor=MAP_BACKGROUND,
+        transparent=True,
         bbox_inches="tight",
         pad_inches=0.02,
     )
@@ -585,8 +598,7 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         lats = lats[lat_mask]
         lons_plot = lons_plot[lon_mask]
         fig, ax = plt.subplots(figsize=(3.3, 3.3))
-        fig.patch.set_facecolor(MAP_BACKGROUND)
-        fig.patch.set_alpha(1.0)
+        fig.patch.set_alpha(0)
         style_map_ax(ax, boundary, compact=True)
         lo, hi = robust_limits(vals)
         ax.pcolormesh(lons_plot, lats, vals, cmap="terrain", shading="auto", vmin=lo, vmax=hi, zorder=1)
@@ -595,8 +607,7 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         fig.savefig(
             out_path,
             dpi=dpi,
-            transparent=False,
-            facecolor=MAP_BACKGROUND,
+            transparent=True,
             bbox_inches="tight",
             pad_inches=0.02,
         )
@@ -1079,8 +1090,9 @@ def main() -> None:
             "annotation_free": True,
             "colorbar": False,
             "axis_frame": False,
-            "opaque_map_background": True,
-            "map_background": MAP_BACKGROUND,
+            "opaque_china_fill": True,
+            "transparent_outside_boundary": True,
+            "china_fill_color": MAP_BACKGROUND,
             "extent": list(CHINA_EXTENT),
         },
         "outputs": {
