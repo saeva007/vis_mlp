@@ -130,8 +130,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time", default="", help="UTC valid time, e.g. 2025-10-31 15:00")
     parser.add_argument(
         "--dynamic_vars",
-        default="RH2M,T2M,PM10",
-        help="Comma-separated representative dynamic variables to draw, e.g. RH2M,T2M,PM10.",
+        default="RH2M,T2M,PM10,WSPD10,LCC",
+        help="Comma-separated representative dynamic variables to draw, e.g. RH2M,T2M,PM10,WSPD10,LCC.",
     )
     parser.add_argument(
         "--dynamic_var",
@@ -145,12 +145,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--static_vars",
-        default="terrain_h,terrain_anomaly,veg",
+        default="terrain_h,terrain_anomaly,terrain_std,veg",
         help="Comma-separated static station inputs to draw: terrain_h,terrain_anomaly,terrain_std,lat,lon,veg.",
     )
     parser.add_argument(
         "--fe_vars",
-        default="near_saturation_proxy,ventilation_proxy",
+        default="near_saturation_proxy,ventilation_proxy,fog_potential_index",
         help="Comma-separated FE variables to include in the static/FE stack.",
     )
     parser.add_argument(

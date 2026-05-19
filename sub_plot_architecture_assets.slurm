@@ -20,10 +20,10 @@
 # 可选环境变量（sbatch 前 export 或 --export=ALL,VAR=val）:
 #   DATA_DIR=/path/to/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2
 #   OUT_DIR=/path/to/architecture_map_assets
-#   DYNAMIC_VARS=RH2M,T2M,PM10,PM2.5
+#   DYNAMIC_VARS=RH2M,T2M,PM10,WSPD10,LCC
 #   DYNAMIC_LAGS=-11,-7,-3,0
-#   STATIC_VARS=terrain_h,terrain_anomaly,veg
-#   FE_VARS=near_saturation_proxy,ventilation_proxy
+#   STATIC_VARS=terrain_h,terrain_anomaly,terrain_std,veg
+#   FE_VARS=near_saturation_proxy,ventilation_proxy,fog_potential_index
 #   VALID_TIME="2025-10-31 15:00"
 #   OUTPUT_TIMES=3
 #   OUTPUT_MIN_GAP_HOURS=24
@@ -35,7 +35,7 @@
 #   MAX_POINTS=0
 #
 # 示例（逗号变量建议先 export，避免 Slurm --export 把逗号当变量分隔符）:
-#   export DYNAMIC_VARS="RH2M,T2M,PM10,PM2.5"
+#   export DYNAMIC_VARS="RH2M,T2M,PM10,WSPD10,LCC"
 #   export DYNAMIC_LAGS="-11,-7,-3,0"
 #   sbatch /public/home/putianshu/vis_mlp/train/sub_plot_architecture_assets.slurm
 #
@@ -61,10 +61,10 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 SHP_PATH="${SHP_PATH:-/public/home/putianshu/中华人民共和国/中华人民共和国.shp}"
 ORO_PATH="${ORO_PATH:-/public/home/putianshu/vis_cnn/data_orography.nc}"
 OUT_DIR="${OUT_DIR:-/public/home/putianshu/vis_mlp/architecture_map_assets}"
-DYNAMIC_VARS="${DYNAMIC_VARS:-RH2M,T2M,PM10}"
+DYNAMIC_VARS="${DYNAMIC_VARS:-RH2M,T2M,PM10,WSPD10,LCC}"
 DYNAMIC_LAGS="${DYNAMIC_LAGS:--11,-7,-3,0}"
-STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly,veg}"
-FE_VARS="${FE_VARS:-near_saturation_proxy,ventilation_proxy}"
+STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly,terrain_std,veg}"
+FE_VARS="${FE_VARS:-near_saturation_proxy,ventilation_proxy,fog_potential_index}"
 VALID_TIME="${VALID_TIME:-}"
 OUTPUT_TIMES="${OUTPUT_TIMES:-3}"
 OUTPUT_MIN_GAP_HOURS="${OUTPUT_MIN_GAP_HOURS:-24}"
