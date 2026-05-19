@@ -22,7 +22,7 @@
 #   OUT_DIR=/path/to/architecture_map_assets
 #   DYNAMIC_VARS=RH2M,T2M,PM10,PM2.5
 #   DYNAMIC_LAGS=-11,-7,-3,0
-#   STATIC_VARS=terrain_h,terrain_anomaly
+#   STATIC_VARS=terrain_h,terrain_anomaly,veg
 #   FE_VARS=near_saturation_proxy,ventilation_proxy
 #   VALID_TIME="2025-10-31 15:00"
 #   OUTPUT_TIMES=4
@@ -61,7 +61,7 @@ ORO_PATH="${ORO_PATH:-/public/home/putianshu/vis_cnn/data_orography.nc}"
 OUT_DIR="${OUT_DIR:-/public/home/putianshu/vis_mlp/architecture_map_assets}"
 DYNAMIC_VARS="${DYNAMIC_VARS:-RH2M,T2M,PM10}"
 DYNAMIC_LAGS="${DYNAMIC_LAGS:--11,-7,-3,0}"
-STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly}"
+STATIC_VARS="${STATIC_VARS:-terrain_h,terrain_anomaly,veg}"
 FE_VARS="${FE_VARS:-near_saturation_proxy,ventilation_proxy}"
 VALID_TIME="${VALID_TIME:-}"
 OUTPUT_TIMES="${OUTPUT_TIMES:-4}"

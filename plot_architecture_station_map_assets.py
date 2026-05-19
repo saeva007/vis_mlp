@@ -43,6 +43,7 @@ DEFAULT_OUT = BASE_PATH / "architecture_map_assets"
 
 WINDOW_SIZE = 12
 CHINA_EXTENT = (73.0, 136.0, 3.0, 54.8)
+MAP_BACKGROUND = "#FFFFFF"
 
 BASE_DYN_NAMES = [
     "RH2M",
@@ -144,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--static_vars",
-        default="terrain_h,terrain_anomaly",
+        default="terrain_h,terrain_anomaly,veg",
         help="Comma-separated static station inputs to draw: terrain_h,terrain_anomaly,terrain_std,lat,lon,veg.",
     )
     parser.add_argument(
@@ -317,7 +318,7 @@ def style_map_ax(ax, boundary, compact: bool = True) -> None:
     ax.set_xlim(CHINA_EXTENT[0], CHINA_EXTENT[1])
     ax.set_ylim(CHINA_EXTENT[2], CHINA_EXTENT[3])
     ax.set_aspect("equal", adjustable="box")
-    ax.set_facecolor("none")
+    ax.set_facecolor(MAP_BACKGROUND)
     draw_boundary(ax, boundary, color="#242424", lw=0.45, zorder=6)
     if compact:
         ax.set_xticks([])
@@ -358,7 +359,8 @@ def draw_station_value_map(
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.patch.set_alpha(0)
+    fig.patch.set_facecolor(MAP_BACKGROUND)
+    fig.patch.set_alpha(1.0)
     style_map_ax(ax, boundary, compact=True)
     vals = np.asarray(value, dtype=float)
     valid = np.isfinite(vals) & np.isfinite(df["lon"].to_numpy(float)) & np.isfinite(df["lat"].to_numpy(float))
@@ -375,7 +377,14 @@ def draw_station_value_map(
             alpha=0.92,
             zorder=4,
         )
-    fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(
+        out_path,
+        dpi=dpi,
+        transparent=False,
+        facecolor=MAP_BACKGROUND,
+        bbox_inches="tight",
+        pad_inches=0.02,
+    )
     plt.close(fig)
 
 
@@ -391,7 +400,8 @@ def draw_class_map(
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.patch.set_alpha(0)
+    fig.patch.set_facecolor(MAP_BACKGROUND)
+    fig.patch.set_alpha(1.0)
     style_map_ax(ax, boundary, compact=True)
     cls = np.asarray(classes, dtype=float)
     valid = np.isfinite(cls)
@@ -406,7 +416,14 @@ def draw_class_map(
         alpha=0.96,
         zorder=4,
     )
-    fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(
+        out_path,
+        dpi=dpi,
+        transparent=False,
+        facecolor=MAP_BACKGROUND,
+        bbox_inches="tight",
+        pad_inches=0.02,
+    )
     plt.close(fig)
 
 
@@ -557,13 +574,21 @@ def draw_grid_orography(oro_path: Path, out_path: Path, boundary, dpi: int) -> b
         lats = lats[lat_mask]
         lons_plot = lons_plot[lon_mask]
         fig, ax = plt.subplots(figsize=(3.3, 3.3))
-        fig.patch.set_alpha(0)
+        fig.patch.set_facecolor(MAP_BACKGROUND)
+        fig.patch.set_alpha(1.0)
         style_map_ax(ax, boundary, compact=True)
         lo, hi = robust_limits(vals)
         ax.pcolormesh(lons_plot, lats, vals, cmap="terrain", shading="auto", vmin=lo, vmax=hi, zorder=1)
         draw_boundary(ax, boundary, color="#202020", lw=0.5, zorder=6)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=dpi, transparent=True, bbox_inches="tight", pad_inches=0.02)
+        fig.savefig(
+            out_path,
+            dpi=dpi,
+            transparent=False,
+            facecolor=MAP_BACKGROUND,
+            bbox_inches="tight",
+            pad_inches=0.02,
+        )
         plt.close(fig)
         return True
     except Exception as exc:
@@ -837,7 +862,16 @@ def main() -> None:
             print(f"[WARN] Skip unknown static variable {name!r}", flush=True)
             continue
         vals, cmap = static_lookup[key]
-        lo, hi = robust_limits(vals, symmetric=(key == "terrain_anomaly"))
+        if key == "veg":
+            finite_vals = np.asarray(vals, dtype=float)
+            finite_vals = finite_vals[np.isfinite(finite_vals)]
+            if finite_vals.size:
+                lo = float(np.floor(finite_vals.min()) - 0.5)
+                hi = float(np.ceil(finite_vals.max()) + 0.5)
+            else:
+                lo, hi = -0.5, 0.5
+        else:
+            lo, hi = robust_limits(vals, symmetric=(key == "terrain_anomaly"))
         p = layer_dir / "static" / f"static_{key}.png"
         draw_station_value_map(
             df_t,
@@ -961,6 +995,8 @@ def main() -> None:
             "annotation_free": True,
             "colorbar": False,
             "axis_frame": False,
+            "opaque_map_background": True,
+            "map_background": MAP_BACKGROUND,
             "extent": list(CHINA_EXTENT),
         },
         "outputs": {
