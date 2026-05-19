@@ -51,8 +51,8 @@ CHINA_EXTENT = (73.0, 136.0, 3.0, 54.8)
 MAP_BACKGROUND = "#FFFFFF"
 HUMIDITY_CMAP = "YlGnBu"
 FEATURE_ENGINEERING_CMAP = LinearSegmentedColormap.from_list(
-    "pmst_feature_clean",
-    ["#F7FCF5", "#D9F0E3", "#A6DBD5", "#67A9CF", "#2166AC"],
+    "pmst_feature_warm",
+    ["#FFF7E6", "#FEE8B0", "#FDB863", "#E36C3D", "#9E2F1C"],
     N=256,
 )
 TOPOGRAPHY_CMAP = LinearSegmentedColormap.from_list(
@@ -1341,7 +1341,7 @@ def main() -> None:
             "extent": list(CHINA_EXTENT),
             "colormaps": {
                 "relative_humidity": HUMIDITY_CMAP,
-                "feature_engineering": "pmst_feature_clean",
+                "feature_engineering": "pmst_feature_warm",
                 "terrain_h": "pmst_topography",
                 "terrain_anomaly": TERRAIN_ANOMALY_CMAP,
                 "terrain_std": TERRAIN_STD_CMAP,
