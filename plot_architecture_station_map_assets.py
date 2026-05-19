@@ -10,6 +10,7 @@ mostly annotation-free PNG layers for an architecture schematic:
   - compact dynamic-input station stacks at selected lags, default t-11/t-7/t-3/t.
   - an angled 12-h RH2M window stack for the dynamic sequence icon.
   - one static/feature-engineering station stack.
+  - one gridded China orography map clipped to the national boundary.
   - several three-class output maps selected for adequate low-visibility count
     and high low-visibility precision/recall when evaluation CSV is available.
   - a small categorical output colorbar for the three visibility classes.
@@ -51,7 +52,7 @@ MAP_BACKGROUND = "#FFFFFF"
 HUMIDITY_CMAP = "YlGnBu"
 TOPOGRAPHY_CMAP = LinearSegmentedColormap.from_list(
     "pmst_topography",
-    ["#f7fbef", "#d9f0c7", "#8fc98b", "#c9bd7a", "#9c6b47", "#f2efe8"],
+    ["#1A9850", "#66BD63", "#D9EF8B", "#C8A96A", "#8C510A", "#F7F7F2"],
     N=256,
 )
 TERRAIN_ANOMALY_CMAP = "BrBG"
@@ -217,8 +218,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--draw_grid_orography",
         action="store_true",
-        help="Also draw a gridded terrain map. Off by default to keep architecture assets frameless.",
+        help="Draw a gridded China terrain map. Kept for backward compatibility; this is on by default.",
     )
+    parser.add_argument(
+        "--skip_grid_orography",
+        dest="draw_grid_orography",
+        action="store_false",
+        help="Skip the default gridded China terrain map.",
+    )
+    parser.set_defaults(draw_grid_orography=True)
     parser.add_argument(
         "--write_sheets",
         action="store_true",
