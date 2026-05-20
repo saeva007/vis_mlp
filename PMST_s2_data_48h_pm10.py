@@ -22,6 +22,7 @@ import json
 import os
 import re
 import gc
+import struct
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ PM10_S2_FILE = os.environ.get("PM10_S2_FILE", os.path.join(BASE_PATH, "pm10_stat
 PM10_DIR = os.environ.get("PM10_DIR", os.path.join(BASE_PATH, "pm10_station"))
 PM25_S2_FILE = os.environ.get("PM25_S2_FILE", os.path.join(BASE_PATH, "pm2.5_station", "pm2p5_station_s2_2025.nc"))
 PM25_DIR = os.environ.get("PM25_DIR", os.path.join(BASE_PATH, "pm2.5_station"))
+SPLITS_TO_WRITE_ENV = os.environ.get("SPLITS_TO_WRITE", "test")
 
 # current_48h 目录中 2m 温度为 TMP2m（无 t2mz），与 VAR_MAPPING 一致
 VARIABLES_48H = [
@@ -72,6 +74,38 @@ VARIABLES_48H = [
     "u925", "v925", "dp1000", "dp925", "q1000", "q925", "omg925",
     "omg1000", "gust", "TMP2m",
 ]
+
+
+def parse_splits_to_write(value):
+    if value is None:
+        return ("test",)
+    norm = str(value).strip().lower()
+    if norm in {"", "testonly", "test_only"}:
+        return ("test",)
+    if norm == "all":
+        return ("train", "val", "test")
+    aliases = {"validation": "val", "valid": "val"}
+    splits = []
+    for item in re.split(r"[,;\s]+", norm):
+        if not item:
+            continue
+        tag = aliases.get(item, item)
+        if tag not in {"train", "val", "test"}:
+            raise ValueError(f"Unsupported split in SPLITS_TO_WRITE={value!r}: {item!r}")
+        if tag not in splits:
+            splits.append(tag)
+    return tuple(splits or ["test"])
+
+
+def clear_existing_dataset_outputs(out_dir):
+    for tag in ("train", "val", "test"):
+        for name in (f"X_{tag}.npy", f"y_{tag}.npy", f"meta_{tag}.csv"):
+            path = os.path.join(out_dir, name)
+            if os.path.exists(path):
+                os.remove(path)
+    config_path = os.path.join(out_dir, "dataset_build_config.json")
+    if os.path.exists(config_path):
+        os.remove(config_path)
 
 
 def get_run_list_from_current_48h():
@@ -267,10 +301,12 @@ def load_merged_run_ds(run_str, data_veg, data_oro):
     return ds, init_time
 
 
-def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da, pm10_da, pm25_da):
+def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da, pm10_da, pm25_da, splits_to_write):
     """
-    仅在当前 run 的 48h 时间序列内划分 12h 窗口，不跨 run。
-    返回: (X_dyn_flat, X_stat_flat, fe_flat, y_flat, meta_tuple)
+    仅在当前 run 的 48h 时间序列内划分 12h 时间窗。
+
+    为避免全年 48h 样本一次性拼接导致 OOM，本函数只物化需要写出的 split
+    样本；默认只写 test split，供 48h 论文评估使用。
     """
     ds = ds_run
     lats = ds["lat"].values
@@ -286,7 +322,6 @@ def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vi
     X_met = ds[FINAL_FEATURE_ORDER].to_array(dim="v").transpose("time", "station_id", "v").values.astype(np.float32)
     zenith = calculate_zenith_angle(lats, lons, times)
     X_dyn = np.concatenate([X_met, zenith], axis=-1)
-    nv = X_dyn.shape[-1]
     del X_met, zenith
     gc.collect()
 
@@ -314,15 +349,15 @@ def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vi
         axis=1,
     )
 
+    dims = {
+        "dynamic_flat_dim": int(WINDOW_SIZE * nv),
+        "static_dim": int(X_stat.shape[1]),
+        "feature_engineering_dim": 36,
+    }
+
     n_wins = (nt - WINDOW_SIZE) // STEP_SIZE + 1
     if n_wins <= 0:
-        return None
-
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    X_wins = sliding_window_view(X_dyn, WINDOW_SIZE, axis=0)[::STEP_SIZE]
-    # 须与 PMST_s2_data.py / s2_data_pm10_monthtail_cell 一致：(n_wins, ns, W, nv)，与 m_t=repeat(win,ns) 对齐
-    X_wins = X_wins.transpose(0, 1, 3, 2).reshape(-1, WINDOW_SIZE, nv)
+        return {}, dims
 
     win_end_idx = (np.arange(n_wins) * STEP_SIZE + (WINDOW_SIZE - 1)).astype(int)
     win_end_times = times[win_end_idx]
@@ -340,11 +375,48 @@ def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vi
     m_la = np.tile(lats, n_wins)
     m_lo = np.tile(lons, n_wins)
     m_lead = np.repeat(win_lead, ns).astype(np.float32)
-    meta = (m_t, m_s, m_la, m_lo, m_lead)
+
+    valid_mask = ~np.isnan(y_flat) & (y_flat >= 0) & (y_flat <= MAX_VIS_THRESHOLD)
+    valid_idxs = np.where(valid_mask)[0]
+    if len(valid_idxs) == 0:
+        return {}, dims
+
+    tr_m, val_m, test_m = get_monthly_split_mask_last_days(
+        pd.DatetimeIndex(m_t[valid_idxs]),
+        gap_hours=GAP_HOURS,
+        val_last_days=VAL_LAST_DAYS,
+        test_last_days=TEST_LAST_DAYS,
+    )
+    split_masks = {"train": tr_m, "val": val_m, "test": test_m}
+    split_indices = {
+        tag: valid_idxs[split_masks[tag]]
+        for tag in ("train", "val", "test")
+        if tag in splits_to_write and split_masks[tag].any()
+    }
+    if not split_indices:
+        return {}, dims
+
+    selected_parts = []
+    split_slices = {}
+    cursor = 0
+    for tag in ("train", "val", "test"):
+        ix = split_indices.get(tag)
+        if ix is None or len(ix) == 0:
+            continue
+        selected_parts.append(ix)
+        split_slices[tag] = slice(cursor, cursor + len(ix))
+        cursor += len(ix)
+    selected_ix = np.concatenate(selected_parts, axis=0)
+
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    X_wins = sliding_window_view(X_dyn, WINDOW_SIZE, axis=0)[::STEP_SIZE]
+    # 须与 PMST_s2_data.py / s2_data_pm10_monthtail_cell 一致：(n_wins, ns, W, nv)，与 m_t=repeat(win,ns) 对齐
+    X_wins = X_wins.transpose(0, 1, 3, 2).reshape(-1, WINDOW_SIZE, nv)[selected_ix]
 
     fe_flat = compute_fog_features(X_wins, WINDOW_SIZE, nv)
 
-    sample_times = pd.DatetimeIndex(m_t)
+    sample_times = pd.DatetimeIndex(m_t[selected_ix])
     months = sample_times.month.values.astype(np.float32)
     hours = sample_times.hour.values.astype(np.float32)
     time_feat = np.column_stack(
@@ -355,85 +427,177 @@ def build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vi
             np.cos(2 * np.pi * hours / 24),
         ]
     ).astype(np.float32)
-
     fe_flat = np.concatenate([fe_flat, time_feat], axis=1)
 
-    # pm10 已作为动态变量进入 dyn，FE_flat 不再附加 pm10；lead 仅在 meta
-
     X_dyn_flat = X_wins.reshape(X_wins.shape[0], -1)
-    X_stat_flat = np.tile(X_stat, (n_wins, 1))
-
-    return X_dyn_flat, X_stat_flat, fe_flat, y_flat, meta
-
-
-def save_chunked_48h(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_dir):
-    times_all, stats_all, lats_all, lons_all, lead_all, init_all = meta
-    valid_idxs = np.where(mask)[0]
-    n = len(valid_idxs)
-    print(f"  Valid Samples: {n} ({n / len(mask):.1%})", flush=True)
-    valid_times = pd.DatetimeIndex(times_all[valid_idxs])
-    tr_m, val_m, test_m = get_monthly_split_mask_last_days(
-        valid_times,
-        gap_hours=GAP_HOURS,
-        val_last_days=VAL_LAST_DAYS,
-        test_last_days=TEST_LAST_DAYS,
+    station_pos = selected_ix % ns
+    X_stat_flat = X_stat[station_pos].astype(np.float32, copy=False)
+    y_sel = y_flat[selected_ix]
+    meta_sel = (
+        m_t[selected_ix],
+        m_s[selected_ix],
+        m_la[selected_ix],
+        m_lo[selected_ix],
+        m_lead[selected_ix],
     )
-    splits = {"train": valid_idxs[tr_m], "val": valid_idxs[val_m], "test": valid_idxs[test_m]}
-    dims = [X_dyn_flat.shape[1], X_stat_flat.shape[1], fe_flat.shape[1]]
-    for tag, ix in splits.items():
-        if len(ix) == 0:
-            continue
-        print(f"    Saving {tag} (N={len(ix)})", flush=True)
-        np.save(os.path.join(out_dir, f"y_{tag}.npy"), y_flat[ix])
+
+    chunks = {}
+    for tag, slc in split_slices.items():
+        chunks[tag] = {
+            "X_dyn": X_dyn_flat[slc],
+            "X_stat": X_stat_flat[slc],
+            "fe": fe_flat[slc],
+            "y": y_sel[slc],
+            "meta": tuple(v[slc] for v in meta_sel),
+        }
+
+    dims.update(
+        {
+            "dynamic_flat_dim": int(X_dyn_flat.shape[1]),
+            "static_dim": int(X_stat_flat.shape[1]),
+            "feature_engineering_dim": int(fe_flat.shape[1]),
+        }
+    )
+    return chunks, dims
+
+
+def _fixed_npy_header(shape, dtype, header_len=1014):
+    """Build a fixed-size NPY v1 header so append-only files can be finalized in place."""
+    dtype = np.dtype(dtype)
+    header = "{'descr': %r, 'fortran_order': False, 'shape': %r, }" % (
+        np.lib.format.dtype_to_descr(dtype),
+        tuple(int(x) for x in shape),
+    )
+    header_bytes = header.encode("latin1")
+    if len(header_bytes) + 1 > header_len:
+        raise ValueError(f"NPY header too small for shape={shape}")
+    payload = header_bytes + b" " * (header_len - len(header_bytes) - 1) + b"\n"
+    return np.lib.format.magic(1, 0) + struct.pack("<H", header_len) + payload
+
+
+class AppendableNpyWriter:
+    """Append rows to a valid .npy file, then patch the final row count at close."""
+
+    def __init__(self, path, dtype, sample_shape):
+        self.path = path
+        self.dtype = np.dtype(dtype)
+        self.sample_shape = tuple(sample_shape)
+        self.n_rows = 0
+        self.fh = open(path, "wb")
+        self.fh.write(_fixed_npy_header((0,) + self.sample_shape, self.dtype))
+
+    def write(self, arr):
+        arr = np.asarray(arr, dtype=self.dtype)
+        if self.sample_shape:
+            arr = arr.reshape((-1,) + self.sample_shape)
+        else:
+            arr = arr.reshape(-1)
+        if arr.shape[0] == 0:
+            return
+        arr = np.ascontiguousarray(arr)
+        arr.tofile(self.fh)
+        self.n_rows += int(arr.shape[0])
+
+    def close(self):
+        if self.fh.closed:
+            return
+        self.fh.flush()
+        self.fh.seek(0)
+        self.fh.write(_fixed_npy_header((self.n_rows,) + self.sample_shape, self.dtype))
+        self.fh.close()
+
+
+class Streaming48hWriter:
+    def __init__(self, out_dir, splits_to_write, dims):
+        self.out_dir = out_dir
+        self.splits_to_write = tuple(splits_to_write)
+        self.dims = dict(dims)
+        self.dims["total_dim"] = (
+            self.dims["dynamic_flat_dim"] + self.dims["static_dim"] + self.dims["feature_engineering_dim"]
+        )
+        self.x_writers = {}
+        self.y_writers = {}
+        self.counts = {tag: 0 for tag in self.splits_to_write}
+        os.makedirs(out_dir, exist_ok=True)
+        for tag in self.splits_to_write:
+            self.x_writers[tag] = AppendableNpyWriter(
+                os.path.join(out_dir, f"X_{tag}.npy"),
+                "float32",
+                (self.dims["total_dim"],),
+            )
+            self.y_writers[tag] = AppendableNpyWriter(
+                os.path.join(out_dir, f"y_{tag}.npy"),
+                "float32",
+                (),
+            )
+            pd.DataFrame(columns=["time", "station_id", "lat", "lon", "lead_hour", "init_time"]).to_csv(
+                os.path.join(out_dir, f"meta_{tag}.csv"),
+                index=False,
+            )
+
+    def write_chunk(self, tag, chunk, init_time):
+        if tag not in self.x_writers:
+            return
+        n = int(len(chunk["y"]))
+        if n == 0:
+            return
+        x_full = np.empty((n, self.dims["total_dim"]), dtype=np.float32)
+        d0 = self.dims["dynamic_flat_dim"]
+        d1 = d0 + self.dims["static_dim"]
+        x_full[:, :d0] = chunk["X_dyn"]
+        x_full[:, d0:d1] = chunk["X_stat"]
+        x_full[:, d1:] = chunk["fe"]
+        self.x_writers[tag].write(x_full)
+        self.y_writers[tag].write(chunk["y"])
+
+        times, stats, lats, lons, leads = chunk["meta"]
         pd.DataFrame(
             {
-                "time": times_all[ix],
-                "station_id": stats_all[ix],
-                "lat": lats_all[ix],
-                "lon": lons_all[ix],
-                "lead_hour": lead_all[ix].astype(np.float32),
-                "init_time": init_all[ix],
+                "time": times,
+                "station_id": stats,
+                "lat": lats,
+                "lon": lons,
+                "lead_hour": leads.astype(np.float32),
+                "init_time": np.full(n, init_time, dtype=object),
             }
-        ).to_csv(os.path.join(out_dir, f"meta_{tag}.csv"), index=False)
-        fp = np.lib.format.open_memmap(
-            os.path.join(out_dir, f"X_{tag}.npy"), mode="w+", dtype="float32", shape=(len(ix), sum(dims))
-        )
-        bs = 100000
-        for i in tqdm(range(0, len(ix), bs), desc=tag):
-            bi = ix[i : i + bs]
-            n_bi = len(bi)
-            fp[i : i + n_bi, : dims[0]] = X_dyn_flat[bi]
-            fp[i : i + n_bi, dims[0] : dims[0] + dims[1]] = X_stat_flat[bi]
-            fp[i : i + n_bi, dims[0] + dims[1] :] = fe_flat[bi]
-        del fp
-        gc.collect()
+        ).to_csv(os.path.join(self.out_dir, f"meta_{tag}.csv"), mode="a", header=False, index=False)
+        self.counts[tag] += n
 
-    config = {
-        "builder": os.path.basename(__file__),
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "output_dataset_dir": out_dir,
-        "source_current_48h_dir": CURRENT_48H_DIR,
-        "visibility_source_nc": VIS_SOURCE_NC,
-        "tianji_raw_time_alignment": "raw_utc_no_shift",
-        "split": {
-            "type": "monthly_tail_last_days",
-            "val_last_days": VAL_LAST_DAYS,
-            "test_last_days": TEST_LAST_DAYS,
-            "gap_hours": GAP_HOURS,
-        },
-        "window_size": WINDOW_SIZE,
-        "step_size": STEP_SIZE,
-        "dynamic_order": FINAL_FEATURE_ORDER + ["zenith", "PM10_ugm3", "PM25_ugm3"],
-        "dynamic_dim": int(X_dyn_flat.shape[1] // WINDOW_SIZE),
-        "static_dim": int(X_stat_flat.shape[1]),
-        "feature_engineering_dim": int(fe_flat.shape[1]),
-        "total_dim": int(X_dyn_flat.shape[1] + X_stat_flat.shape[1] + fe_flat.shape[1]),
-        "pm10_file": PM10_S2_FILE,
-        "pm25_file": PM25_S2_FILE,
-        "note": "48h evaluation dataset aligned with current PM10+PM2.5 UTC main model layout.",
-    }
-    with open(os.path.join(out_dir, "dataset_build_config.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    def close(self, run_count, skipped_count):
+        for writer in self.x_writers.values():
+            writer.close()
+        for writer in self.y_writers.values():
+            writer.close()
+        config = {
+            "builder": os.path.basename(__file__),
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "output_dataset_dir": self.out_dir,
+            "source_current_48h_dir": CURRENT_48H_DIR,
+            "visibility_source_nc": VIS_SOURCE_NC,
+            "tianji_raw_time_alignment": "raw_utc_no_shift",
+            "split": {
+                "type": "monthly_tail_last_days",
+                "val_last_days": VAL_LAST_DAYS,
+                "test_last_days": TEST_LAST_DAYS,
+                "gap_hours": GAP_HOURS,
+                "splits_written": list(self.splits_to_write),
+            },
+            "window_size": WINDOW_SIZE,
+            "step_size": STEP_SIZE,
+            "dynamic_order": FINAL_FEATURE_ORDER + ["zenith", "PM10_ugm3", "PM25_ugm3"],
+            "dynamic_dim": int(self.dims["dynamic_flat_dim"] // WINDOW_SIZE),
+            "static_dim": int(self.dims["static_dim"]),
+            "feature_engineering_dim": int(self.dims["feature_engineering_dim"]),
+            "total_dim": int(self.dims["total_dim"]),
+            "sample_counts": {k: int(v) for k, v in self.counts.items()},
+            "runs_processed": int(run_count),
+            "runs_skipped": int(skipped_count),
+            "pm10_file": PM10_S2_FILE,
+            "pm25_file": PM25_S2_FILE,
+            "note": "Streaming 48h evaluation dataset aligned with current PM10+PM2.5 UTC main model layout.",
+        }
+        with open(os.path.join(self.out_dir, "dataset_build_config.json"), "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
 
 
 def main():
@@ -441,6 +605,7 @@ def main():
 
     warnings.filterwarnings("ignore")
     os.makedirs(OUTPUT_DATASET_DIR, exist_ok=True)
+    clear_existing_dataset_outputs(OUTPUT_DATASET_DIR)
 
     print("Loading auxiliary data...", flush=True)
     data_veg = xr.open_dataset(VEG_FILE, engine="h5netcdf")
@@ -460,19 +625,21 @@ def main():
     pm25_da = load_station_pm_dataarray(PM25_S2_FILE, PM25_DIR, ("pm2p5", "pm25", "pm2_5", "PM2_5"), "PM2.5")
 
     run_list = get_run_list_from_current_48h()
+    splits_to_write = parse_splits_to_write(SPLITS_TO_WRITE_ENV)
     print(
         f"Found {len(run_list)} runs in {CURRENT_48H_DIR}. "
         f"Building 12h windows within each 0–48h run only (no cross-run merge).",
         flush=True,
     )
+    print(f"Streaming output splits: {', '.join(splits_to_write)}", flush=True)
 
-    X_dyn_list, X_stat_list, fe_list, y_list = [], [], [], []
-    meta_t_list, meta_s_list, meta_la_list, meta_lo_list = [], [], [], []
-    meta_lead_list, meta_init_list = [], []
-
+    writer = None
+    processed_runs = 0
+    skipped_runs = 0
     for run_str in tqdm(run_list, desc="Runs"):
         ds_run, init_time = load_merged_run_ds(run_str, data_veg, data_oro)
         if ds_run is None:
+            skipped_runs += 1
             continue
         if vis_da is None:
             vis_da_use = xr.DataArray(
@@ -483,56 +650,44 @@ def main():
         else:
             vis_da_use = vis_da
         try:
-            out = build_windows_and_features_per_run(ds_run, init_time, data_veg, data_oro, vis_da_use, pm10_da, pm25_da)
+            out = build_windows_and_features_per_run(
+                ds_run,
+                init_time,
+                data_veg,
+                data_oro,
+                vis_da_use,
+                pm10_da,
+                pm25_da,
+                splits_to_write,
+            )
         except Exception as e:
             ds_run.close()
             print(f"  Run {run_str} skip: {e}", flush=True)
+            skipped_runs += 1
             continue
         ds_run.close()
         gc.collect()
         if out is None:
             continue
-        X_dyn_flat, X_stat_flat, fe_flat, y_flat, meta = out
-        X_dyn_list.append(X_dyn_flat)
-        X_stat_list.append(X_stat_flat)
-        fe_list.append(fe_flat)
-        y_list.append(y_flat)
-        meta_t_list.append(meta[0])
-        meta_s_list.append(meta[1])
-        meta_la_list.append(meta[2])
-        meta_lo_list.append(meta[3])
-        meta_lead_list.append(meta[4])
-        meta_init_list.append(
-            np.full(len(meta[0]), run_str, dtype=object)
-        )
+        chunks, dims = out
+        processed_runs += 1
+        if chunks and writer is None:
+            writer = Streaming48hWriter(OUTPUT_DATASET_DIR, splits_to_write, dims)
+        if writer is not None:
+            for tag, chunk in chunks.items():
+                writer.write_chunk(tag, chunk, run_str)
+        del chunks
+        gc.collect()
 
-    if not X_dyn_list:
-        print("No samples produced. Check current_48h, vis source, and pm10 files.", flush=True)
+    if writer is None:
+        print("No selected 48h samples produced. Check SPLITS_TO_WRITE, current_48h, and visibility source.", flush=True)
         return
 
-    X_dyn_flat = np.concatenate(X_dyn_list, axis=0)
-    X_stat_flat = np.concatenate(X_stat_list, axis=0)
-    fe_flat = np.concatenate(fe_list, axis=0)
-    y_flat = np.concatenate(y_list, axis=0)
-    m_t = np.concatenate(meta_t_list, axis=0)
-    m_s = np.concatenate(meta_s_list, axis=0)
-    m_la = np.concatenate(meta_la_list, axis=0)
-    m_lo = np.concatenate(meta_lo_list, axis=0)
-    m_lead = np.concatenate(meta_lead_list, axis=0)
-    m_init = np.concatenate(meta_init_list, axis=0)
-    del X_dyn_list, X_stat_list, fe_list, y_list, meta_t_list, meta_s_list, meta_la_list, meta_lo_list
-    del meta_lead_list, meta_init_list
-    gc.collect()
-
-    mask = ~np.isnan(y_flat) & (y_flat >= 0) & (y_flat <= MAX_VIS_THRESHOLD)
-    save_chunked_48h(
-        X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask,
-        (m_t, m_s, m_la, m_lo, m_lead, m_init),
-        OUTPUT_DATASET_DIR,
-    )
+    writer.close(processed_runs, skipped_runs)
     print(f"Done. Output: {OUTPUT_DATASET_DIR}", flush=True)
-    print(f"  Dyn dim: {X_dyn_flat.shape[1] // WINDOW_SIZE} (met+zenith+PM10+PM2.5)", flush=True)
-    print(f"  FE dim (fog+cyclical): {fe_flat.shape[1]}", flush=True)
+    print(f"  Sample counts: {writer.counts}", flush=True)
+    print(f"  Dyn dim: {writer.dims['dynamic_flat_dim'] // WINDOW_SIZE} (met+zenith+PM10+PM2.5)", flush=True)
+    print(f"  FE dim (fog+cyclical): {writer.dims['feature_engineering_dim']}", flush=True)
 
 
 if __name__ == "__main__":
