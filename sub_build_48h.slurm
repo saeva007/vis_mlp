@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J build_48h_pm10pm25
-#SBATCH -p kshdexclu01
+#SBATCH -p kshcexclu04
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --cpus-per-task=16
+#SBATCH --exclusive
 #SBATCH --mem=0
 #SBATCH -t 72:00:00
 #SBATCH -D /public/home/putianshu/vis_mlp/train
@@ -17,6 +17,7 @@ OUT_DIR="${OUT_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_fe_12h_48h_pm10_pm
 
 echo "48h PM10+PM2.5 data build started at: $(date)"
 echo "Node      : $(hostname)"
+echo "Queue     : ${SLURM_JOB_PARTITION:-kshcexclu04}"
 echo "SCRIPT_DIR: ${SCRIPT_DIR}"
 echo "OUT_DIR   : ${OUT_DIR}"
 echo "SPLITS    : ${SPLITS_TO_WRITE:-test}"
@@ -28,10 +29,15 @@ source /public/home/putianshu/miniconda3/bin/activate
 conda activate torch
 
 export PYTHONUNBUFFERED=1
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+NODE_CORES="${SLURM_CPUS_ON_NODE:-${SLURM_CPUS_PER_TASK:-1}}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${NODE_CORES}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${NODE_CORES}}"
 export OUTPUT_DATASET_DIR="${OUT_DIR}"
 export SPLITS_TO_WRITE="${SPLITS_TO_WRITE:-test}"
+
+echo "CPU cores : ${NODE_CORES}"
+echo "OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+echo "MKL_NUM_THREADS=${MKL_NUM_THREADS}"
 
 python "${SCRIPT_DIR}/PMST_s2_data_48h_pm10.py"
 

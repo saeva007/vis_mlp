@@ -16,4 +16,5 @@
 ## Slurm Notes
 
 - Data-build jobs for `.npy/.nc` generation should follow the single-node CPU style used by `sub_s1_data_aerosol_vera.slurm`.
+- The 48h PM10+PM2.5 dataset build (`sub_build_48h.slurm` / `PMST_s2_data_48h_pm10.py`) is CPU-only and does not need DCU/GPU resources. Submit it to `kshcexclu04`, reserve the full node with `--exclusive`, request all node memory with `--mem=0`, and set `OMP_NUM_THREADS` / `MKL_NUM_THREADS` from `SLURM_CPUS_ON_NODE`. The default output should remain `SPLITS_TO_WRITE=test` for paper 48h evaluation unless train/val splits are explicitly needed.
 - The airport METAR training script `PMST_net_airport_metar.py` intentionally reuses the original multi-GPU S2/DDP training stack from `PMST_net_test_11_s2_pm10.py`; launch it with `torchrun` through `sub_PMST_net_airport_metar.slurm`.
