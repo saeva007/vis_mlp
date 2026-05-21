@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3840" height="2160" viewBox="0 0 3840 2160">
+<defs>
+<marker id="arrow" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="strokeWidth">
+<path d="M 0 0 L 14 7 L 0 14 z" fill="#5F7282"/>
+</marker>
+<marker id="arrowBlue" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="strokeWidth">
+<path d="M 0 0 L 14 7 L 0 14 z" fill="#2B78C5"/>
+</marker>
+<marker id="arrowGreen" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="strokeWidth">
+<path d="M 0 0 L 14 7 L 0 14 z" fill="#1FA187"/>
+</marker>
+<marker id="arrowPurple" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="strokeWidth">
+<path d="M 0 0 L 14 7 L 0 14 z" fill="#7B61B6"/>
+</marker>
+<marker id="arrowTeal" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto" markerUnits="strokeWidth">
+<path d="M 0 0 L 14 7 L 0 14 z" fill="#2E9AA3"/>
+</marker>
+</defs>
+<rect x="0" y="0" width="3840" height="2160" fill="#FFFFFF"/>
+<text x="150" y="108" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="66" font-weight="700" fill="#17313D" text-anchor="start">End-to-End Low-Visibility Classification Forecast Model</text>
+<text x="150" y="174" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="36" font-weight="400" fill="#5F7282" text-anchor="start">StaticRNNLowVisNet: dynamic sequence encoder + static station branch + optional feature-engineering branch</text>
+<text x="155" y="292" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#2B78C5" text-anchor="start">INFERENCE GRAPH</text>
+<text x="155" y="1285" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#7B61B6" text-anchor="start">TWO-STAGE TRAINING</text>
+<text x="150" y="2070" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="28" font-weight="400" fill="#5F7282" text-anchor="start">Source: vis_mlp/train_static_rnn_lowvis.py | SCI-style vector diagram on white background</text>
+<rect x="1810" y="350" width="910" height="970" rx="30" ry="30" fill="#FBFCFE" stroke="#D8E1E8" stroke-width="3"/>
+<text x="1880" y="440" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="36" font-weight="700" fill="#5F7282" text-anchor="start">Parallel encoders</text>
+<rect x="150" y="1350" width="3610" height="565" rx="30" ry="30" fill="#FFFFFF" stroke="#DCE4EA" stroke-width="3"/>
+<rect x="150" y="415" width="740" height="610" rx="28" ry="28" fill="#EAF3FC" stroke="#2B78C5" stroke-width="5"/>
+<text x="198" y="487" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="40" font-weight="700" fill="#2B78C5" text-anchor="start">Input tensor x</text>
+<text x="198" y="543" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="34" font-weight="400" fill="#17313D"><tspan x="198" dy="0">X_dyn: [B, T=12, D_dyn=24-27]</tspan><tspan x="198" dy="48">Forecast fields + zenith +</tspan><tspan x="198" dy="48">optional PM10/PM2.5</tspan><tspan x="198" dy="48">x_static: [B, 5]</tspan><tspan x="198" dy="48">Vegetation id: [B] -&gt; embedding</tspan><tspan x="198" dy="48">x_FE: [B, D_FE] optional</tspan></text>
+<rect x="1040" y="415" width="650" height="610" rx="28" ry="28" fill="#F6F8FA" stroke="#A9B7C2" stroke-width="5"/>
+<text x="1088" y="487" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="40" font-weight="700" fill="#5F7282" text-anchor="start">Runtime preprocessing</text>
+<text x="1088" y="543" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="34" font-weight="400" fill="#17313D"><tspan x="1088" dy="0">Resolve feature layout</tspan><tspan x="1088" dy="48">Optional PM channel mask</tspan><tspan x="1088" dy="48">log1p for skewed dynamic</tspan><tspan x="1088" dy="48">variables</tspan><tspan x="1088" dy="48">RobustScaler + clipping</tspan></text>
+<rect x="1880" y="535" width="780" height="250" rx="28" ry="28" fill="#EAF8F4" stroke="#1FA187" stroke-width="5"/>
+<text x="1928" y="607" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="37" font-weight="700" fill="#1FA187" text-anchor="start">Dynamic encoder</text>
+<text x="1928" y="663" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="31" font-weight="400" fill="#17313D"><tspan x="1928" dy="0">Linear(D_dyn -&gt; H) + LN + GELU</tspan><tspan x="1928" dy="44">GRU/LSTM over 12 h sequence</tspan><tspan x="1928" dy="44">mean / last / attention pooling +</tspan><tspan x="1928" dy="44">LN</tspan></text>
+<rect x="1880" y="830" width="780" height="225" rx="28" ry="28" fill="#F1ECFA" stroke="#7B61B6" stroke-width="5"/>
+<text x="1928" y="902" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="37" font-weight="700" fill="#7B61B6" text-anchor="start">Static encoder</text>
+<text x="1928" y="958" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="31" font-weight="400" fill="#17313D"><tspan x="1928" dy="0">5 station/static variables</tspan><tspan x="1928" dy="44">concat vegetation embedding</tspan><tspan x="1928" dy="44">two-layer MLP -&gt; h_static</tspan></text>
+<rect x="1880" y="1100" width="780" height="185" rx="28" ry="28" fill="#EAF7F8" stroke="#2E9AA3" stroke-width="5"/>
+<text x="1928" y="1172" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="37" font-weight="700" fill="#2E9AA3" text-anchor="start">FE encoder (optional)</text>
+<text x="1928" y="1228" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="31" font-weight="400" fill="#17313D"><tspan x="1928" dy="0">Engineered physical features</tspan><tspan x="1928" dy="44">compact MLP -&gt; h_FE</tspan></text>
+<rect x="2865" y="590" width="465" height="430" rx="28" ry="28" fill="#F7F4FC" stroke="#7B61B6" stroke-width="5"/>
+<text x="2913" y="662" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="38" font-weight="700" fill="#7B61B6" text-anchor="start">Fusion MLP</text>
+<text x="2913" y="718" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="30" font-weight="400" fill="#17313D"><tspan x="2913" dy="0">[h_dyn || h_static ||</tspan><tspan x="2913" dy="42">h_FE]</tspan><tspan x="2913" dy="42">Linear + LN + GELU +</tspan><tspan x="2913" dy="42">dropout</tspan><tspan x="2913" dy="42">latent vector z</tspan></text>
+<rect x="3455" y="575" width="305" height="300" rx="28" ry="28" fill="#EAF3FC" stroke="#2B78C5" stroke-width="5"/>
+<text x="3503" y="647" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="33" font-weight="700" fill="#2B78C5" text-anchor="start">Class head</text>
+<text x="3503" y="703" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="27" font-weight="400" fill="#17313D"><tspan x="3503" dy="0">logits/probs [B,</tspan><tspan x="3503" dy="38">3]</tspan><tspan x="3503" dy="38">Fog: &lt;500 m</tspan><tspan x="3503" dy="38">Mist: 500-1000 m</tspan><tspan x="3503" dy="38">Clear: &gt;=1000 m</tspan></text>
+<rect x="3455" y="960" width="305" height="240" rx="28" ry="28" fill="#EAF8F4" stroke="#1FA187" stroke-width="5"/>
+<text x="3503" y="1032" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="33" font-weight="700" fill="#1FA187" text-anchor="start">Aux head</text>
+<text x="3503" y="1088" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="27" font-weight="400" fill="#17313D"><tspan x="3503" dy="0">optional</tspan><tspan x="3503" dy="38">log1p(visibility)</tspan><tspan x="3503" dy="38">regression output</tspan></text>
+<rect x="240" y="1485" width="750" height="305" rx="28" ry="28" fill="#EAF3FC" stroke="#2B78C5" stroke-width="5"/>
+<text x="288" y="1557" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="36" font-weight="700" fill="#2B78C5" text-anchor="start">Stage 1 pretraining</text>
+<text x="288" y="1613" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="29" font-weight="400" fill="#17313D"><tspan x="288" dy="0">S1 aligned 12 h dataset</tspan><tspan x="288" dy="41">train all parameters</tspan><tspan x="288" dy="41">balanced fog / mist / clear</tspan><tspan x="288" dy="41">batches</tspan></text>
+<rect x="1180" y="1485" width="750" height="305" rx="28" ry="28" fill="#F1ECFA" stroke="#7B61B6" stroke-width="5"/>
+<text x="1228" y="1557" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="36" font-weight="700" fill="#7B61B6" text-anchor="start">Stage 2 Phase A</text>
+<text x="1228" y="1613" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="29" font-weight="400" fill="#17313D"><tspan x="1228" dy="0">load compatible S1 checkpoint</tspan><tspan x="1228" dy="41">head-only adaptation</tspan><tspan x="1228" dy="41">fusion, heads, FE/norm/attention +</tspan><tspan x="1228" dy="41">L2-SP</tspan></text>
+<rect x="2120" y="1485" width="750" height="305" rx="28" ry="28" fill="#EAF8F4" stroke="#1FA187" stroke-width="5"/>
+<text x="2168" y="1557" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="36" font-weight="700" fill="#1FA187" text-anchor="start">Stage 2 Phase B</text>
+<text x="2168" y="1613" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="29" font-weight="400" fill="#17313D"><tspan x="2168" dy="0">reload best Phase A</tspan><tspan x="2168" dy="41">unfreeze all parameters</tspan><tspan x="2168" dy="41">low backbone LR + head LR + L2-SP</tspan></text>
+<rect x="3060" y="1485" width="540" height="305" rx="28" ry="28" fill="#F6F8FA" stroke="#A9B7C2" stroke-width="5"/>
+<text x="3108" y="1557" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#5F7282" text-anchor="start">Validation policy</text>
+<text x="3108" y="1613" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="28" font-weight="400" fill="#17313D"><tspan x="3108" dy="0">weighted focal loss</tspan><tspan x="3108" dy="39">FP penalty + recall boost</tspan><tspan x="3108" dy="39">fog/mist threshold search</tspan></text>
+<line x1="890" y1="720" x2="1040" y2="720" stroke="#2B78C5" stroke-width="8" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+<line x1="1690" y1="650" x2="1880" y2="660" stroke="#1FA187" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowGreen)"/>
+<line x1="1690" y1="735" x2="1880" y2="940" stroke="#7B61B6" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowPurple)"/>
+<line x1="1690" y1="820" x2="1880" y2="1195" stroke="#2E9AA3" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowTeal)"/>
+<line x1="2660" y1="660" x2="2865" y2="710" stroke="#1FA187" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowGreen)"/>
+<line x1="2660" y1="940" x2="2865" y2="805" stroke="#7B61B6" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowPurple)"/>
+<line x1="2660" y1="1195" x2="2865" y2="905" stroke="#2E9AA3" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowTeal)"/>
+<line x1="3330" y1="720" x2="3455" y2="725" stroke="#2B78C5" stroke-width="8" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+<line x1="3330" y1="850" x2="3455" y2="1080" stroke="#1FA187" stroke-width="7" stroke-linecap="round" marker-end="url(#arrowGreen)"/>
+<text x="2870" y="1085" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="28" font-weight="400" fill="#5F7282" text-anchor="start">end-to-end differentiable</text>
+<line x1="990" y1="1638" x2="1180" y2="1638" stroke="#5F7282" stroke-width="7" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="1930" y1="1638" x2="2120" y2="1638" stroke="#5F7282" stroke-width="7" stroke-linecap="round" marker-end="url(#arrow)"/>
+<line x1="2870" y1="1638" x2="3060" y2="1638" stroke="#5F7282" stroke-width="7" stroke-linecap="round" marker-end="url(#arrow)"/>
+<polyline points="3375,1485 3375,1325 3110,1020" fill="none" stroke="#7B61B6" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowPurple)" stroke-dasharray="18 14"/>
+<text x="2715" y="1330" font-family="Arial, Segoe UI, Helvetica, sans-serif" font-size="27" font-weight="400" fill="#5F7282" text-anchor="start">checkpoint selection updates deployed parameters</text>
+</svg>

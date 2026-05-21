@@ -191,6 +191,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-recall-boost", type=float, default=0.2)
     p.add_argument("--label-smoothing", action="store_true", default=True)
     p.add_argument("--no-label-smoothing", dest="label_smoothing", action="store_false")
+    p.add_argument("--boundary-weight", type=float, default=0.0, help="Extra sample weight near 500 m and 1000 m boundaries.")
+    p.add_argument("--boundary-fog-sigma", type=float, default=100.0, help="Width for the 500 m Fog/Mist boundary kernel.")
+    p.add_argument("--boundary-mist-sigma", type=float, default=200.0, help="Width for the 1000 m Mist/Clear boundary kernel.")
+    p.add_argument("--physical-hard-weight", type=float, default=0.0, help="Extra weight for high-humidity Clear-like hard negatives.")
+    p.add_argument("--humid-rh-th", type=float, default=90.0)
+    p.add_argument("--humid-dpd-th", type=float, default=2.0)
+    p.add_argument("--humid-clear-vis-max", type=float, default=3000.0)
+    p.add_argument("--aerosol-hard-weight", type=float, default=0.0, help="Extra weight for humid aerosol transition samples.")
+    p.add_argument("--aerosol-rh-th", type=float, default=85.0)
+    p.add_argument("--pm25-hard-th", type=float, default=75.0)
+    p.add_argument("--pm10-hard-th", type=float, default=150.0)
+    p.add_argument("--ordinal-cost-weight", type=float, default=0.0, help="Penalty on probability mass assigned far from the ordered target class.")
+    p.add_argument("--sample-weight-cap", type=float, default=4.0)
 
     p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall"], default="recall_csi")
     p.add_argument("--min-fog-precision", type=float, default=0.10)
@@ -269,6 +282,21 @@ def apply_core_transform(core: np.ndarray, layout: Layout, use_pm: bool, log_mas
     return out
 
 
+def boundary_weight_from_visibility(y_raw: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    weights = np.ones(len(y_raw), dtype=np.float32)
+    if args.boundary_weight <= 0:
+        return weights
+    vis = np.asarray(y_raw, dtype=np.float32)
+    fog_sigma = max(float(args.boundary_fog_sigma), 1.0)
+    mist_sigma = max(float(args.boundary_mist_sigma), 1.0)
+    fog_mist = np.exp(-np.abs(vis - 500.0) / fog_sigma)
+    mist_clear = np.exp(-np.abs(vis - 1000.0) / mist_sigma)
+    boundary = np.maximum(fog_mist, mist_clear)
+    weights += float(args.boundary_weight) * boundary.astype(np.float32)
+    cap = max(float(args.sample_weight_cap), 1.0)
+    return np.clip(weights, 0.0, cap).astype(np.float32)
+
+
 def scaler_cache_path(args: argparse.Namespace, stage: str, layout: Layout, use_pm: bool) -> str:
     pm_tag = "pm" if use_pm else "nopm"
     name = f"robust_scaler_{args.run_id}_{stage}_w{layout.window_size}_dyn{layout.dyn_vars}_{pm_tag}.pkl"
@@ -285,22 +313,65 @@ class LowVisDataset(Dataset):
         scaler: Optional[RobustScaler],
         use_fe: bool,
         use_pm: bool,
+        args: argparse.Namespace,
     ) -> None:
         self.x_path = x_path
         self.layout = layout
         self.scaler = scaler
         self.use_fe = bool(use_fe)
         self.use_pm = bool(use_pm)
+        self.args = args
         self.y_raw = torch.as_tensor(np.maximum(y_raw, 0.0), dtype=torch.float32)
         self.y_cls = torch.as_tensor(y_cls, dtype=torch.long)
         self.y_reg = torch.log1p(self.y_raw)
+        self.base_weights = boundary_weight_from_visibility(np.maximum(y_raw, 0.0), args)
         self.log_mask = build_dyn_log_mask(layout)
         self.X = None
 
     def __len__(self) -> int:
         return len(self.y_cls)
 
+    def _physical_weight(self, row: np.ndarray, idx: int) -> float:
+        weight = float(self.base_weights[idx])
+        args = self.args
+        cls = int(self.y_cls[idx])
+        vis = float(self.y_raw[idx])
+        last = (self.layout.window_size - 1) * self.layout.dyn_vars
+        rh = float(row[last + 0]) if self.layout.dyn_vars > 0 else math.nan
+        wspd = float(row[last + 6]) if self.layout.dyn_vars > 6 else math.nan
+        dpd = float(row[last + 22]) if self.layout.dyn_vars > 22 else math.nan
+        pm10 = float(row[last + self.layout.dyn_vars - 2]) if self.layout.dyn_vars >= 27 else math.nan
+        pm25 = float(row[last + self.layout.dyn_vars - 1]) if self.layout.dyn_vars >= 27 else math.nan
+
+        if args.physical_hard_weight > 0 and cls == 2:
+            humid_clear = (
+                (math.isfinite(rh) and rh >= args.humid_rh_th)
+                or (math.isfinite(dpd) and dpd <= args.humid_dpd_th)
+                or (1000.0 <= vis < args.humid_clear_vis_max)
+            )
+            ventilated_humid = (
+                math.isfinite(rh)
+                and math.isfinite(wspd)
+                and rh >= max(args.humid_rh_th - 5.0, 0.0)
+                and wspd >= 4.0
+            )
+            if humid_clear or ventilated_humid:
+                weight += float(args.physical_hard_weight)
+
+        if args.aerosol_hard_weight > 0:
+            humid = math.isfinite(rh) and rh >= args.aerosol_rh_th
+            aerosol = (
+                (math.isfinite(pm25) and pm25 >= args.pm25_hard_th)
+                or (math.isfinite(pm10) and pm10 >= args.pm10_hard_th)
+            )
+            if humid and aerosol and vis < args.humid_clear_vis_max:
+                weight += float(args.aerosol_hard_weight)
+
+        cap = max(float(args.sample_weight_cap), 1.0)
+        return float(np.clip(weight, 0.0, cap))
+
     def __getitem__(self, idx: int):
+        idx = int(idx)
         if self.X is None:
             self.X = np.load(self.x_path, mmap_mode="r")
         row = self.X[idx]
@@ -315,7 +386,8 @@ class LowVisDataset(Dataset):
             fe = row[self.layout.split_dyn + 6 : self.layout.split_dyn + 6 + self.layout.fe_dim]
             parts.append(np.clip(fe.astype(np.float32), -10.0, 10.0))
         final = np.nan_to_num(np.concatenate(parts), nan=0.0, posinf=10.0, neginf=-10.0)
-        return torch.from_numpy(final).float(), self.y_cls[idx], self.y_reg[idx], self.y_raw[idx]
+        sample_weight = np.asarray(self._physical_weight(row, idx), dtype=np.float32)
+        return torch.from_numpy(final).float(), self.y_cls[idx], self.y_reg[idx], self.y_raw[idx], torch.from_numpy(sample_weight)
 
 
 def load_split_paths(
@@ -394,8 +466,8 @@ def load_data(
     if len(y_raw_va) != np.load(x_va, mmap_mode="r").shape[0]:
         raise ValueError("val X/y length mismatch")
     scaler = fit_or_load_scaler(args, stage, x_tr, layout, use_pm, rank, world_size, device)
-    tr_ds = LowVisDataset(x_tr, y_raw_tr, y_cls_tr, layout, scaler, use_fe, use_pm)
-    va_ds = LowVisDataset(x_va, y_raw_va, y_cls_va, layout, scaler, use_fe, use_pm)
+    tr_ds = LowVisDataset(x_tr, y_raw_tr, y_cls_tr, layout, scaler, use_fe, use_pm, args)
+    va_ds = LowVisDataset(x_va, y_raw_va, y_cls_va, layout, scaler, use_fe, use_pm, args)
     rank0(rank, f"[Data:{stage}] train={len(tr_ds)} val={len(va_ds)} layout={layout} use_fe={use_fe} use_pm={use_pm}")
     return tr_ds, va_ds, layout, scaler
 
@@ -512,13 +584,28 @@ class WeightedFocalLoss(nn.Module):
         self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
         self.register_buffer("gamma", torch.tensor(gamma, dtype=torch.float32))
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, soft_targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        soft_targets: Optional[torch.Tensor] = None,
+        sample_weight: Optional[torch.Tensor] = None,
+        ordinal_cost_weight: float = 0.0,
+    ) -> torch.Tensor:
         probs = torch.softmax(logits, dim=1).clamp(1e-7, 1.0 - 1e-7)
         if soft_targets is None:
             soft_targets = F.one_hot(targets, 3).float()
         focal = (1.0 - probs) ** self.gamma.unsqueeze(0)
         weight = self.class_weights.unsqueeze(0)
+        if ordinal_cost_weight > 0:
+            cls_ids = torch.arange(logits.size(1), device=logits.device, dtype=logits.dtype).unsqueeze(0)
+            dist = torch.abs(cls_ids - targets.float().unsqueeze(1))
+            weight = weight * (1.0 + float(ordinal_cost_weight) * dist)
         loss = -(soft_targets * weight * focal * torch.log(probs)).sum(dim=1)
+        if sample_weight is not None:
+            sw = sample_weight.to(loss.device, dtype=loss.dtype).clamp_min(0.0)
+            sw = sw / sw.mean().clamp_min(1e-6)
+            loss = loss * sw
         return loss.mean()
 
 
@@ -539,6 +626,14 @@ def soft_targets_from_visibility(raw: torch.Tensor, labels: torch.Tensor) -> tor
     return soft
 
 
+def weighted_mean(value: torch.Tensor, sample_weight: Optional[torch.Tensor]) -> torch.Tensor:
+    if sample_weight is None:
+        return torch.mean(value)
+    sw = sample_weight.to(value.device, dtype=value.dtype).clamp_min(0.0)
+    sw = sw / sw.mean().clamp_min(1e-6)
+    return torch.mean(value * sw)
+
+
 def combined_loss(
     args: argparse.Namespace,
     focal: WeightedFocalLoss,
@@ -547,21 +642,43 @@ def combined_loss(
     y: torch.Tensor,
     y_reg: torch.Tensor,
     y_raw: torch.Tensor,
+    sample_weight: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     soft = soft_targets_from_visibility(y_raw, y) if args.label_smoothing else None
-    l_cls = focal(logits, y, soft)
+    l_cls = focal(logits, y, soft, sample_weight, 0.0)
     probs = torch.softmax(logits, dim=1)
     clear = (y == 2).float()
     fog = (y == 0).float()
     mist = (y == 1).float()
     p_low = torch.clamp(probs[:, 0] + probs[:, 1], 0.0, 1.0)
-    l_fp = torch.mean((p_low ** 2) * clear)
-    l_boost = torch.mean(((1.0 - probs[:, 0]) ** 2) * fog) + torch.mean(((1.0 - probs[:, 1]) ** 2) * mist)
+    l_fp = weighted_mean((p_low ** 2) * clear, sample_weight)
+    l_boost = weighted_mean(((1.0 - probs[:, 0]) ** 2) * fog, sample_weight) + weighted_mean(
+        ((1.0 - probs[:, 1]) ** 2) * mist,
+        sample_weight,
+    )
+    if args.ordinal_cost_weight > 0:
+        cls_ids = torch.arange(probs.size(1), device=probs.device, dtype=probs.dtype).unsqueeze(0)
+        ordinal_distance = torch.abs(cls_ids - y.float().unsqueeze(1))
+        l_ord = weighted_mean(torch.sum(probs * ordinal_distance, dim=1), sample_weight)
+    else:
+        l_ord = probs.sum() * 0.0
     # Keep the auxiliary head in the autograd graph even when the auxiliary
     # objective is disabled; otherwise DDP reports reg_head as an unused branch.
-    l_reg = F.mse_loss(reg, y_reg) if args.aux_reg_weight > 0 else reg.sum() * 0.0
-    total = l_cls + args.alpha_clear_fp * l_fp + args.alpha_recall_boost * l_boost + args.aux_reg_weight * l_reg
-    return total, {"cls": float(l_cls.detach()), "fp": float(l_fp.detach()), "boost": float(l_boost.detach()), "reg": float(l_reg.detach())}
+    l_reg = weighted_mean((reg - y_reg) ** 2, sample_weight) if args.aux_reg_weight > 0 else reg.sum() * 0.0
+    total = (
+        l_cls
+        + args.alpha_clear_fp * l_fp
+        + args.alpha_recall_boost * l_boost
+        + args.ordinal_cost_weight * l_ord
+        + args.aux_reg_weight * l_reg
+    )
+    return total, {
+        "cls": float(l_cls.detach()),
+        "fp": float(l_fp.detach()),
+        "boost": float(l_boost.detach()),
+        "ord": float(l_ord.detach()),
+        "reg": float(l_reg.detach()),
+    }
 
 
 def class_stats(y_true: np.ndarray, pred: np.ndarray, cls: int) -> Tuple[float, float, float]:
@@ -680,7 +797,7 @@ def evaluate(
     model.eval()
     probs_l, targets_l = [], []
     with torch.no_grad():
-        for bx, by, _, _ in loader:
+        for bx, by, _, _, _ in loader:
             bx = bx.to(device, non_blocking=True)
             logits, _ = model(bx)
             probs_l.append(torch.softmax(logits, dim=1))
@@ -892,22 +1009,23 @@ def train_stage(
 
     while step < total_steps:
         try:
-            bx, by, breg, braw = next(iterator)
+            bx, by, breg, braw, bw = next(iterator)
         except StopIteration:
             epoch += 1
             batch_sampler.set_epoch(epoch)
             iterator = iter(train_loader)
-            bx, by, breg, braw = next(iterator)
+            bx, by, breg, braw, bw = next(iterator)
         bx = bx.to(device, non_blocking=True)
         by = by.to(device, non_blocking=True)
         breg = breg.to(device, non_blocking=True)
         braw = braw.to(device, non_blocking=True)
+        bw = bw.to(device, non_blocking=True)
         batch_count += 1
         is_sync = batch_count % args.grad_accum == 0
         ctx = model.no_sync() if world_size > 1 and not is_sync else contextlib.nullcontext()
         with ctx:
             logits, reg = model(bx)
-            loss, loss_parts = combined_loss(args, focal, logits, reg, by, breg, braw)
+            loss, loss_parts = combined_loss(args, focal, logits, reg, by, breg, braw, bw)
             if l2sp_ref and l2sp_alpha > 0:
                 loss = loss + l2sp_alpha * l2sp_penalty(model, l2sp_ref)
             (loss / args.grad_accum).backward()
@@ -927,7 +1045,8 @@ def train_stage(
             print(
                 f"[{tag}] step={step}/{total_steps} loss={float(loss):.4f} "
                 f"cls={loss_parts['cls']:.4f} fp={loss_parts['fp']:.4f} "
-                f"boost={loss_parts['boost']:.4f} lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
+                f"boost={loss_parts['boost']:.4f} ord={loss_parts['ord']:.4f} "
+                f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
                 flush=True,
             )
 
