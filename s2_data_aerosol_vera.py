@@ -85,12 +85,26 @@ FINAL_FEATURE_ORDER = [
 VAL_LAST_DAYS = 3
 TEST_LAST_DAYS = 3
 GAP_HOURS = 24
+TIANJI_INPUT_TIME_SHIFT_HOURS = float(os.environ.get("TIANJI_INPUT_TIME_SHIFT_HOURS", "0"))
+TIANJI_TIME_ALIGNMENT = (
+    "bjt_minus_8_to_utc"
+    if TIANJI_INPUT_TIME_SHIFT_HOURS == -8
+    else ("raw_utc_no_shift" if TIANJI_INPUT_TIME_SHIFT_HOURS == 0 else "custom_shift_to_utc")
+)
 
 WINDOW_SIZE, STEP_SIZE = 12, 1
 UNIQUE_VEG_IDS = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20])
 MAX_VIS_THRESHOLD = 30000
 # 沿时间窗分批物化样本，避免一次性分配 (n_wins×n_st)×12×nv 的 X_samples（易 OOM）
 TIME_CHUNK_WINS = 48
+
+
+def normalize_tianji_times(raw_times):
+    times = pd.DatetimeIndex(pd.to_datetime(raw_times))
+    if TIANJI_INPUT_TIME_SHIFT_HOURS:
+        times = times + pd.to_timedelta(TIANJI_INPUT_TIME_SHIFT_HOURS, unit="h")
+    return times
+
 
 BASE_FOG_FEATURE_NAMES = [
     "sat_dpd", "wind_favourability", "stability_ri", "night_clear_radiation",
@@ -558,7 +572,7 @@ def prepare_raw_data(ds_in, data_veg, data_oro):
         lats, lons = ds["latitude"].values, ds["longitude"].values
     else:
         raise AttributeError("Latitude/Longitude coordinates not found.")
-    times, stations = pd.to_datetime(ds.time.values), ds.station_id.values
+    times, stations = normalize_tianji_times(ds.time.values), ds.station_id.values
     print("  Building Dynamic Matrix...", flush=True)
     X_met = (
         ds[FINAL_FEATURE_ORDER]
@@ -641,7 +655,8 @@ def main():
     data_oro = xr.open_dataset(ORO_FILE, engine="h5netcdf")
     ds_in = xr.open_dataset(INPUT_FILE, engine="h5netcdf")
     print(
-        "[Time Alignment] merged_final_all_vars.nc raw time is UTC; no shift applied.",
+        "[Time Alignment] merged_final_all_vars.nc time alignment: "
+        f"{TIANJI_TIME_ALIGNMENT} (shift={TIANJI_INPUT_TIME_SHIFT_HOURS:+g} h before split).",
         flush=True,
     )
 
