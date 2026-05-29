@@ -17,6 +17,9 @@ files, log1p transforms for skewed dynamic variables, RobustScaler caching,
 stratified low-visibility batch sampling, focal loss with class weights,
 validation-time threshold search, gradient clipping, warmup+cosine LR, optional
 L2-SP, and compatible Stage-1-to-Stage-2 checkpoint loading.
+
+For manuscript loss-function ablations, the architecture and training protocol
+can be held fixed while switching only the objective with ``--loss-mode``.
 """
 
 from __future__ import annotations
@@ -155,6 +158,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-fe", action="store_true", help="Drop the FE block at training time.")
     p.add_argument("--no-pm", action="store_true", help="Zero PM channels while keeping data layout fixed.")
     p.add_argument("--aux-reg-weight", type=float, default=0.0)
+    p.add_argument(
+        "--loss-mode",
+        choices=["designed_focal", "ce", "regression"],
+        default=os.environ.get("LOWVIS_RNN_LOSS_MODE", "designed_focal"),
+        help=(
+            "Objective for loss-function ablations: designed_focal keeps the "
+            "paper loss, ce is plain hard-label cross entropy, and regression "
+            "uses only MSE on log1p(visibility)."
+        ),
+    )
 
     p.add_argument("--s1-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S1_STEPS", "15000")))
     p.add_argument("--s2-phase-a-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_A_STEPS", "8000")))
@@ -644,6 +657,34 @@ def combined_loss(
     y_raw: torch.Tensor,
     sample_weight: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    loss_mode = getattr(args, "loss_mode", "designed_focal")
+
+    if loss_mode == "ce":
+        l_cls = F.cross_entropy(logits, y)
+        l_reg = reg.sum() * 0.0
+        total = l_cls + l_reg
+        zero = float(l_reg.detach())
+        return total, {
+            "cls": float(l_cls.detach()),
+            "fp": zero,
+            "boost": zero,
+            "ord": zero,
+            "reg": zero,
+        }
+
+    if loss_mode == "regression":
+        l_reg = torch.mean((reg - y_reg) ** 2)
+        l_cls = logits.sum() * 0.0
+        total = l_reg + l_cls
+        zero = float(l_cls.detach())
+        return total, {
+            "cls": zero,
+            "fp": zero,
+            "boost": zero,
+            "ord": zero,
+            "reg": float(l_reg.detach()),
+        }
+
     soft = soft_targets_from_visibility(y_raw, y) if args.label_smoothing else None
     l_cls = focal(logits, y, soft, sample_weight, 0.0)
     probs = torch.softmax(logits, dim=1)
@@ -697,6 +738,15 @@ def pred_from_thresholds(probs: np.ndarray, fog_th: float, mist_th: float) -> np
     mist = (probs[:, 1] > mist_th) & (probs[:, 1] > probs[:, 0])
     pred[fog] = 0
     pred[mist] = 1
+    return pred
+
+
+def pred_from_regression_logvis(logvis_pred: np.ndarray) -> np.ndarray:
+    logvis = np.asarray(logvis_pred, dtype=np.float64)
+    vis = np.expm1(np.clip(logvis, 0.0, np.log1p(80000.0)))
+    pred = np.full(len(vis), 2, dtype=np.int64)
+    pred[vis < 1000.0] = 1
+    pred[vis < 500.0] = 0
     return pred
 
 
@@ -795,15 +845,34 @@ def evaluate(
     n_actual: int,
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
     model.eval()
-    probs_l, targets_l = [], []
+    probs_l, targets_l, reg_l = [], [], []
     with torch.no_grad():
-        for bx, by, _, _, _ in loader:
+        for bx, by, _, braw, _ in loader:
             bx = bx.to(device, non_blocking=True)
-            logits, _ = model(bx)
-            probs_l.append(torch.softmax(logits, dim=1))
+            logits, reg = model(bx)
+            if getattr(args, "loss_mode", "designed_focal") == "regression":
+                reg_l.append(torch.stack([reg, braw.to(device)], dim=1))
+            else:
+                probs_l.append(torch.softmax(logits, dim=1))
             targets_l.append(by.to(device))
-    probs = torch.cat(probs_l, dim=0)
     targets = torch.cat(targets_l, dim=0)
+    if getattr(args, "loss_mode", "designed_focal") == "regression":
+        reg_pack = torch.cat(reg_l, dim=0)
+        all_reg, all_targets = gather_eval_arrays(reg_pack, targets, world_size)
+        all_reg = all_reg[:n_actual]
+        all_targets = all_targets[:n_actual]
+        if rank == 0:
+            pred = pred_from_regression_logvis(all_reg[:, 0])
+            metrics = build_metrics(all_targets.astype(np.int64), pred)
+            vis_pred = np.expm1(np.clip(all_reg[:, 0], 0.0, np.log1p(80000.0)))
+            vis_true = np.maximum(all_reg[:, 1], 0.0)
+            err = vis_pred - vis_true
+            metrics["regression_mae_m"] = float(np.mean(np.abs(err)))
+            metrics["regression_rmse_m"] = float(np.sqrt(np.mean(err ** 2)))
+            return score_metrics(args, metrics), {"fog_vis_m": 500.0, "mist_vis_m": 1000.0}, metrics
+        return -1.0, {"fog_vis_m": 500.0, "mist_vis_m": 1000.0}, {}
+
+    probs = torch.cat(probs_l, dim=0)
     all_probs, all_targets = gather_eval_arrays(probs, targets, world_size)
     all_probs = all_probs[:n_actual]
     all_targets = all_targets[:n_actual]
@@ -992,7 +1061,12 @@ def train_stage(
     if world_size > 1:
         dist.all_reduce(torch.zeros(1, device=device), op=dist.ReduceOp.SUM)
         torch.cuda.synchronize(device)
-    rank0(rank, f"[{tag}] start steps={total_steps} trainable={trainable} fog_ratio={fog_ratio} mist_ratio={mist_ratio}")
+    rank0(
+        rank,
+        f"[{tag}] start steps={total_steps} trainable={trainable} "
+        f"loss_mode={getattr(args, 'loss_mode', 'designed_focal')} "
+        f"fog_ratio={fog_ratio} mist_ratio={mist_ratio}",
+    )
 
     ckpt_best = os.path.join(args.ckpt_dir, f"{args.run_id}_{tag}_best_score.pt")
     ckpt_latest = os.path.join(args.ckpt_dir, f"{args.run_id}_{tag}_latest.pt")
@@ -1046,6 +1120,7 @@ def train_stage(
                 f"[{tag}] step={step}/{total_steps} loss={float(loss):.4f} "
                 f"cls={loss_parts['cls']:.4f} fp={loss_parts['fp']:.4f} "
                 f"boost={loss_parts['boost']:.4f} ord={loss_parts['ord']:.4f} "
+                f"reg={loss_parts['reg']:.4f} "
                 f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
                 flush=True,
             )
@@ -1061,6 +1136,24 @@ def train_stage(
                 "thresholds": th,
                 "metrics": metrics,
                 "selection_metric": args.selection_metric,
+                "loss_mode": getattr(args, "loss_mode", "designed_focal"),
+                "decision_type": "regression_threshold" if getattr(args, "loss_mode", "designed_focal") == "regression" else "probability_threshold",
+                "loss_terms": {
+                    "class_weight_fog": float(args.class_weight_fog),
+                    "class_weight_mist": float(args.class_weight_mist),
+                    "class_weight_clear": float(args.class_weight_clear),
+                    "focal_gamma_fog": float(args.focal_gamma_fog),
+                    "focal_gamma_mist": float(args.focal_gamma_mist),
+                    "focal_gamma_clear": float(args.focal_gamma_clear),
+                    "alpha_clear_fp": float(args.alpha_clear_fp),
+                    "alpha_recall_boost": float(args.alpha_recall_boost),
+                    "label_smoothing": bool(args.label_smoothing),
+                    "boundary_weight": float(args.boundary_weight),
+                    "physical_hard_weight": float(args.physical_hard_weight),
+                    "aerosol_hard_weight": float(args.aerosol_hard_weight),
+                    "ordinal_cost_weight": float(args.ordinal_cost_weight),
+                    "aux_reg_weight": float(args.aux_reg_weight),
+                },
             }
             save_checkpoint(model, ckpt_latest, rank, ckpt_meta)
             if rank == 0:

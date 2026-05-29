@@ -2,6 +2,7 @@ import os
 import glob
 import gc
 import warnings
+import json
 
 import numpy as np
 import pandas as pd
@@ -12,12 +13,54 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 warnings.filterwarnings("ignore")
 
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_months(value, default):
+    text = os.environ.get(value, default)
+    months = []
+    for token in str(text).replace(";", ",").replace(":", ",").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        month = int(token)
+        if month < 1 or month > 12:
+            raise ValueError(f"{value} contains invalid month {month}; months must be 1..12")
+        months.append(month)
+    if not months:
+        raise ValueError(f"{value} produced an empty month list")
+    return tuple(dict.fromkeys(months))
+
+
 # ================= 配置（与 train/PMST_s2_data_48h_pm10 末尾单元格保持同一套“月末天数”语义） =================
 BASE_PATH = "/public/home/putianshu/vis_mlp"
 INPUT_FILE = os.path.join(BASE_PATH, "tianji_auto_station", "merged_final_all_vars.nc")
 VEG_FILE = "/public/home/putianshu/vis_cnn/data_vegtype.nc"
 ORO_FILE = "/public/home/putianshu/vis_cnn/data_orography.nc"
-OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, "ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2")
+
+SPLIT_POLICY = os.environ.get("S2_SPLIT_POLICY", "month_tail").strip().lower()
+if SPLIT_POLICY not in {"month_tail", "month_group"}:
+    raise ValueError("S2_SPLIT_POLICY must be 'month_tail' or 'month_group'")
+SPLIT_NAME = os.environ.get("S2_SPLIT_NAME", SPLIT_POLICY).strip() or SPLIT_POLICY
+MONTH_GROUP_TRAIN_MONTHS = _parse_months("S2_TRAIN_MONTHS", "1,3,5,7,9")
+MONTH_GROUP_VAL_MONTHS = _parse_months("S2_VAL_MONTHS", "11")
+MONTH_GROUP_TEST_MONTHS = _parse_months("S2_TEST_MONTHS", "2,4,6,8,10,12")
+MONTH_GROUP_DROP_CROSS_SPLIT_WINDOWS = _env_bool("S2_DROP_CROSS_SPLIT_WINDOWS", True)
+
+DEFAULT_OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, "ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2")
+DEFAULT_MONTH_GROUP_OUTPUT_DATASET_DIR = os.path.join(
+    BASE_PATH,
+    "ml_dataset_s2_tianji_12h_pm10_pm25_monthgroup_train13579_val11_test24681012",
+)
+OUTPUT_DATASET_DIR = os.environ.get(
+    "S2_OUTPUT_DATASET_DIR",
+    DEFAULT_MONTH_GROUP_OUTPUT_DATASET_DIR if SPLIT_POLICY == "month_group" else DEFAULT_OUTPUT_DATASET_DIR,
+)
 
 # PM10：优先单文件（与 48h 一致），否则尝试目录下多 nc 拼接
 PM10_S2_FILE = os.path.join(BASE_PATH, "pm10_station", "pm10_station_s2_2025.nc")
@@ -148,6 +191,152 @@ def get_monthly_split_mask_last_days(sample_times, gap_hours, val_last_days, tes
         test_mask |= msub & (times >= t_test0)
 
     return train_mask, val_mask, test_mask
+
+
+def _validate_month_groups(train_months, val_months, test_months):
+    groups = {
+        "train": set(int(m) for m in train_months),
+        "val": set(int(m) for m in val_months),
+        "test": set(int(m) for m in test_months),
+    }
+    for tag, months in groups.items():
+        if not months:
+            raise ValueError(f"{tag} month group is empty")
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = groups[a] & groups[b]
+        if overlap:
+            raise ValueError(f"Month groups overlap between {a} and {b}: {sorted(overlap)}")
+    return groups
+
+
+def get_month_group_split_masks(
+    sample_times,
+    window_start_times,
+    window_end_times,
+    train_months,
+    val_months,
+    test_months,
+    drop_cross_split_windows=True,
+):
+    """Split by whole calendar months and drop windows that cross split groups.
+
+    ``sample_times`` are label/valid times.  A 12 h sample near a month boundary
+    can use input hours from the previous month; if those hours belong to a
+    different split group, the sample is excluded to avoid temporal leakage.
+    """
+
+    groups = _validate_month_groups(train_months, val_months, test_months)
+    month_to_split = {}
+    for tag, months in groups.items():
+        for month in months:
+            month_to_split[int(month)] = tag
+
+    label_times = pd.DatetimeIndex(sample_times)
+    start_times = pd.DatetimeIndex(window_start_times)
+    end_times = pd.DatetimeIndex(window_end_times)
+    if not (len(label_times) == len(start_times) == len(end_times)):
+        raise ValueError("sample_times, window_start_times, and window_end_times must have the same length")
+
+    def tags_for_months(month_values):
+        return np.asarray([month_to_split.get(int(month), "") for month in month_values], dtype=object)
+
+    label_tags = tags_for_months(label_times.month)
+    start_tags = tags_for_months(start_times.month)
+    end_tags = tags_for_months(end_times.month)
+
+    assigned_label = label_tags != ""
+    same_group_window = (start_tags == label_tags) & (end_tags == label_tags)
+    if drop_cross_split_windows:
+        keep = assigned_label & same_group_window
+    else:
+        keep = assigned_label
+
+    train_mask = keep & (label_tags == "train")
+    val_mask = keep & (label_tags == "val")
+    test_mask = keep & (label_tags == "test")
+    audit = {
+        "split_policy": "month_group",
+        "train_months": sorted(groups["train"]),
+        "val_months": sorted(groups["val"]),
+        "test_months": sorted(groups["test"]),
+        "drop_cross_split_windows": bool(drop_cross_split_windows),
+        "valid_samples_before_split": int(len(label_times)),
+        "assigned_label_month_samples": int(assigned_label.sum()),
+        "dropped_unassigned_label_month_samples": int((~assigned_label).sum()),
+        "dropped_cross_split_window_samples": int((assigned_label & ~same_group_window).sum())
+        if drop_cross_split_windows
+        else 0,
+        "retained_train_samples": int(train_mask.sum()),
+        "retained_val_samples": int(val_mask.sum()),
+        "retained_test_samples": int(test_mask.sum()),
+    }
+    return train_mask, val_mask, test_mask, audit
+
+
+def _class_counts(y_values):
+    y = np.asarray(y_values, dtype=np.float32)
+    cls = np.full(len(y), "Clear", dtype=object)
+    cls[y < 1000.0] = "Mist"
+    cls[y < 500.0] = "Fog"
+    return {name: int(np.sum(cls == name)) for name in ("Fog", "Mist", "Clear")}
+
+
+def write_split_metadata(out_dir, split_policy, split_audit, split_indices, y_flat, times_all, fe_dim):
+    summary_rows = []
+    for tag, ix in split_indices.items():
+        t = pd.DatetimeIndex(times_all[ix])
+        row = {
+            "split": tag,
+            "n_samples": int(len(ix)),
+            "n_times": int(t.nunique()) if len(t) else 0,
+            "months": ",".join(str(m) for m in sorted(pd.Index(t.month).unique())) if len(t) else "",
+        }
+        row.update({f"{k}_samples": v for k, v in _class_counts(y_flat[ix]).items()})
+        summary_rows.append(row)
+    pd.DataFrame(summary_rows).to_csv(os.path.join(out_dir, "split_summary.csv"), index=False)
+
+    month_rows = []
+    for tag, ix in split_indices.items():
+        t = pd.DatetimeIndex(times_all[ix])
+        y_split = y_flat[ix]
+        for month in range(1, 13):
+            mask = t.month == month
+            if not np.any(mask):
+                continue
+            counts = _class_counts(y_split[mask])
+            month_rows.append(
+                {
+                    "split": tag,
+                    "month": month,
+                    "n_samples": int(np.sum(mask)),
+                    **{f"{k}_samples": v for k, v in counts.items()},
+                }
+            )
+    pd.DataFrame(month_rows).to_csv(os.path.join(out_dir, "split_month_summary.csv"), index=False)
+
+    config = {
+        "dataset": "s2_tianji_12h_pm10_pm25",
+        "split_policy": split_policy,
+        "split_name": SPLIT_NAME,
+        "output_dataset_dir": out_dir,
+        "window_size": int(WINDOW_SIZE),
+        "step_size": int(STEP_SIZE),
+        "max_visibility_m": float(MAX_VIS_THRESHOLD),
+        "time_alignment": TIANJI_TIME_ALIGNMENT,
+        "tianji_input_time_shift_hours": float(TIANJI_INPUT_TIME_SHIFT_HOURS),
+        "dynamic_feature_order": FINAL_FEATURE_ORDER + ["ZENITH", "PM10", "PM2P5"],
+        "feature_engineering_dim": int(fe_dim),
+        "static_columns": ["lat_norm", "lon_norm", "orography_norm", "htcc", "veg_type_index"],
+        "split_audit": split_audit,
+        "outputs": {
+            "split_summary": os.path.join(out_dir, "split_summary.csv"),
+            "split_month_summary": os.path.join(out_dir, "split_month_summary.csv"),
+        },
+    }
+    with open(os.path.join(out_dir, "dataset_split_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
 def load_pm10_dataarray():
     """返回 (time, station_id) 的 pm10 DataArray，或 None。"""
     das = []
@@ -480,20 +669,49 @@ def prepare_raw_data(ds_in, data_veg, data_oro):
 
 
 def save_chunked(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_dir):
-    times_all, stats_all, lats_all, lons_all = meta
+    times_all, window_start_all, window_end_all, stats_all, lats_all, lons_all = meta
     valid_idxs = np.where(mask)[0]
     n = len(valid_idxs)
     print(f"  Valid Samples: {n} ({n / len(mask):.1%})", flush=True)
     valid_times = pd.DatetimeIndex(times_all[valid_idxs])
-    tr_m, val_m, test_m = get_monthly_split_mask_last_days(
-        valid_times, GAP_HOURS, VAL_LAST_DAYS, TEST_LAST_DAYS
-    )
+    if SPLIT_POLICY == "month_group":
+        tr_m, val_m, test_m, split_audit = get_month_group_split_masks(
+            valid_times,
+            pd.DatetimeIndex(window_start_all[valid_idxs]),
+            pd.DatetimeIndex(window_end_all[valid_idxs]),
+            MONTH_GROUP_TRAIN_MONTHS,
+            MONTH_GROUP_VAL_MONTHS,
+            MONTH_GROUP_TEST_MONTHS,
+            MONTH_GROUP_DROP_CROSS_SPLIT_WINDOWS,
+        )
+        print(
+            "  Split policy: month_group "
+            f"train={split_audit['train_months']} val={split_audit['val_months']} "
+            f"test={split_audit['test_months']} "
+            f"dropped_cross_split_windows={split_audit['dropped_cross_split_window_samples']}",
+            flush=True,
+        )
+    else:
+        tr_m, val_m, test_m = get_monthly_split_mask_last_days(
+            valid_times, GAP_HOURS, VAL_LAST_DAYS, TEST_LAST_DAYS
+        )
+        split_audit = {
+            "split_policy": "month_tail",
+            "val_last_days": int(VAL_LAST_DAYS),
+            "test_last_days": int(TEST_LAST_DAYS),
+            "gap_hours": int(GAP_HOURS),
+            "valid_samples_before_split": int(n),
+            "retained_train_samples": int(tr_m.sum()),
+            "retained_val_samples": int(val_m.sum()),
+            "retained_test_samples": int(test_m.sum()),
+        }
     splits = {
         "train": valid_idxs[tr_m],
         "val": valid_idxs[val_m],
         "test": valid_idxs[test_m],
     }
     dims = [X_dyn_flat.shape[1], X_stat_flat.shape[1], fe_flat.shape[1]]
+    write_split_metadata(out_dir, SPLIT_POLICY, split_audit, splits, y_flat, times_all, dims[2])
     for tag, ix in splits.items():
         if len(ix) == 0:
             continue
@@ -502,6 +720,8 @@ def save_chunked(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_dir):
         pd.DataFrame(
             {
                 "time": times_all[ix],
+                "window_start_time": window_start_all[ix],
+                "window_end_time": window_end_all[ix],
                 "station_id": stats_all[ix],
                 "lat": lats_all[ix],
                 "lon": lons_all[ix],
@@ -527,6 +747,20 @@ def save_chunked(X_dyn_flat, X_stat_flat, fe_flat, y_flat, mask, meta, out_dir):
 def main():
     os.makedirs(OUTPUT_DATASET_DIR, exist_ok=True)
     print("Loading auxiliary data...", flush=True)
+    print(
+        f"Dataset output: {OUTPUT_DATASET_DIR}\n"
+        f"Split policy  : {SPLIT_POLICY} ({SPLIT_NAME})",
+        flush=True,
+    )
+    if SPLIT_POLICY == "month_group":
+        print(
+            "Month groups  : "
+            f"train={MONTH_GROUP_TRAIN_MONTHS} "
+            f"val={MONTH_GROUP_VAL_MONTHS} "
+            f"test={MONTH_GROUP_TEST_MONTHS} "
+            f"drop_cross_split_windows={MONTH_GROUP_DROP_CROSS_SPLIT_WINDOWS}",
+            flush=True,
+        )
     data_veg = xr.open_dataset(VEG_FILE, engine="h5netcdf")
     data_oro = xr.open_dataset(ORO_FILE, engine="h5netcdf")
     ds_in = xr.open_dataset(INPUT_FILE, engine="h5netcdf")
@@ -565,7 +799,10 @@ def main():
     dyn_flat_dim = WINDOW_SIZE * nv
 
     y = ds_in[vis_key].values[WINDOW_SIZE - 1 :: STEP_SIZE].reshape(-1)
-    m_t = np.repeat(times[WINDOW_SIZE - 1 :: STEP_SIZE], ns)
+    window_start_times = times[np.arange(n_wins) * STEP_SIZE]
+    window_end_times = times[(np.arange(n_wins) * STEP_SIZE) + WINDOW_SIZE - 1]
+    m_t0 = np.repeat(window_start_times, ns)
+    m_t = np.repeat(window_end_times, ns)
     m_s = np.tile(stats, n_wins)
     m_la = np.tile(lats, n_wins)
     m_lo = np.tile(lons, n_wins)
@@ -628,9 +865,9 @@ def main():
     print("  Broadcasting Static...", flush=True)
     X_stat_flat = np.tile(X_stat, (n_wins, 1))
 
-    print("  Saving (month-tail split)...", flush=True)
+    print(f"  Saving ({SPLIT_POLICY} split)...", flush=True)
     mask = ~np.isnan(y) & (y >= 0) & (y <= MAX_VIS_THRESHOLD)
-    save_chunked(mm_x, X_stat_flat, mm_fe, y, mask, (m_t, m_s, m_la, m_lo), OUTPUT_DATASET_DIR)
+    save_chunked(mm_x, X_stat_flat, mm_fe, y, mask, (m_t, m_t0, m_t, m_s, m_la, m_lo), OUTPUT_DATASET_DIR)
 
     del mm_x, mm_fe, X_stat_flat
     gc.collect()
