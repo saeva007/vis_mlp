@@ -144,6 +144,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-data-dir", default=DEFAULT_S2_DIR)
     p.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR)
     p.add_argument("--pretrained-ckpt", default="")
+    p.add_argument(
+        "--pretrained-layout-policy",
+        choices=["strict", "compatible"],
+        default=os.environ.get("LOWVIS_RNN_PRETRAINED_LAYOUT_POLICY", "strict"),
+        help=(
+            "strict refuses S1/S2 transfers with different dynamic or FE input "
+            "layouts; compatible keeps the historical shape-matching partial load."
+        ),
+    )
 
     p.add_argument("--window-size", type=int, default=12)
     p.add_argument("--hidden-dim", type=int, default=256)
@@ -979,24 +988,106 @@ def save_checkpoint(model: nn.Module, path: str, rank: int, metadata: Optional[D
     print(f"[Ckpt] saved {path}", flush=True)
 
 
-def load_compatible_checkpoint(model: nn.Module, path: str, rank: int, device: torch.device) -> None:
+def _normalise_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        kk = str(k)
+        if kk.startswith("module."):
+            kk = kk[len("module.") :]
+        out[kk] = v
+    return out
+
+
+def infer_checkpoint_layout(
+    state: Dict[str, torch.Tensor],
+    metadata: Optional[Dict],
+) -> Tuple[Optional[int], Optional[int], Optional[bool]]:
+    meta_layout = (metadata or {}).get("layout") if isinstance(metadata, dict) else None
+    dyn_vars = None
+    fe_dim = None
+    use_fe = None
+    if isinstance(meta_layout, dict):
+        if meta_layout.get("dyn_vars") is not None:
+            dyn_vars = int(meta_layout["dyn_vars"])
+        if meta_layout.get("fe_dim") is not None:
+            fe_dim = int(meta_layout["fe_dim"])
+    if isinstance(metadata, dict) and metadata.get("use_fe") is not None:
+        use_fe = bool(metadata["use_fe"])
+
+    state_n = _normalise_state_dict_keys(state)
+    w = state_n.get("dynamic_proj.0.weight")
+    if dyn_vars is None and torch.is_tensor(w) and w.ndim == 2:
+        dyn_vars = int(w.shape[1])
+    fe_w = state_n.get("fe_encoder.0.weight")
+    if fe_dim is None and torch.is_tensor(fe_w) and fe_w.ndim == 2:
+        fe_dim = int(fe_w.shape[1])
+    if use_fe is None:
+        use_fe = "fe_encoder.0.weight" in state_n
+    return dyn_vars, fe_dim, use_fe
+
+
+def validate_pretrained_layout(
+    model: nn.Module,
+    state: Dict[str, torch.Tensor],
+    metadata: Optional[Dict],
+    path: str,
+    policy: str,
+) -> None:
+    if policy == "compatible":
+        return
+    target = unwrap(model)
+    ckpt_dyn, ckpt_fe, ckpt_use_fe = infer_checkpoint_layout(state, metadata)
+    problems: List[str] = []
+    if ckpt_dyn is not None and ckpt_dyn != target.layout.dyn_vars:
+        problems.append(f"dyn_vars checkpoint={ckpt_dyn} target={target.layout.dyn_vars}")
+    if target.use_fe:
+        if ckpt_use_fe is False:
+            problems.append("checkpoint has no FE encoder but target uses FE")
+        if ckpt_fe is not None and ckpt_fe != target.layout.fe_dim:
+            problems.append(f"fe_dim checkpoint={ckpt_fe} target={target.layout.fe_dim}")
+    if problems:
+        raise ValueError(
+            "Pretrained checkpoint layout mismatch for "
+            f"{path}: {'; '.join(problems)}. "
+            "Use a matching S1 checkpoint for this feature layout, or pass "
+            "--pretrained-layout-policy compatible only for an intentional "
+            "partial tensor load."
+        )
+
+
+def load_compatible_checkpoint(
+    model: nn.Module,
+    path: str,
+    rank: int,
+    device: torch.device,
+    layout_policy: str = "strict",
+) -> None:
     if not path:
         return
     if not os.path.exists(path):
-        rank0(rank, f"[Ckpt] pretrained path not found, skip: {path}")
-        return
-    state = torch.load(path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
+    payload = torch.load(path, map_location=device)
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+    if not isinstance(state, dict):
+        raise ValueError(f"Checkpoint {path} does not contain a state_dict-like mapping")
     target = unwrap(model)
     own = target.state_dict()
+    validate_pretrained_layout(target, state, metadata, path, layout_policy)
+    state = _normalise_state_dict_keys(state)
     compatible = {}
     for k, v in state.items():
-        kk = k.replace("module.", "")
-        if kk in own and tuple(v.shape) == tuple(own[kk].shape):
-            compatible[kk] = v
+        if k in own and tuple(v.shape) == tuple(own[k].shape):
+            compatible[k] = v
     missing, unexpected = target.load_state_dict(compatible, strict=False)
-    rank0(rank, f"[Ckpt] loaded {len(compatible)} tensors from {path}; missing={len(missing)} unexpected={len(unexpected)}")
+    ckpt_dyn, ckpt_fe, ckpt_use_fe = infer_checkpoint_layout(state, metadata)
+    rank0(
+        rank,
+        f"[Ckpt] loaded {len(compatible)} tensors from {path}; "
+        f"policy={layout_policy} ckpt_dyn={ckpt_dyn} ckpt_fe={ckpt_fe} "
+        f"ckpt_use_fe={ckpt_use_fe} target_dyn={target.layout.dyn_vars} "
+        f"target_fe={target.layout.fe_dim} missing={len(missing)} unexpected={len(unexpected)}",
+    )
 
 
 def clone_state(model: nn.Module, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -1205,10 +1296,15 @@ def train_stage(
         if step % args.val_interval == 0 or step == total_steps:
             score, th, metrics = evaluate(args, model, val_loader, device, rank, world_size, len(val_ds))
             model.train()
+            raw_for_meta = unwrap(model)
             ckpt_meta = {
                 "run_id": args.run_id,
                 "tag": tag,
                 "step": step,
+                "layout": asdict(raw_for_meta.layout),
+                "use_fe": bool(raw_for_meta.use_fe),
+                "encoder": raw_for_meta.encoder,
+                "pooling": raw_for_meta.pooling,
                 "score": score,
                 "thresholds": th,
                 "metrics": metrics,
@@ -1319,7 +1415,7 @@ def main() -> None:
         model = build_model(args, layout, use_fe, device)
         pretrained = args.pretrained_ckpt or s1_best
         if pretrained:
-            load_compatible_checkpoint(model, pretrained, rank, device)
+            load_compatible_checkpoint(model, pretrained, rank, device, args.pretrained_layout_policy)
         l2_ref = clone_state(model, device) if pretrained else None
         set_trainable(model, "head")
         ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=True)
@@ -1337,7 +1433,7 @@ def main() -> None:
             torch.cuda.empty_cache()
             safe_barrier(world_size, device)
         if phase_a_best:
-            load_compatible_checkpoint(raw_model, phase_a_best, rank, device)
+            load_compatible_checkpoint(raw_model, phase_a_best, rank, device, args.pretrained_layout_policy)
         set_trainable(raw_model, "all")
         ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
         train_stage(

@@ -50,6 +50,18 @@ sbatch --export=ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_PRETRAINED_CKPT=/public/home/p
 sbatch --export=ALL,LOWVIS_RNN_BATCH_SIZE=384,LOWVIS_RNN_GRAD_ACCUM=3 sub_static_rnn_lowvis_main.slurm
 ```
 
+For the S1-necessity check on the month-group Tianji split, first build
+`ml_dataset_s2_tianji_12h_pm10_pm25_monthgroup_train13579_val11_test24681012`
+with `sub_s2_data_aerosol_month_group.slurm`, then submit:
+
+```bash
+sbatch --export=ALL,ABLATION_MODE=s1_pretrained,S1_RUN_ID=<s1_run_id>,LOWVIS_RNN_RUN_ID=exp_monthgroup_s1_pretrained sub_static_rnn_lowvis_s1_necessity_month_group.slurm
+sbatch --export=ALL,ABLATION_MODE=scratch,LOWVIS_RNN_RUN_ID=exp_monthgroup_scratch sub_static_rnn_lowvis_s1_necessity_month_group.slurm
+```
+
+The scratch job sets `S2_PhaseA=0` and trains all parameters in `S2_PhaseB` for
+30000 steps so its budget matches the default pretrained `8000+22000` steps.
+
 Default main architecture:
 
 - `Static MLP + GRU`
