@@ -233,11 +233,75 @@ def rank0(rank: int, text: str) -> None:
         print(text, flush=True)
 
 
+COMPACT_COMMON_CORE_INDEX = {
+    "T2M": 0,
+    "MSLP": 1,
+    "U10": 2,
+    "WSPD10": 3,
+    "V10": 4,
+    "WDIR10": 5,
+    "RH_925": 6,
+    "U_925": 7,
+    "WSPD925": 8,
+    "V_925": 9,
+    "DP_1000": 10,
+    "DP_925": 11,
+    "Q_1000": 12,
+    "Q_925": 13,
+    "DPD": 14,
+    "ZENITH": 15,
+    "PM10": 16,
+    "PM25": 17,
+}
+COMPACT_COMMON_CORE_WITH_RH_INDEX = {
+    "RH2M": 0,
+    "T2M": 1,
+    "MSLP": 2,
+    "U10": 3,
+    "WSPD10": 4,
+    "V10": 5,
+    "WDIR10": 6,
+    "RH_925": 7,
+    "U_925": 8,
+    "WSPD925": 9,
+    "V_925": 10,
+    "DP_1000": 11,
+    "DP_925": 12,
+    "Q_1000": 13,
+    "Q_925": 14,
+    "DPD": 15,
+    "ZENITH": 16,
+    "PM10": 17,
+    "PM25": 18,
+}
+PMST27_INDEX = {
+    "RH2M": 0,
+    "T2M": 1,
+    "WSPD10": 6,
+    "DPD": 22,
+    "PM10": 25,
+    "PM25": 26,
+}
+
+
+def dyn_index(dyn_vars: int, name: str) -> Optional[int]:
+    if dyn_vars == 18:
+        return COMPACT_COMMON_CORE_INDEX.get(name)
+    if dyn_vars == 19:
+        return COMPACT_COMMON_CORE_WITH_RH_INDEX.get(name)
+    if name == "PM10":
+        return 25 if dyn_vars >= 26 else None
+    if name == "PM25":
+        return 26 if dyn_vars >= 27 else None
+    idx = PMST27_INDEX.get(name)
+    return idx if idx is not None and idx < dyn_vars else None
+
+
 def resolve_dyn_and_fe_dims(total_dim: int, win_size: int) -> Tuple[int, int]:
     rest = int(total_dim) - 6
     if rest <= 0:
         raise ValueError(f"total_dim={total_dim} too small for dyn+static+veg+FE layout")
-    for dyn in (27, 26, 25, 24):
+    for dyn in (27, 26, 25, 24, 19, 18):
         fe = rest - dyn * int(win_size)
         if 20 <= fe <= 64:
             return dyn, fe
@@ -253,6 +317,10 @@ def resolve_layout_from_file(path_x: str, win_size: int) -> Layout:
 
 
 def pm_indices(dyn_vars: int) -> List[int]:
+    if dyn_vars == 18:
+        return [16, 17]
+    if dyn_vars == 19:
+        return [17, 18]
     if dyn_vars >= 27:
         return [dyn_vars - 2, dyn_vars - 1]
     if dyn_vars >= 25:
@@ -261,6 +329,10 @@ def pm_indices(dyn_vars: int) -> List[int]:
 
 
 def log1p_dyn_indices(dyn_vars: int) -> List[int]:
+    if dyn_vars == 18:
+        return pm_indices(dyn_vars)
+    if dyn_vars == 19:
+        return pm_indices(dyn_vars)
     idxs = [2, 4, 9]
     idxs.extend(pm_indices(dyn_vars))
     return sorted(set(i for i in idxs if 0 <= i < dyn_vars))
@@ -350,11 +422,16 @@ class LowVisDataset(Dataset):
         cls = int(self.y_cls[idx])
         vis = float(self.y_raw[idx])
         last = (self.layout.window_size - 1) * self.layout.dyn_vars
-        rh = float(row[last + 0]) if self.layout.dyn_vars > 0 else math.nan
-        wspd = float(row[last + 6]) if self.layout.dyn_vars > 6 else math.nan
-        dpd = float(row[last + 22]) if self.layout.dyn_vars > 22 else math.nan
-        pm10 = float(row[last + self.layout.dyn_vars - 2]) if self.layout.dyn_vars >= 27 else math.nan
-        pm25 = float(row[last + self.layout.dyn_vars - 1]) if self.layout.dyn_vars >= 27 else math.nan
+        rh_i = dyn_index(self.layout.dyn_vars, "RH2M")
+        wspd_i = dyn_index(self.layout.dyn_vars, "WSPD10")
+        dpd_i = dyn_index(self.layout.dyn_vars, "DPD")
+        pm10_i = dyn_index(self.layout.dyn_vars, "PM10")
+        pm25_i = dyn_index(self.layout.dyn_vars, "PM25")
+        rh = float(row[last + rh_i]) if rh_i is not None else math.nan
+        wspd = float(row[last + wspd_i]) if wspd_i is not None else math.nan
+        dpd = float(row[last + dpd_i]) if dpd_i is not None else math.nan
+        pm10 = float(row[last + pm10_i]) if pm10_i is not None else math.nan
+        pm25 = float(row[last + pm25_i]) if pm25_i is not None else math.nan
 
         if args.physical_hard_weight > 0 and cls == 2:
             humid_clear = (
