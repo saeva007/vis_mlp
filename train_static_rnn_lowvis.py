@@ -60,6 +60,7 @@ class Layout:
     window_size: int
     dyn_vars: int
     fe_dim: int
+    dynamic_feature_order: Optional[List[str]] = None
 
     @property
     def split_dyn(self) -> int:
@@ -293,7 +294,27 @@ PMST27_INDEX = {
 }
 
 
-def dyn_index(dyn_vars: int, name: str) -> Optional[int]:
+def normalize_feature_name(name: str) -> str:
+    raw = str(name).strip().upper().replace("-", "_").replace(" ", "_")
+    compact = raw.replace("_", "")
+    aliases = {
+        "PM10UGM3": "PM10",
+        "PM10UG_M3": "PM10",
+        "PM25UGM3": "PM25",
+        "PM25UG_M3": "PM25",
+        "PM2P5": "PM25",
+    }
+    return aliases.get(compact, raw)
+
+
+def dyn_index(layout_or_dyn, name: str) -> Optional[int]:
+    if isinstance(layout_or_dyn, Layout) and layout_or_dyn.dynamic_feature_order:
+        target = normalize_feature_name(name)
+        for i, feat in enumerate(layout_or_dyn.dynamic_feature_order):
+            if normalize_feature_name(feat) == target:
+                return i
+        return None
+    dyn_vars = layout_or_dyn.dyn_vars if isinstance(layout_or_dyn, Layout) else int(layout_or_dyn)
     if dyn_vars == 18:
         return COMPACT_COMMON_CORE_INDEX.get(name)
     if dyn_vars == 19:
@@ -317,15 +338,45 @@ def resolve_dyn_and_fe_dims(total_dim: int, win_size: int) -> Tuple[int, int]:
     raise ValueError(f"Cannot resolve feature layout: total_dim={total_dim}, window={win_size}")
 
 
-def resolve_layout_from_file(path_x: str, win_size: int) -> Layout:
+def load_dynamic_feature_order(data_dir: str) -> Tuple[Optional[int], Optional[List[str]]]:
+    cfg_path = os.path.join(data_dir, "dataset_build_config.json")
+    if not os.path.isfile(cfg_path):
+        return None, None
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None, None
+    dyn_vars = cfg.get("dyn_vars")
+    order = cfg.get("dynamic_feature_order")
+    if isinstance(order, list):
+        order = [str(v) for v in order]
+    else:
+        order = None
+    return (int(dyn_vars) if dyn_vars is not None else None), order
+
+
+def resolve_layout_from_file(path_x: str, win_size: int, data_dir: str = "") -> Layout:
     shape = np.load(path_x, mmap_mode="r").shape
     if len(shape) != 2:
         raise ValueError(f"{path_x} must be 2D, got shape={shape}")
+    cfg_dyn, order = load_dynamic_feature_order(data_dir) if data_dir else (None, None)
+    if cfg_dyn is not None:
+        rest = int(shape[1]) - 6
+        fe = rest - cfg_dyn * int(win_size)
+        if fe < 0:
+            raise ValueError(f"{path_x}: config dyn_vars={cfg_dyn} incompatible with row_dim={shape[1]}")
+        if order is not None and len(order) != cfg_dyn:
+            raise ValueError(f"{path_x}: dynamic_feature_order length {len(order)} != dyn_vars {cfg_dyn}")
+        return Layout(window_size=win_size, dyn_vars=cfg_dyn, fe_dim=fe, dynamic_feature_order=order)
     dyn, fe = resolve_dyn_and_fe_dims(int(shape[1]), win_size)
     return Layout(window_size=win_size, dyn_vars=dyn, fe_dim=fe)
 
 
-def pm_indices(dyn_vars: int) -> List[int]:
+def pm_indices(layout_or_dyn) -> List[int]:
+    if isinstance(layout_or_dyn, Layout) and layout_or_dyn.dynamic_feature_order:
+        return [i for i, name in enumerate(layout_or_dyn.dynamic_feature_order) if normalize_feature_name(name) in {"PM10", "PM25"}]
+    dyn_vars = layout_or_dyn.dyn_vars if isinstance(layout_or_dyn, Layout) else int(layout_or_dyn)
     if dyn_vars == 18:
         return [16, 17]
     if dyn_vars == 19:
@@ -337,7 +388,11 @@ def pm_indices(dyn_vars: int) -> List[int]:
     return []
 
 
-def log1p_dyn_indices(dyn_vars: int) -> List[int]:
+def log1p_dyn_indices(layout_or_dyn) -> List[int]:
+    if isinstance(layout_or_dyn, Layout) and layout_or_dyn.dynamic_feature_order:
+        log_names = {"PRECIP", "SW_RAD", "CAPE", "PM10", "PM25"}
+        return [i for i, name in enumerate(layout_or_dyn.dynamic_feature_order) if normalize_feature_name(name) in log_names]
+    dyn_vars = layout_or_dyn.dyn_vars if isinstance(layout_or_dyn, Layout) else int(layout_or_dyn)
     if dyn_vars == 18:
         return pm_indices(dyn_vars)
     if dyn_vars == 19:
@@ -360,7 +415,7 @@ def visibility_to_labels(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def build_dyn_log_mask(layout: Layout) -> np.ndarray:
     mask = np.zeros(layout.split_dyn, dtype=bool)
     for t in range(layout.window_size):
-        for idx in log1p_dyn_indices(layout.dyn_vars):
+        for idx in log1p_dyn_indices(layout):
             mask[t * layout.dyn_vars + idx] = True
     return mask
 
@@ -369,7 +424,7 @@ def apply_core_transform(core: np.ndarray, layout: Layout, use_pm: bool, log_mas
     out = core.astype(np.float32, copy=True)
     if not use_pm:
         for t in range(layout.window_size):
-            for idx in pm_indices(layout.dyn_vars):
+            for idx in pm_indices(layout):
                 out[:, t * layout.dyn_vars + idx] = 0.0
     dyn = out[:, : layout.split_dyn]
     dyn[:] = np.where(log_mask, np.log1p(np.maximum(dyn, 0.0)), dyn)
@@ -431,11 +486,11 @@ class LowVisDataset(Dataset):
         cls = int(self.y_cls[idx])
         vis = float(self.y_raw[idx])
         last = (self.layout.window_size - 1) * self.layout.dyn_vars
-        rh_i = dyn_index(self.layout.dyn_vars, "RH2M")
-        wspd_i = dyn_index(self.layout.dyn_vars, "WSPD10")
-        dpd_i = dyn_index(self.layout.dyn_vars, "DPD")
-        pm10_i = dyn_index(self.layout.dyn_vars, "PM10")
-        pm25_i = dyn_index(self.layout.dyn_vars, "PM25")
+        rh_i = dyn_index(self.layout, "RH2M")
+        wspd_i = dyn_index(self.layout, "WSPD10")
+        dpd_i = dyn_index(self.layout, "DPD")
+        pm10_i = dyn_index(self.layout, "PM10")
+        pm25_i = dyn_index(self.layout, "PM25")
         rh = float(row[last + rh_i]) if rh_i is not None else math.nan
         wspd = float(row[last + wspd_i]) if wspd_i is not None else math.nan
         dpd = float(row[last + dpd_i]) if dpd_i is not None else math.nan
@@ -554,8 +609,8 @@ def load_data(
     device: torch.device,
 ) -> Tuple[LowVisDataset, LowVisDataset, Layout, RobustScaler]:
     x_tr, y_tr, x_va, y_va = load_split_paths(data_dir, stage, rank, local_rank, world_size, args.run_id)
-    layout = resolve_layout_from_file(x_tr, args.window_size)
-    va_layout = resolve_layout_from_file(x_va, args.window_size)
+    layout = resolve_layout_from_file(x_tr, args.window_size, data_dir)
+    va_layout = resolve_layout_from_file(x_va, args.window_size, data_dir)
     if asdict(layout) != asdict(va_layout):
         raise ValueError(f"train/val layout mismatch: {layout} vs {va_layout}")
     y_raw_tr, y_cls_tr = visibility_to_labels(np.load(y_tr))
@@ -1040,6 +1095,13 @@ def validate_pretrained_layout(
     problems: List[str] = []
     if ckpt_dyn is not None and ckpt_dyn != target.layout.dyn_vars:
         problems.append(f"dyn_vars checkpoint={ckpt_dyn} target={target.layout.dyn_vars}")
+    meta_layout = (metadata or {}).get("layout") if isinstance(metadata, dict) else None
+    ckpt_order = meta_layout.get("dynamic_feature_order") if isinstance(meta_layout, dict) else None
+    if ckpt_order and target.layout.dynamic_feature_order:
+        ckpt_norm = [normalize_feature_name(v) for v in ckpt_order]
+        target_norm = [normalize_feature_name(v) for v in target.layout.dynamic_feature_order]
+        if ckpt_norm != target_norm:
+            problems.append("dynamic_feature_order differs between checkpoint and target")
     if target.use_fe:
         if ckpt_use_fe is False:
             problems.append("checkpoint has no FE encoder but target uses FE")
