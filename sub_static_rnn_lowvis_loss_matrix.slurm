@@ -116,6 +116,7 @@ export LOWVIS_RNN_EXPERIMENTS="${LOWVIS_RNN_EXPERIMENTS:-0 1 2}"
 EXPERIMENT_LIST="${LOWVIS_RNN_EXPERIMENTS//,/ }"
 EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
 export LOWVIS_RNN_RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-${LOWVIS_RNN_RUN_ID:-exp_${SLURM_JOB_ID}_static_rnn_loss_matrix}}"
+export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-${LOWVIS_RNN_RUN_PREFIX}_shared_data}"
 export LOWVIS_RNN_SLEEP_BETWEEN="${LOWVIS_RNN_SLEEP_BETWEEN:-15}"
 
 echo "Head Node       : ${head_node}"
@@ -124,6 +125,7 @@ echo "BASE_PORT       : ${BASE_PORT}"
 echo "MODE            : ${LOWVIS_RNN_MODE}"
 echo "PRETRAINED_CKPT : ${LOWVIS_RNN_PRETRAINED_CKPT}"
 echo "RUN_PREFIX      : ${LOWVIS_RNN_RUN_PREFIX}"
+echo "LOCAL_CACHE_ID  : ${LOWVIS_RNN_LOCAL_CACHE_ID}"
 echo "EXPERIMENTS     : ${EXPERIMENT_LIST}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
@@ -182,6 +184,7 @@ run_one_experiment() {
                  \"${SCRIPT_DIR}/train_static_rnn_lowvis.py\" \
                  --mode \"${LOWVIS_RNN_MODE}\" \
                  --run-id \"${run_id}\" \
+                 --local-cache-id \"${LOWVIS_RNN_LOCAL_CACHE_ID}\" \
                  ${MODEL_ARGS} \
                  --pretrained-ckpt \"${LOWVIS_RNN_PRETRAINED_CKPT}\" \
                  ${LOWVIS_RNN_EXTRA_ARGS}

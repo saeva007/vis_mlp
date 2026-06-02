@@ -12,8 +12,8 @@ This script is intentionally simpler than ``PMST_net_test_11_s2_pm10.py``:
   log-visibility auxiliary regression head.
 
 It keeps the training tricks that have been stable for this repository:
-runtime feature-layout checks, PM ablation by masking channels in the same data
-files, log1p transforms for skewed dynamic variables, RobustScaler caching,
+runtime feature-layout checks, optional PM ablation by masking PM channels when
+they are present, log1p transforms for skewed dynamic variables, RobustScaler caching,
 stratified low-visibility batch sampling, focal loss with class weights,
 validation-time threshold search, gradient clipping, warmup+cosine LR, optional
 L2-SP, and compatible Stage-1-to-Stage-2 checkpoint loading.
@@ -140,6 +140,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["s1", "s2", "both"], default="both")
     p.add_argument("--encoder", choices=["gru", "lstm"], default="gru")
     p.add_argument("--run-id", default=os.environ.get("LOWVIS_RNN_RUN_ID", f"exp_{int(time.time())}_static_rnn"))
+    p.add_argument(
+        "--local-cache-id",
+        default=os.environ.get("LOWVIS_RNN_LOCAL_CACHE_ID", ""),
+        help=(
+            "Optional stable id for /tmp data copies. Use this to let matrix "
+            "experiments share local cached npy files while keeping run-id "
+            "separate for checkpoints."
+        ),
+    )
     p.add_argument("--base-path", default=DEFAULT_BASE)
     p.add_argument("--s1-data-dir", default=DEFAULT_S1_DIR)
     p.add_argument("--s2-data-dir", default=DEFAULT_S2_DIR)
@@ -166,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bidirectional", action="store_true")
     p.add_argument("--pooling", choices=["mean", "last", "attention"], default="mean")
     p.add_argument("--no-fe", action="store_true", help="Drop the FE block at training time.")
-    p.add_argument("--no-pm", action="store_true", help="Zero PM channels while keeping data layout fixed.")
+    p.add_argument("--no-pm", action="store_true", help="Zero PM channels if the current data layout contains them.")
     p.add_argument("--aux-reg-weight", type=float, default=0.0)
     p.add_argument(
         "--loss-mode",
@@ -339,15 +348,20 @@ def resolve_dyn_and_fe_dims(total_dim: int, win_size: int) -> Tuple[int, int]:
 
 
 def load_dynamic_feature_order(data_dir: str) -> Tuple[Optional[int], Optional[List[str]]]:
-    cfg_path = os.path.join(data_dir, "dataset_build_config.json")
-    if not os.path.isfile(cfg_path):
+    cfg: Dict[str, object] = {}
+    for name in ("dataset_build_config.json", "dataset_metadata.json"):
+        cfg_path = os.path.join(data_dir, name)
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            break
+        except Exception:
+            continue
+    if not cfg:
         return None, None
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        return None, None
-    dyn_vars = cfg.get("dyn_vars")
+    dyn_vars = cfg.get("dyn_vars", cfg.get("dyn_vars_count"))
     order = cfg.get("dynamic_feature_order")
     if isinstance(order, list):
         order = [str(v) for v in order]
@@ -608,7 +622,8 @@ def load_data(
     world_size: int,
     device: torch.device,
 ) -> Tuple[LowVisDataset, LowVisDataset, Layout, RobustScaler]:
-    x_tr, y_tr, x_va, y_va = load_split_paths(data_dir, stage, rank, local_rank, world_size, args.run_id)
+    local_cache_id = args.local_cache_id.strip() or args.run_id
+    x_tr, y_tr, x_va, y_va = load_split_paths(data_dir, stage, rank, local_rank, world_size, local_cache_id)
     layout = resolve_layout_from_file(x_tr, args.window_size, data_dir)
     va_layout = resolve_layout_from_file(x_va, args.window_size, data_dir)
     if asdict(layout) != asdict(va_layout):

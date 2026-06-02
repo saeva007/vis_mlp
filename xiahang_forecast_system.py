@@ -16,14 +16,16 @@ import pickle
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Mapping, Sequence, Tuple
 import json
 import joblib
+import re
 from scipy.interpolate import griddata
 from scipy.spatial import cKDTree  # 使用KD树加速
 from scipy.spatial.distance import cdist
 
 from airport_visibility_common import (
+    DYNAMIC_FEATURE_ORDER,
     build_airport_model,
     build_inference_matrix,
     build_improved_pmst_model,
@@ -210,6 +212,257 @@ class BalancedLowVisibilityClassifier(nn.Module):
         final_logits = self.fusion_net(combined_features)
 
         return final_logits, low_vis_confidence, attention_weights
+
+
+class StaticRNNForecastLayout:
+    def __init__(
+        self,
+        window_size: int,
+        dyn_vars: int,
+        fe_dim: int,
+        dynamic_feature_order: Optional[Sequence[str]] = None,
+    ):
+        self.window_size = int(window_size)
+        self.dyn_vars = int(dyn_vars)
+        self.fe_dim = int(fe_dim)
+        self.dynamic_feature_order = list(dynamic_feature_order) if dynamic_feature_order else None
+
+    @property
+    def split_dyn(self) -> int:
+        return self.window_size * self.dyn_vars
+
+
+class StaticRNNLowVisForecastNet(nn.Module):
+    """Inference copy of train_static_rnn_lowvis.StaticRNNLowVisNet."""
+
+    def __init__(
+        self,
+        layout: StaticRNNForecastLayout,
+        encoder: str = "gru",
+        hidden_dim: int = 256,
+        static_hidden_dim: int = 96,
+        fe_hidden_dim: int = 128,
+        fusion_hidden_dim: int = 256,
+        veg_emb_dim: int = 16,
+        rnn_layers: int = 1,
+        dropout: float = 0.2,
+        bidirectional: bool = False,
+        pooling: str = "mean",
+        use_fe: bool = True,
+    ):
+        super().__init__()
+        self.layout = layout
+        self.encoder = encoder
+        self.use_fe = bool(use_fe)
+        self.pooling = pooling
+        self.bidirectional = bool(bidirectional)
+        rnn_dropout = dropout if int(rnn_layers) > 1 else 0.0
+
+        self.dynamic_proj = nn.Sequential(
+            nn.Linear(layout.dyn_vars, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        rnn_cls = nn.GRU if encoder == "gru" else nn.LSTM
+        self.rnn = rnn_cls(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=int(rnn_layers),
+            batch_first=True,
+            dropout=rnn_dropout,
+            bidirectional=bidirectional,
+        )
+        dyn_out = hidden_dim * (2 if bidirectional else 1)
+        self.dynamic_norm = nn.LayerNorm(dyn_out)
+        self.attn_pool = nn.Linear(dyn_out, 1) if pooling == "attention" else None
+
+        self.veg_embedding = nn.Embedding(32, veg_emb_dim)
+        self.static_encoder = nn.Sequential(
+            nn.Linear(5 + veg_emb_dim, static_hidden_dim),
+            nn.LayerNorm(static_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(static_hidden_dim, static_hidden_dim),
+            nn.GELU(),
+        )
+
+        if self.use_fe:
+            self.fe_encoder = nn.Sequential(
+                nn.Linear(layout.fe_dim, fe_hidden_dim),
+                nn.LayerNorm(fe_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.fe_encoder = None
+            fe_hidden_dim = 0
+
+        fusion_in = dyn_out + static_hidden_dim + fe_hidden_dim
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_in, fusion_hidden_dim),
+            nn.LayerNorm(fusion_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_hidden_dim, fusion_hidden_dim // 2),
+            nn.GELU(),
+        )
+        out_dim = fusion_hidden_dim // 2
+        self.class_head = nn.Linear(out_dim, 3)
+        self.reg_head = nn.Linear(out_dim, 1)
+
+    def _pool_dynamic(self, seq: torch.Tensor) -> torch.Tensor:
+        if self.pooling == "last":
+            return seq[:, -1, :]
+        if self.pooling == "attention":
+            w = torch.softmax(self.attn_pool(seq).squeeze(-1), dim=1)
+            return torch.sum(seq * w.unsqueeze(-1), dim=1)
+        return seq.mean(dim=1)
+
+    def forward(self, x: torch.Tensor):
+        split_dyn = self.layout.split_dyn
+        split_static = split_dyn + 5
+        dyn = x[:, :split_dyn].reshape(-1, self.layout.window_size, self.layout.dyn_vars)
+        stat = x[:, split_dyn:split_static]
+        veg = torch.clamp(x[:, split_static].long(), 0, 31)
+        extra = x[:, split_static + 1 :] if self.use_fe else None
+
+        dyn_in = self.dynamic_proj(dyn)
+        dyn_seq, _ = self.rnn(dyn_in)
+        dyn_feat = self.dynamic_norm(self._pool_dynamic(dyn_seq))
+
+        stat_feat = self.static_encoder(torch.cat([stat, self.veg_embedding(veg)], dim=1))
+        parts = [dyn_feat, stat_feat]
+        if self.fe_encoder is not None and extra is not None:
+            parts.append(self.fe_encoder(extra))
+        emb = self.fusion(torch.cat(parts, dim=1))
+        return self.class_head(emb), self.reg_head(emb).squeeze(1)
+
+
+def _normalise_state_dict_keys(state: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out = {}
+    for key, value in state.items():
+        name = str(key)
+        if name.startswith("module."):
+            name = name[len("module."):]
+        out[name] = value
+    return out
+
+
+def _infer_static_rnn_config(
+    state: Mapping[str, torch.Tensor],
+    metadata: Optional[Mapping],
+    override: Optional[Mapping] = None,
+) -> Dict[str, object]:
+    state_n = _normalise_state_dict_keys(state)
+    meta = metadata or {}
+    override = override or {}
+    layout_meta = dict(meta.get("layout", {}) if isinstance(meta.get("layout", {}), Mapping) else {})
+
+    dyn_w = state_n.get("dynamic_proj.0.weight")
+    fe_w = state_n.get("fe_encoder.0.weight")
+    static_w = state_n.get("static_encoder.0.weight")
+    fusion_w = state_n.get("fusion.0.weight")
+    veg_w = state_n.get("veg_embedding.weight")
+
+    dyn_vars = int(
+        override.get("dyn_vars")
+        or override.get("dyn_vars_count")
+        or layout_meta.get("dyn_vars")
+        or (dyn_w.shape[1] if torch.is_tensor(dyn_w) else 25)
+    )
+    fe_dim = int(
+        override.get("fe_dim")
+        or layout_meta.get("fe_dim")
+        or (fe_w.shape[1] if torch.is_tensor(fe_w) else 36)
+    )
+    dynamic_feature_order = (
+        override.get("dynamic_feature_order")
+        or layout_meta.get("dynamic_feature_order")
+    )
+    rnn_layers = int(override.get("rnn_layers") or 1)
+    layer_ids = []
+    for key in state_n:
+        match = re.match(r"rnn\.weight_ih_l(\d+)$", key)
+        if match:
+            layer_ids.append(int(match.group(1)))
+    if layer_ids:
+        rnn_layers = max(layer_ids) + 1
+
+    hidden_dim = int(override.get("hidden_dim") or (dyn_w.shape[0] if torch.is_tensor(dyn_w) else 256))
+    veg_emb_dim = int(override.get("veg_emb_dim") or (veg_w.shape[1] if torch.is_tensor(veg_w) else 16))
+    static_hidden_dim = int(
+        override.get("static_hidden_dim")
+        or (static_w.shape[0] if torch.is_tensor(static_w) else 96)
+    )
+    fe_hidden_dim = int(
+        override.get("fe_hidden_dim")
+        or (fe_w.shape[0] if torch.is_tensor(fe_w) else 128)
+    )
+    fusion_hidden_dim = int(
+        override.get("fusion_hidden_dim")
+        or (fusion_w.shape[0] if torch.is_tensor(fusion_w) else 256)
+    )
+
+    return {
+        "model_type": "static_rnn_airport",
+        "window_size": int(override.get("window_size") or layout_meta.get("window_size") or 12),
+        "dyn_vars_count": dyn_vars,
+        "dyn_vars": dyn_vars,
+        "fe_dim": fe_dim,
+        "dynamic_feature_order": list(dynamic_feature_order) if dynamic_feature_order else None,
+        "encoder": str(override.get("encoder") or meta.get("encoder") or "gru"),
+        "pooling": str(override.get("pooling") or meta.get("pooling") or "mean"),
+        "hidden_dim": hidden_dim,
+        "static_hidden_dim": static_hidden_dim,
+        "fe_hidden_dim": fe_hidden_dim,
+        "fusion_hidden_dim": fusion_hidden_dim,
+        "veg_emb_dim": veg_emb_dim,
+        "rnn_layers": rnn_layers,
+        "dropout": float(override.get("dropout", 0.2)),
+        "bidirectional": bool(override.get("bidirectional") or any("_reverse" in k for k in state_n)),
+        "use_fe": bool(override.get("use_fe", meta.get("use_fe", "fe_encoder.0.weight" in state_n))),
+        "num_classes": 3,
+    }
+
+
+def build_static_rnn_forecast_model(config: Mapping) -> StaticRNNLowVisForecastNet:
+    layout = StaticRNNForecastLayout(
+        window_size=int(config.get("window_size", 12)),
+        dyn_vars=int(config.get("dyn_vars_count", config.get("dyn_vars", 25))),
+        fe_dim=int(config.get("fe_dim", 36)),
+        dynamic_feature_order=config.get("dynamic_feature_order"),
+    )
+    return StaticRNNLowVisForecastNet(
+        layout=layout,
+        encoder=str(config.get("encoder", "gru")),
+        hidden_dim=int(config.get("hidden_dim", 256)),
+        static_hidden_dim=int(config.get("static_hidden_dim", 96)),
+        fe_hidden_dim=int(config.get("fe_hidden_dim", 128)),
+        fusion_hidden_dim=int(config.get("fusion_hidden_dim", 256)),
+        veg_emb_dim=int(config.get("veg_emb_dim", 16)),
+        rnn_layers=int(config.get("rnn_layers", 1)),
+        dropout=float(config.get("dropout", 0.2)),
+        bidirectional=bool(config.get("bidirectional", False)),
+        pooling=str(config.get("pooling", "mean")),
+        use_fe=bool(config.get("use_fe", True)),
+    )
+
+
+def predict_static_rnn_classes_from_probs(
+    probabilities: np.ndarray,
+    thresholds: Optional[Mapping[str, float]] = None,
+) -> np.ndarray:
+    probs = np.asarray(probabilities, dtype=np.float32)
+    th = thresholds or {}
+    fog_th = float(th.get("fog", th.get("fog_threshold", 0.5)))
+    mist_th = float(th.get("mist", th.get("mist_threshold", 0.5)))
+    pred = np.full(len(probs), 2, dtype=np.int64)
+    fog = (probs[:, 0] > fog_th) & (probs[:, 0] >= probs[:, 1])
+    mist = (probs[:, 1] > mist_th) & (probs[:, 1] > probs[:, 0])
+    pred[fog] = 0
+    pred[mist] = 1
+    return pred
 
 # ------------------------------
 # 工具函数
@@ -1822,28 +2075,87 @@ class VisibilityForecastSystem:
 
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model_state = checkpoint['model_state_dict']
+            elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                model_state = checkpoint['state_dict']
             else:
                 model_state = checkpoint
+            metadata = checkpoint.get('metadata', {}) if isinstance(checkpoint, dict) else {}
+            model_state_norm = _normalise_state_dict_keys(model_state) if isinstance(model_state, Mapping) else model_state
+            is_static_rnn_state = isinstance(model_state_norm, Mapping) and 'dynamic_proj.0.weight' in model_state_norm
 
             model_config = {}
             if isinstance(checkpoint, dict):
                 model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
             if not model_config and isinstance(self.preprocessors, dict):
                 model_config = self.preprocessors.get('model_config', {})
+            if not model_config and is_static_rnn_state:
+                model_config = {"model_type": "static_rnn_airport"}
             self.model_type = (
                 self.config.get('model_type')
                 or model_config.get('model_type')
+                or (metadata.get('model_type') if isinstance(metadata, dict) else None)
                 or (checkpoint.get('model_type') if isinstance(checkpoint, dict) else None)
                 or (self.preprocessors.get('model_type') if isinstance(self.preprocessors, dict) else None)
+                or ('static_rnn_airport' if is_static_rnn_state else None)
                 or 'legacy_mlp'
             )
 
-            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport'):
                 if self.preprocessors is None:
                     self.preprocessors = {}
+                metadata_path = (
+                    self.config.get('dataset_metadata_path')
+                    or self.config.get('dataset_config_path')
+                    or self.preprocessors.get('dataset_metadata_path')
+                )
+                dataset_dir = self.config.get('dataset_dir') or self.preprocessors.get('dataset_dir')
+                if not metadata_path and dataset_dir:
+                    candidate = os.path.join(dataset_dir, 'dataset_metadata.json')
+                    if os.path.exists(candidate):
+                        metadata_path = candidate
+                if metadata_path and os.path.basename(metadata_path) != 'dataset_metadata.json':
+                    candidate = os.path.join(os.path.dirname(metadata_path), 'dataset_metadata.json')
+                    if os.path.exists(candidate):
+                        metadata_path = candidate
+                if metadata_path and os.path.exists(metadata_path):
+                    with open(metadata_path, 'r', encoding='utf-8') as f:
+                        dataset_meta = json.load(f)
+                    self.preprocessors.setdefault('dataset_metadata_path', metadata_path)
+                    self.preprocessors.setdefault('station_static', dataset_meta.get('station_static', {}))
+                    self.preprocessors.setdefault('station_order', dataset_meta.get('station_order'))
+                    self.preprocessors.setdefault('fill_values', dataset_meta.get('fill_values', {}))
+                    self.preprocessors.setdefault('dynamic_feature_order', dataset_meta.get('dynamic_feature_order'))
+                    self.preprocessors.setdefault(
+                        'local_time_offset_hours',
+                        dataset_meta.get('local_time_offset_hours', self.config.get('local_time_offset_hours', 8))
+                    )
+                    if isinstance(model_config, dict):
+                        if dataset_meta.get('dyn_vars') or dataset_meta.get('dyn_vars_count'):
+                            model_config.setdefault(
+                                'dyn_vars_count',
+                                int(dataset_meta.get('dyn_vars', dataset_meta.get('dyn_vars_count')))
+                            )
+                            model_config.setdefault('dyn_vars', int(model_config['dyn_vars_count']))
+                        if dataset_meta.get('dynamic_feature_order'):
+                            model_config.setdefault('dynamic_feature_order', dataset_meta.get('dynamic_feature_order'))
+                        if dataset_meta.get('fe_dim') or dataset_meta.get('extra_feature_dim'):
+                            model_config.setdefault('fe_dim', int(dataset_meta.get('fe_dim', dataset_meta.get('extra_feature_dim'))))
+                scaler_path = self.config.get('scaler_path') or self.preprocessors.get('scaler_path')
+                if scaler_path and 'scaler' not in self.preprocessors:
+                    self.preprocessors['scaler'] = joblib.load(scaler_path)
+                    self.preprocessors['scaler_path'] = scaler_path
+                if self.model_type == 'static_rnn_airport':
+                    if 'scaler' not in self.preprocessors:
+                        raise FileNotFoundError("Static-RNN机场模型部署必须在配置中提供 scaler_path。")
+                    if not self.preprocessors.get('station_static'):
+                        raise FileNotFoundError(
+                            "Static-RNN机场模型部署必须提供 dataset_metadata_path，"
+                            "其中包含 station_static、fill_values 和 dynamic_feature_order。"
+                        )
                 self.airport_thresholds = (
                     self.config.get('thresholds')
                     or (checkpoint.get('thresholds') if isinstance(checkpoint, dict) else None)
+                    or (metadata.get('thresholds') if isinstance(metadata, dict) else None)
                     or self.preprocessors.get('thresholds')
                     or {'fog': 0.5, 'mist': 0.5}
                 )
@@ -1875,18 +2187,31 @@ class VisibilityForecastSystem:
                     }
                 if 'fill_values' not in self.preprocessors:
                     self.preprocessors['fill_values'] = checkpoint.get('fill_values', {}) if isinstance(checkpoint, dict) else {}
-                if 'model_config' not in self.preprocessors:
+                if self.model_type == 'static_rnn_airport':
+                    model_config = _infer_static_rnn_config(model_state_norm, metadata, model_config)
+                    if self.preprocessors.get('dynamic_feature_order') and not model_config.get('dynamic_feature_order'):
+                        model_config['dynamic_feature_order'] = self.preprocessors.get('dynamic_feature_order')
                     self.preprocessors['model_config'] = model_config
-
-                if self.model_type == 'improved_dual_stream_pmst':
-                    self.model = build_improved_pmst_model(model_config).to(self.device)
+                    self.model = build_static_rnn_forecast_model(model_config).to(self.device)
+                    self.model.load_state_dict(model_state_norm)
+                    logger.info(
+                        f"Static-RNN机场模型加载成功，dyn={model_config.get('dyn_vars_count')}, "
+                        f"fe={model_config.get('fe_dim')}, thresholds={self.airport_thresholds}, "
+                        f"T={self.airport_temperature:.3f}"
+                    )
                 else:
-                    self.model = build_airport_model(model_config).to(self.device)
-                self.model.load_state_dict(model_state)
-                logger.info(
-                    f"机场PMST模型加载成功，type={self.model_type}, thresholds={self.airport_thresholds}, "
-                    f"T={self.airport_temperature:.3f}"
-                )
+                    if 'model_config' not in self.preprocessors:
+                        self.preprocessors['model_config'] = model_config
+
+                    if self.model_type == 'improved_dual_stream_pmst':
+                        self.model = build_improved_pmst_model(model_config).to(self.device)
+                    else:
+                        self.model = build_airport_model(model_config).to(self.device)
+                    self.model.load_state_dict(model_state_norm)
+                    logger.info(
+                        f"机场PMST模型加载成功，type={self.model_type}, thresholds={self.airport_thresholds}, "
+                        f"T={self.airport_temperature:.3f}"
+                    )
             else:
                 if self.preprocessors is None:
                     raise FileNotFoundError(f"旧模型需要预处理器文件: {preprocessor_path}")
@@ -1903,7 +2228,7 @@ class VisibilityForecastSystem:
             # 初始化数据处理器
             vegetation_data = None
             if (
-                self.model_type != 'airport_pmst'
+                self.model_type not in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport')
                 and self.config.get('vegetation_file')
                 and os.path.exists(self.config['vegetation_file'])
             ):
@@ -1952,12 +2277,17 @@ class VisibilityForecastSystem:
     def preprocess_data(self, features_ds):
         """预处理数据 - 修复维度处理"""
         try:
-            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport'):
                 station_names = self.get_airport_station_names(features_ds.coords)
                 scaler = self.preprocessors.get('scaler')
                 fill_values = self.preprocessors.get('fill_values', {})
                 model_config = self.preprocessors.get('model_config', {})
                 window_size = int(model_config.get('window_size', 12))
+                feature_order = (
+                    model_config.get('dynamic_feature_order')
+                    or self.preprocessors.get('dynamic_feature_order')
+                    or DYNAMIC_FEATURE_ORDER
+                )
                 local_time_offset_hours = float(
                     self.preprocessors.get(
                         'local_time_offset_hours',
@@ -1970,7 +2300,7 @@ class VisibilityForecastSystem:
                         self.config.get('use_source_zenith', False)
                     )
                 )
-                if self.model_type == 'improved_dual_stream_pmst':
+                if self.model_type in ('improved_dual_stream_pmst', 'static_rnn_airport'):
                     X_scaled, out_coords, unknown = build_pmst_inference_matrix(
                         features_ds,
                         station_names=station_names,
@@ -1980,6 +2310,7 @@ class VisibilityForecastSystem:
                         window_size=window_size,
                         local_time_offset_hours=local_time_offset_hours,
                         use_source_zenith=True,
+                        feature_order=feature_order,
                     )
                 else:
                     station_to_idx = self.preprocessors.get('station_to_idx', {})
@@ -1992,6 +2323,7 @@ class VisibilityForecastSystem:
                         window_size=window_size,
                         local_time_offset_hours=local_time_offset_hours,
                         use_source_zenith=use_source_zenith,
+                        feature_order=feature_order,
                     )
                 if unknown:
                     logger.warning(f"存在未见过的机场站点，将使用默认静态/站点特征: {unknown[:10]}")
@@ -2125,6 +2457,8 @@ class VisibilityForecastSystem:
 
     def predict_airport_classes(self, probabilities, coords):
         if not self.airport_season_thresholds:
+            if self.model_type == 'static_rnn_airport':
+                return predict_static_rnn_classes_from_probs(probabilities, self.airport_thresholds)
             return predict_classes_from_probs(probabilities, self.airport_thresholds)
 
         time_values = pd.DatetimeIndex(pd.to_datetime(coords['time']))
@@ -2148,14 +2482,17 @@ class VisibilityForecastSystem:
                 'mist': float(rec.get('mist_th', self.airport_thresholds.get('mist', 0.5))),
             }
             sl = slice(i * station_dim, (i + 1) * station_dim)
-            predictions[sl] = predict_classes_from_probs(probabilities[sl], thresholds)
+            if self.model_type == 'static_rnn_airport':
+                predictions[sl] = predict_static_rnn_classes_from_probs(probabilities[sl], thresholds)
+            else:
+                predictions[sl] = predict_classes_from_probs(probabilities[sl], thresholds)
         return predictions
 
     def predict(self, X_scaled, coords):
         """进行预测"""
         try:
             with torch.no_grad():
-                if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
+                if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport'):
                     batch_size = int(self.config.get('batch_size', 4096))
                     probs_list = []
                     temp = max(float(self.airport_temperature), 1e-6)
@@ -2165,7 +2502,10 @@ class VisibilityForecastSystem:
                             dtype=torch.float32,
                             device=self.device
                         )
-                        logits, _reg_pred, _low_vis = self.model(batch)
+                        if self.model_type == 'static_rnn_airport':
+                            logits, _reg_pred = self.model(batch)
+                        else:
+                            logits, _reg_pred, _low_vis = self.model(batch)
                         probs = F.softmax(logits / temp, dim=1)
                         probs_list.append(probs.cpu().numpy())
                     probabilities = np.concatenate(probs_list, axis=0)
@@ -2201,7 +2541,7 @@ class VisibilityForecastSystem:
     def save_forecast_results(self, predictions, probabilities, coords, timestamp):
         """保存预测结果 - 修复版本"""
         try:
-            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst'):
+            if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport'):
                 time_dim = len(coords['time'])
                 station_names = [str(v) for v in coords['station_name']]
                 station_dim = len(station_names)
@@ -2612,9 +2952,10 @@ def create_default_config():
     """创建默认配置文件"""
     config = {
         "data_root_dir": "/public/home/chenxi/PuTS/tianji",
-        "model_type": "improved_dual_stream_pmst",
-        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_full_from_scratch_Airport_Full_best_score.pt",
-        "preprocessor_path": "/public/home/putianshu/vis_mlp/checkpoints/airport_metar_2025_full_from_scratch_airport_preprocessor.pkl",
+        "model_type": "static_rnn_airport",
+        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/<airport_run_id>_S1_best_score.pt",
+        "scaler_path": "/public/home/putianshu/vis_mlp/checkpoints/robust_scaler_<airport_run_id>_s1_w12_dyn25_pm.pkl",
+        "dataset_metadata_path": "/public/home/putianshu/vis_mlp/ml_dataset_static_rnn_airport_metar_2025_12h/dataset_metadata.json",
         "vegetation_file": "/public/home/chenxi/PuTS/tianji/data_vegtype.nc",
         "grid_data_base_dir": "/sharedata/dataset/GroupData/GD001-EC_Forcasting",
         "output_dir": "/public/home/chenxi/PuTS/tianji/forecasts",

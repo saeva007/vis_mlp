@@ -503,11 +503,12 @@ def transform_airport_rows(
     scaler,
     window_size: int,
     dyn_vars_count: int,
+    log_indices: Optional[Sequence[int]] = None,
     clip_value: float = 10.0,
 ) -> np.ndarray:
     raw_rows = np.asarray(raw_rows, dtype=np.float32)
     split_dyn = int(window_size) * int(dyn_vars_count)
-    cont = raw_rows_to_continuous_matrix(raw_rows, window_size, dyn_vars_count)
+    cont = raw_rows_to_continuous_matrix(raw_rows, window_size, dyn_vars_count, log_indices)
     if scaler is not None:
         cont = (cont - scaler.center_) / (scaler.scale_ + 1e-6)
     cont = np.clip(cont, -clip_value, clip_value)
@@ -523,13 +524,15 @@ def transform_pmst_rows(
     scaler,
     window_size: int,
     dyn_vars_count: int,
+    log_indices: Optional[Sequence[int]] = None,
     clip_value: float = 10.0,
 ) -> np.ndarray:
     """Transform original PMST layout: dyn window + 5 static + veg + FE."""
     raw_rows = np.asarray(raw_rows, dtype=np.float32)
     split_dyn = int(window_size) * int(dyn_vars_count)
     continuous = raw_rows[:, : split_dyn + 5].astype(np.float32, copy=True)
-    log_indices = get_dynamic_log_indices()
+    if log_indices is None:
+        log_indices = get_dynamic_log_indices()
     if log_indices:
         mask = np.zeros(split_dyn, dtype=bool)
         for t in range(int(window_size)):
@@ -558,9 +561,11 @@ def build_inference_matrix(
     window_size: int = WINDOW_SIZE,
     local_time_offset_hours: float = LOCAL_TIME_OFFSET_HOURS,
     use_source_zenith: bool = False,
+    feature_order: Sequence[str] = DYNAMIC_FEATURE_ORDER,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
     cube, times, source_stations = extract_dynamic_cube(
         source,
+        feature_order=feature_order,
         fill_values=fill_values,
         local_time_offset_hours=local_time_offset_hours,
         use_source_zenith=use_source_zenith,
@@ -589,7 +594,7 @@ def build_inference_matrix(
         idxs = np.clip(idxs, 0, nt - 1)
         wins = cube[idxs, :, :].transpose(1, 0, 2).astype(np.float32)
         dyn_flat = wins.reshape(ns, split_dyn)
-        fog_features = compute_fog_features(wins)
+        fog_features = compute_fog_features(wins, feature_order)
         cyc = time_cyclical_features([times[t]], ns, local_time_offset_hours)
         extra = np.concatenate([fog_features, cyc], axis=1)
         write1 = write0 + ns
@@ -598,7 +603,13 @@ def build_inference_matrix(
         raw_rows[write0:write1, split_dyn + 1 :] = extra
         write0 = write1
 
-    x = transform_airport_rows(raw_rows, scaler, window_size, dyn_vars)
+    x = transform_airport_rows(
+        raw_rows,
+        scaler,
+        window_size,
+        dyn_vars,
+        log_indices=get_dynamic_log_indices(feature_order),
+    )
     coords = {
         "time": np.asarray(times),
         "station_name": np.asarray(station_names, dtype=object),
@@ -615,9 +626,11 @@ def build_pmst_inference_matrix(
     window_size: int = WINDOW_SIZE,
     local_time_offset_hours: float = LOCAL_TIME_OFFSET_HOURS,
     use_source_zenith: bool = True,
+    feature_order: Sequence[str] = DYNAMIC_FEATURE_ORDER,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
     cube, times, source_stations = extract_dynamic_cube(
         source,
+        feature_order=feature_order,
         fill_values=fill_values,
         local_time_offset_hours=local_time_offset_hours,
         use_source_zenith=use_source_zenith,
@@ -648,7 +661,7 @@ def build_pmst_inference_matrix(
         idxs = np.clip(idxs, 0, nt - 1)
         wins = cube[idxs, :, :].transpose(1, 0, 2).astype(np.float32)
         dyn_flat = wins.reshape(ns, split_dyn)
-        fog_features = compute_fog_features(wins)
+        fog_features = compute_fog_features(wins, feature_order)
         cyc = time_cyclical_features([times[t]], ns, local_time_offset_hours)
         extra = np.concatenate([fog_features, cyc], axis=1)
         write1 = write0 + ns
@@ -658,7 +671,13 @@ def build_pmst_inference_matrix(
         raw_rows[write0:write1, split_dyn + 6 :] = extra
         write0 = write1
 
-    x = transform_pmst_rows(raw_rows, scaler, window_size, dyn_vars)
+    x = transform_pmst_rows(
+        raw_rows,
+        scaler,
+        window_size,
+        dyn_vars,
+        log_indices=get_dynamic_log_indices(feature_order),
+    )
     coords = {
         "time": np.asarray(times),
         "station_name": np.asarray(station_names, dtype=object),

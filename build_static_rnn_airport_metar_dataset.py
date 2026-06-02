@@ -9,10 +9,10 @@ same airport source data but emits the standard repository layout:
     X_train.npy, y_train.npy, meta_train.csv
     X_val.npy, y_val.npy, meta_val.csv
 
-By default two zero-valued PM placeholder channels are appended after the
-airport dynamic features.  This keeps the dynamic layout compatible with the
-current 27-channel Static-RNN training assumptions without introducing any
-non-airport data.
+The airport link has no PM10/PM2.5 inputs, so the default output keeps the
+true airport dynamic feature count.  A legacy flag can still append zero PM
+slots, but the recommended Static-RNN path should train with the real input
+dimension recorded in ``dataset_build_config.json``.
 """
 
 from __future__ import annotations
@@ -386,8 +386,38 @@ def write_dataset(args: argparse.Namespace) -> None:
         longitudes,
     )
 
+    dataset_config = {
+        "dataset_type": "static_rnn_airport_metar_visibility",
+        "feature_set": "airport_metar_true_dynamic_dim",
+        "window_size": int(args.window_size),
+        "step_size": int(args.step_size),
+        "dyn_vars": int(dyn_vars),
+        "dyn_vars_count": int(dyn_vars),
+        "dynamic_feature_order": dynamic_feature_order,
+        "base_airport_dynamic_feature_order": list(DYNAMIC_FEATURE_ORDER),
+        "zero_pm_slots": bool(args.append_zero_pm_slots),
+        "fe_dim": int(EXTRA_FEATURE_DIM),
+        "extra_feature_dim": int(EXTRA_FEATURE_DIM),
+        "static_continuous_dim": int(static_dim),
+        "vegetation_index_dim": 1,
+        "total_dim": int(total_dim),
+        "layout": {
+            "X": "dyn_window_flat, static_continuous_5, vegetation_index, engineered_features",
+            "dyn_window_flat_dim": int(split_dyn),
+            "static_continuous_dim": int(static_dim),
+            "vegetation_index_dim": 1,
+            "engineered_feature_dim": int(EXTRA_FEATURE_DIM),
+            "total_dim": int(total_dim),
+        },
+    }
+
+    config_path = os.path.join(args.output_dir, "dataset_build_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(dataset_config, f, indent=2, ensure_ascii=False)
+
     metadata_path = os.path.join(args.output_dir, "dataset_metadata.json")
     metadata = {
+        **dataset_config,
         "dataset_type": "static_rnn_airport_metar_visibility",
         "created_at": datetime.utcnow().isoformat() + "Z",
         "source_notebook": "xiahang_train_data_prepare.ipynb",
@@ -401,23 +431,8 @@ def write_dataset(args: argparse.Namespace) -> None:
         "weather_time_shift_hours": float(args.weather_time_shift_hours),
         "visibility_time_shift_hours": float(args.visibility_time_shift_hours),
         "output_dir": args.output_dir,
-        "window_size": int(args.window_size),
-        "step_size": int(args.step_size),
         "local_time_offset_hours": float(args.local_time_offset_hours),
         "max_visibility_m": float(args.max_visibility_m),
-        "dynamic_feature_order": dynamic_feature_order,
-        "base_airport_dynamic_feature_order": list(DYNAMIC_FEATURE_ORDER),
-        "zero_pm_slots": bool(args.append_zero_pm_slots),
-        "dyn_vars_count": int(dyn_vars),
-        "extra_feature_dim": int(EXTRA_FEATURE_DIM),
-        "layout": {
-            "X": "dyn_window_flat, static_continuous_5, vegetation_index, engineered_features",
-            "dyn_window_flat_dim": int(split_dyn),
-            "static_continuous_dim": int(static_dim),
-            "vegetation_index_dim": 1,
-            "engineered_feature_dim": int(EXTRA_FEATURE_DIM),
-            "total_dim": int(total_dim),
-        },
         "fill_values": fill_values,
         "station_order": [str(s) for s in stations],
         "station_static": {
@@ -444,7 +459,7 @@ def write_dataset(args: argparse.Namespace) -> None:
             "script": "train_static_rnn_lowvis.py",
             "recommended_mode": "s1",
             "recommended_arg": f"--s1-data-dir {args.output_dir}",
-            "note": "Use --no-pm because PM slots are zero placeholders for layout compatibility.",
+            "note": "Do not pass --no-pm for the recommended true-dimension airport dataset.",
         },
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -478,12 +493,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-ratio", type=float, default=0.0)
     parser.add_argument("--gap-hours", type=float, default=24.0)
     parser.add_argument(
+        "--append-zero-pm-slots",
+        action="store_true",
+        dest="append_zero_pm_slots",
+        help="Legacy compatibility only: append zero PM10/PM2.5 channels.",
+    )
+    parser.add_argument(
         "--no-zero-pm-slots",
         action="store_false",
         dest="append_zero_pm_slots",
-        help="Do not append zero PM10/PM2.5 compatibility channels.",
+        help=argparse.SUPPRESS,
     )
-    parser.set_defaults(append_zero_pm_slots=True)
+    parser.set_defaults(append_zero_pm_slots=False)
     return parser.parse_args()
 
 

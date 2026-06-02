@@ -143,7 +143,6 @@ srun --nodes=${SLURM_NNODES} \
              --fusion-hidden-dim 256 \
              --dropout 0.2 \
              --selection-metric recall_csi \
-             --no-pm \
              ${LOWVIS_RNN_EXTRA_ARGS}
      "
 
