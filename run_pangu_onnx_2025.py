@@ -32,6 +32,22 @@ from onnx2torch import convert
 UPPER_VARS = ("z", "q", "t", "u", "v")
 SURFACE_VARS = ("msl", "u10", "v10", "t2m")
 PRESSURE_LEVELS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50)
+ERA5_ROOT_DEFAULT = "/sharedata/dataset/realtime/SD005-ERA5/0p25"
+
+ERA5_PRESSURE_CONFIG = {
+    "z": ("geopotential", ("z", "geopotential")),
+    "q": ("specific_humidity", ("q", "specific_humidity")),
+    "t": ("temperature", ("t", "temperature")),
+    "u": ("u_component_of_wind", ("u", "u_component_of_wind")),
+    "v": ("v_component_of_wind", ("v", "v_component_of_wind")),
+}
+
+ERA5_SURFACE_CONFIG = {
+    "msl": ("mean_sea_level_pressure", ("msl", "mean_sea_level_pressure")),
+    "u10": ("10m_u_component_of_wind", ("u10", "10u", "10m_u_component_of_wind")),
+    "v10": ("10m_v_component_of_wind", ("v10", "10v", "10m_v_component_of_wind")),
+    "t2m": ("2m_temperature", ("t2m", "2t", "2m_temperature")),
+}
 
 OUTPUT_ORDER = (
     "T2M",
@@ -67,6 +83,11 @@ class GribPair:
     init_time: Optional[pd.Timestamp] = None
 
 
+@dataclass(frozen=True)
+class Era5Init:
+    init_time: pd.Timestamp
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -87,6 +108,23 @@ def parse_steps(value: str) -> List[int]:
         if step not in out:
             out.append(step)
     return sorted(out or [1])
+
+
+def parse_init_hours(value: str) -> List[int]:
+    raw_value = str(value or "").strip().lower()
+    if raw_value in {"all", "*"}:
+        return list(range(24))
+    hours: List[int] = []
+    for raw in raw_value.replace(";", ",").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        hour = int(raw)
+        if hour < 0 or hour > 23:
+            raise ValueError("--init-hours values must be between 0 and 23, or 'all'.")
+        if hour not in hours:
+            hours.append(hour)
+    return sorted(hours or [0])
 
 
 def infer_coord_name(ds: xr.Dataset, candidates: Sequence[str]) -> str:
@@ -230,6 +268,157 @@ def read_initial_state(
         ds_surface.close()
 
 
+def date_span(start: date, end: date):
+    current = start
+    while current <= end:
+        yield current
+        current = current + timedelta(days=1)
+
+
+def build_era5_init_times(args: argparse.Namespace, save_steps: Sequence[int]) -> List[Era5Init]:
+    valid_start = pd.Timestamp(parse_date(args.start_date))
+    valid_end = pd.Timestamp(datetime.combine(parse_date(args.end_date), datetime.max.time()))
+    lead_base = int(args.lead_hours)
+    init_start_day = (valid_start - pd.Timedelta(hours=lead_base * max(save_steps))).date()
+    init_end_day = (valid_end - pd.Timedelta(hours=lead_base * min(save_steps))).date()
+    init_hours = parse_init_hours(args.init_hours)
+
+    items: List[Era5Init] = []
+    for day in date_span(init_start_day, init_end_day):
+        for hour in init_hours:
+            init_time = pd.Timestamp(datetime(day.year, day.month, day.day, hour))
+            possible_valids = [init_time + pd.Timedelta(hours=lead_base * step) for step in save_steps]
+            if any(valid_start <= vt <= valid_end for vt in possible_valids):
+                items.append(Era5Init(init_time=init_time))
+    return items
+
+
+def era5_file_path(root: str, dataset_type: str, folder: str, init_time: pd.Timestamp) -> str:
+    ts = pd.Timestamp(init_time)
+    date_str = ts.strftime("%Y%m%d")
+    return os.path.join(
+        str(root),
+        dataset_type,
+        folder,
+        ts.strftime("%Y"),
+        ts.strftime("%m"),
+        f"era5_hourly_{folder}_{date_str}_global.grib",
+    )
+
+
+def select_var_name(ds: xr.Dataset, candidates: Sequence[str]) -> str:
+    for name in candidates:
+        if name in ds.data_vars:
+            return name
+    lower = {str(name).lower(): str(name) for name in ds.data_vars}
+    for name in candidates:
+        if name.lower() in lower:
+            return lower[name.lower()]
+    if len(ds.data_vars) == 1:
+        return str(next(iter(ds.data_vars)))
+    raise KeyError(f"Cannot find any variable from {candidates}; available={list(ds.data_vars)}")
+
+
+def select_init_time(ds: xr.Dataset, init_time: pd.Timestamp) -> xr.Dataset:
+    if "time" not in ds.coords and "time" not in ds.dims:
+        return ds
+    target = np.datetime64(pd.Timestamp(init_time).to_datetime64())
+    try:
+        return ds.sel(time=target)
+    except Exception as exc:
+        available = pd.DatetimeIndex(pd.to_datetime(np.asarray(ds["time"].values).reshape(-1)))
+        preview = ", ".join(str(v) for v in available[:4])
+        raise KeyError(f"Init time {init_time} not found in ERA5 file; first available times: {preview}") from exc
+
+
+def read_era5_var(
+    root: str,
+    dataset_type: str,
+    folder: str,
+    candidates: Sequence[str],
+    init_time: pd.Timestamp,
+    cfgrib_indexpath: str,
+    levels: Optional[Sequence[int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    path = era5_file_path(root, dataset_type, folder, init_time)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    ds = open_grib(path, cfgrib_indexpath)
+    try:
+        var_name = select_var_name(ds, candidates)
+        lat_name = infer_coord_name(ds, ("latitude", "lat"))
+        lon_name = infer_coord_name(ds, ("longitude", "lon"))
+        ds = maybe_sort_lat(ds, lat_name)
+        ds = select_init_time(ds, init_time)
+        da = ds[var_name]
+        if levels is not None:
+            lev_name = infer_coord_name(da, ("isobaricInhPa", "level", "plev"))
+            da = da.sel({lev_name: list(levels)})
+            da = da.transpose(lev_name, lat_name, lon_name)
+        else:
+            da = da.transpose(lat_name, lon_name)
+        lat = np.asarray(da[lat_name].values, dtype=np.float64)
+        lon = np.asarray(da[lon_name].values, dtype=np.float64)
+        values = np.asarray(da.values, dtype=np.float32)
+        return values, lat, lon
+    finally:
+        ds.close()
+
+
+def read_era5_initial_state(
+    item: Era5Init,
+    args: argparse.Namespace,
+    levels: Sequence[int],
+) -> Tuple[pd.Timestamp, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]:
+    init_time = pd.Timestamp(item.init_time)
+    root = str(args.era5_root)
+
+    upper_parts: List[np.ndarray] = []
+    ref_lat: Optional[np.ndarray] = None
+    ref_lon: Optional[np.ndarray] = None
+    for var_name in UPPER_VARS:
+        folder, candidates = ERA5_PRESSURE_CONFIG[var_name]
+        values, lat, lon = read_era5_var(
+            root,
+            "pressure-hourly",
+            folder,
+            candidates,
+            init_time,
+            args.cfgrib_indexpath,
+            levels=levels,
+        )
+        if ref_lat is None:
+            ref_lat, ref_lon = lat, lon
+        elif len(lat) != len(ref_lat) or len(lon) != len(ref_lon) or not np.allclose(lat, ref_lat) or not np.allclose(lon, ref_lon):
+            raise ValueError(f"Grid mismatch for ERA5 pressure variable {var_name}.")
+        upper_parts.append(values)
+
+    surface_parts: List[np.ndarray] = []
+    for var_name in SURFACE_VARS:
+        folder, candidates = ERA5_SURFACE_CONFIG[var_name]
+        values, lat, lon = read_era5_var(
+            root,
+            "single-hourly",
+            folder,
+            candidates,
+            init_time,
+            args.cfgrib_indexpath,
+            levels=None,
+        )
+        if ref_lat is None or ref_lon is None:
+            ref_lat, ref_lon = lat, lon
+        elif len(lat) != len(ref_lat) or len(lon) != len(ref_lon) or not np.allclose(lat, ref_lat) or not np.allclose(lon, ref_lon):
+            raise ValueError(f"Grid mismatch for ERA5 surface variable {var_name}.")
+        surface_parts.append(values)
+
+    if ref_lat is None or ref_lon is None:
+        raise RuntimeError("No ERA5 variables were loaded.")
+    validate_global_grid(ref_lat, ref_lon, not args.no_require_global_grid)
+    upper_np = np.stack(upper_parts, axis=0).astype(np.float32, copy=False)
+    surface_np = np.stack(surface_parts, axis=0).astype(np.float32, copy=False)
+    return init_time, torch.from_numpy(upper_np), torch.from_numpy(surface_np), ref_lat, ref_lon
+
+
 def calc_rh_from_q(temperature_k, specific_humidity, pressure_hpa):
     temp_c = temperature_k - 273.15
     es = 6.112 * np.exp((17.67 * temp_c) / np.clip(temp_c + 243.5, 1.0e-6, None))
@@ -270,6 +459,14 @@ def crop_indices(lat: np.ndarray, lon: np.ndarray, args: argparse.Namespace) -> 
     return lat_idx, lon_idx
 
 
+def contiguous_slice(indices: np.ndarray, name: str) -> slice:
+    if len(indices) == 0:
+        raise ValueError(f"Empty {name} crop indices.")
+    if len(indices) > 1 and not np.all(np.diff(indices) == 1):
+        raise ValueError(f"{name} crop is not contiguous; adjust crop bounds or handle wrap-around explicitly.")
+    return slice(int(indices[0]), int(indices[-1]) + 1)
+
+
 def as_dataarray(values: np.ndarray, time_value: pd.Timestamp, lat: np.ndarray, lon: np.ndarray) -> xr.DataArray:
     return xr.DataArray(
         values[np.newaxis, :, :].astype(np.float32, copy=False),
@@ -290,13 +487,20 @@ def build_output_dataset(
     lead_hours: int,
     lat: np.ndarray,
     lon: np.ndarray,
-    lat_idx: np.ndarray,
-    lon_idx: np.ndarray,
+    lat_idx: Optional[np.ndarray],
+    lon_idx: Optional[np.ndarray],
+    already_cropped: bool = False,
 ) -> xr.Dataset:
-    pressure = pressure[:, :, lat_idx, :][:, :, :, lon_idx]
-    surface = surface[:, lat_idx, :][:, :, lon_idx]
-    out_lat = lat[lat_idx]
-    out_lon = lon[lon_idx]
+    if already_cropped:
+        out_lat = lat
+        out_lon = lon
+    else:
+        if lat_idx is None or lon_idx is None:
+            raise ValueError("lat_idx/lon_idx are required when pressure and surface are not pre-cropped.")
+        pressure = pressure[:, :, lat_idx, :][:, :, :, lon_idx]
+        surface = surface[:, lat_idx, :][:, :, lon_idx]
+        out_lat = lat[lat_idx]
+        out_lon = lon[lon_idx]
 
     fields: Dict[str, np.ndarray] = {}
     fields["MSLP"] = surface[0]
@@ -357,11 +561,12 @@ def flush_output_group(
     lead_hours: int,
     compress_level: int,
     overwrite: bool,
+    output_label_suffix: str = "",
 ) -> str:
     if not parts:
         return ""
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_file = output_dir / f"pangu_china_{label}_lead{int(lead_hours):03d}h.nc"
+    out_file = output_dir / f"pangu_china_{label}{output_label_suffix}_lead{int(lead_hours):03d}h.nc"
     tmp_file = output_dir / f"{out_file.stem}.tmp.nc"
     if out_file.exists() and not overwrite:
         log(f"[SKIP] {out_file} exists; pass --overwrite to replace.")
@@ -389,6 +594,22 @@ def parse_args() -> argparse.Namespace:
         description="Run Pangu-Weather 24 h ONNX and export China-region canonical NetCDF files."
     )
     parser.add_argument("--model-path", required=True, help="Path to pangu_weather_24.onnx.")
+    parser.add_argument(
+        "--input-mode",
+        choices=["era5-dirs", "pair"],
+        default="era5-dirs",
+        help="era5-dirs reads the SD005-ERA5 variable-folder layout; pair reads pre-merged upper/surface GRIBs.",
+    )
+    parser.add_argument(
+        "--era5-root",
+        default=ERA5_ROOT_DEFAULT,
+        help="Root of SD005-ERA5 0p25 data, containing single-hourly and pressure-hourly.",
+    )
+    parser.add_argument(
+        "--init-hours",
+        default="0",
+        help="Comma-separated initialization hours in UTC for era5-dirs mode, e.g. 0,12 or all.",
+    )
     parser.add_argument("--upper-dir", default="", help="Directory containing pressure-level GRIB files.")
     parser.add_argument("--surface-dir", default="", help="Directory containing surface GRIB files.")
     parser.add_argument("--upper-glob", default="*.grib*", help="Glob under --upper-dir.")
@@ -406,7 +627,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lat-max", type=float, default=54.0)
     parser.add_argument("--lon-min", type=float, default=73.0)
     parser.add_argument("--lon-max", type=float, default=135.0)
-    parser.add_argument("--output-dir", default="/public/home/putianshu/vis_mlp/pangu_2025_china_monthly")
+    parser.add_argument("--output-dir", default="/data2/share/chenxi/PuTS/mlp/pangu_2025_china_monthly")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N.")
     parser.add_argument(
         "--cfgrib-indexpath",
@@ -414,7 +635,10 @@ def parse_args() -> argparse.Namespace:
         help="cfgrib indexpath. Empty disables sidecar .idx writes; use AUTO to let cfgrib choose.",
     )
     parser.add_argument("--compress-level", type=int, default=1, choices=range(0, 10))
-    parser.add_argument("--smoke-count", type=int, default=0, help="Process only N GRIB pairs for testing.")
+    parser.add_argument("--smoke-count", type=int, default=0, help="Process only N initial states for testing.")
+    parser.add_argument("--manifest-name", default="pangu_onnx_manifest.json", help="Manifest JSON filename under --output-dir.")
+    parser.add_argument("--output-label-suffix", default="", help="Suffix inserted after YYYYMM in output NetCDF filenames.")
+    parser.add_argument("--skip-missing-init", action="store_true", help="Skip missing ERA5 initial states instead of failing.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-require-global-grid", action="store_true")
     return parser.parse_args()
@@ -429,11 +653,14 @@ def main() -> None:
     if end < start:
         raise ValueError("--end-date must be on or after --start-date.")
 
-    pairs = build_pairs(args)
+    if args.input_mode == "era5-dirs":
+        input_items = build_era5_init_times(args, save_steps)
+    else:
+        input_items = build_pairs(args)
     if args.smoke_count > 0:
-        pairs = pairs[: int(args.smoke_count)]
-    if not pairs:
-        raise RuntimeError("No GRIB pairs to process.")
+        input_items = input_items[: int(args.smoke_count)]
+    if not input_items:
+        raise RuntimeError("No initial states to process.")
 
     device = args.device
     if device == "auto":
@@ -448,18 +675,30 @@ def main() -> None:
     processed = 0
     skipped = 0
     lat_idx = lon_idx = None
+    lat_slice = lon_slice = None
+    out_lat = out_lon = None
     cached_lat = cached_lon = None
 
     valid_start = pd.Timestamp(start)
     valid_end = pd.Timestamp(datetime.combine(end, datetime.max.time()))
 
-    for pair_no, pair in enumerate(pairs, start=1):
-        init_time, x, x_surface, lat, lon = read_initial_state(
-            pair,
-            PRESSURE_LEVELS,
-            args.cfgrib_indexpath,
-            not args.no_require_global_grid,
-        )
+    for item_no, item in enumerate(input_items, start=1):
+        try:
+            if isinstance(item, Era5Init):
+                init_time, x, x_surface, lat, lon = read_era5_initial_state(item, args, PRESSURE_LEVELS)
+            else:
+                init_time, x, x_surface, lat, lon = read_initial_state(
+                    item,
+                    PRESSURE_LEVELS,
+                    args.cfgrib_indexpath,
+                    not args.no_require_global_grid,
+                )
+        except (FileNotFoundError, KeyError) as exc:
+            if args.skip_missing_init:
+                log(f"[SKIP] missing init state for item {item_no}: {exc}")
+                skipped += 1
+                continue
+            raise
         possible_valids = [init_time + pd.Timedelta(hours=int(args.lead_hours) * step) for step in save_steps]
         if not any(valid_start <= vt <= valid_end for vt in possible_valids):
             skipped += 1
@@ -467,6 +706,10 @@ def main() -> None:
 
         if lat_idx is None or cached_lat is None or cached_lon is None:
             lat_idx, lon_idx = crop_indices(lat, lon, args)
+            lat_slice = contiguous_slice(lat_idx, "latitude")
+            lon_slice = contiguous_slice(lon_idx, "longitude")
+            out_lat = lat[lat_idx]
+            out_lon = lon[lon_idx]
             cached_lat, cached_lon = lat.copy(), lon.copy()
             log(
                 "[grid] input={}x{} crop={}x{} lat {:.2f}-{:.2f} lon {:.2f}-{:.2f}".format(
@@ -482,8 +725,13 @@ def main() -> None:
             )
         elif len(lat) != len(cached_lat) or len(lon) != len(cached_lon) or not np.allclose(lat, cached_lat) or not np.allclose(lon, cached_lon):
             raise ValueError("Grid changed between GRIB pairs; this script expects a fixed Pangu grid.")
+        if lat_slice is None or lon_slice is None or out_lat is None or out_lon is None:
+            raise RuntimeError("Crop slices were not initialized.")
 
-        log(f"[{pair_no}/{len(pairs)}] init={init_time} upper={Path(pair.upper_path).name} surface={Path(pair.surface_path).name}")
+        if isinstance(item, Era5Init):
+            log(f"[{item_no}/{len(input_items)}] init={init_time} era5_root={args.era5_root}")
+        else:
+            log(f"[{item_no}/{len(input_items)}] init={init_time} upper={Path(item.upper_path).name} surface={Path(item.surface_path).name}")
         state = x.to(device=device, dtype=torch.float32, non_blocking=True)
         state_surface = x_surface.to(device=device, dtype=torch.float32, non_blocking=True)
 
@@ -495,8 +743,8 @@ def main() -> None:
                 valid_time = init_time + pd.Timedelta(hours=int(args.lead_hours) * step)
                 if not (valid_start <= valid_time <= valid_end):
                     continue
-                pressure_np = state.detach().cpu().numpy().astype(np.float32, copy=False)
-                surface_np = state_surface.detach().cpu().numpy().astype(np.float32, copy=False)
+                pressure_np = state[:, :, lat_slice, lon_slice].detach().cpu().numpy().astype(np.float32, copy=False)
+                surface_np = state_surface[:, lat_slice, lon_slice].detach().cpu().numpy().astype(np.float32, copy=False)
                 lead_hours = int(args.lead_hours) * step
                 ds_out = build_output_dataset(
                     pressure_np,
@@ -504,10 +752,11 @@ def main() -> None:
                     init_time,
                     valid_time,
                     lead_hours,
-                    lat,
-                    lon,
-                    lat_idx,
-                    lon_idx,
+                    out_lat,
+                    out_lon,
+                    None,
+                    None,
+                    already_cropped=True,
                 )
                 key = (month_label(valid_time), lead_hours)
                 buffers[key].append(ds_out)
@@ -518,7 +767,15 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     for (label, lead_hours), parts in sorted(buffers.items()):
-        written_path = flush_output_group(parts, output_dir, label, lead_hours, args.compress_level, args.overwrite)
+        written_path = flush_output_group(
+            parts,
+            output_dir,
+            label,
+            lead_hours,
+            args.compress_level,
+            args.overwrite,
+            args.output_label_suffix,
+        )
         if written_path:
             written.append(written_path)
 
@@ -530,8 +787,12 @@ def main() -> None:
         "save_steps": save_steps,
         "processed_outputs": int(processed),
         "skipped_pairs": int(skipped),
-        "input_pairs": len(pairs),
+        "input_mode": args.input_mode,
+        "input_count": len(input_items),
+        "era5_root": args.era5_root if args.input_mode == "era5-dirs" else "",
+        "init_hours": parse_init_hours(args.init_hours) if args.input_mode == "era5-dirs" else [],
         "output_dir": str(output_dir),
+        "output_label_suffix": args.output_label_suffix,
         "outputs": written,
         "surface_input_order": list(SURFACE_VARS),
         "pressure_input_order": list(UPPER_VARS),
@@ -550,7 +811,7 @@ def main() -> None:
         "rh2m_note": "RH2M is not generated from 1000 hPa humidity in this 2025 ONNX workflow.",
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = output_dir / "pangu_onnx_manifest.json"
+    manifest_path = output_dir / args.manifest_name
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"[DONE] processed_outputs={processed} skipped_pairs={skipped} manifest={manifest_path}")
 
