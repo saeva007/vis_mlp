@@ -312,7 +312,17 @@ def _wait_for_node_leader_copy(
 
 def copy_to_local(src_path: str, global_rank: int, local_rank: int,
                   world_size: int, exp_id: str = None) -> str:
-    target_dir = "/tmp"
+    target_dir = os.environ.get("LOWVIS_RNN_LOCAL_CACHE_DIR", "").strip() or "/tmp"
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        if global_rank == 0:
+            print(
+                f"[Data-Copy] Cannot use LOWVIS_RNN_LOCAL_CACHE_DIR={target_dir}: "
+                f"{exc}; falling back to /tmp.",
+                flush=True,
+            )
+        target_dir = "/tmp"
     if exp_id is None:
         exp_id = "default_exp"
 

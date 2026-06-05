@@ -39,6 +39,10 @@ get_experiment() {
             EXP_NAME="proposed_rare_event_focal"
             MODEL_ARGS="$(base_model_args) --loss-mode designed_focal"
             ;;
+        3)
+            EXP_NAME="plain_focal_loss"
+            MODEL_ARGS="$(base_model_args) --loss-mode designed_focal --no-label-smoothing --class-weight-fog 1.0 --class-weight-mist 1.0 --class-weight-clear 1.0 --focal-gamma-fog 2.0 --focal-gamma-mist 2.0 --focal-gamma-clear 2.0 --alpha-clear-fp 0.0 --alpha-recall-boost 0.0 --ordinal-cost-weight 0.0 --aux-reg-weight 0.0 --boundary-weight 0.0 --physical-hard-weight 0.0 --aerosol-hard-weight 0.0 --sample-weight-cap 1.0"
+            ;;
         *)
             echo "Unknown loss experiment id: $1" >&2
             exit 2

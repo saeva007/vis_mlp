@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J pangu_onnx_2025
-#SBATCH -p kshdexclu01
+#SBATCH --partition=dcu
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
@@ -18,12 +18,12 @@ echo "Node: $(hostname)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
 
+source /lustre/chenxi/yliang/miniforge3/bin/activate
 module purge
+module load compiler/dtk/23.10
 module load compiler/devtoolset/7.3.1
-export CONDA_NO_PLUGINS=true
-export CONDA_SOLVER=classic
-source /public/home/putianshu/miniconda3/bin/activate
-conda activate torch
+module load mpi/hpcx/2.7.4/gcc-7.3.1
+source /lustre/chenxi/yliang/work/cast3/env.sh
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
@@ -34,6 +34,10 @@ export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 WORK_DIR="${WORK_DIR:-/data2/share/chenxi/PuTS/mlp}"
 cd "${WORK_DIR}"
 mkdir -p logs
+PYTHON_PACKAGES="${PYTHON_PACKAGES:-${WORK_DIR}/python_packages}"
+if [[ -d "${PYTHON_PACKAGES}" ]]; then
+    export PYTHONPATH="${PYTHON_PACKAGES}:${PYTHONPATH:-}"
+fi
 
 SCRIPT_PATH="${SCRIPT_PATH:-${WORK_DIR}/run_pangu_onnx_2025.py}"
 MODEL_PATH="${MODEL_PATH:-${WORK_DIR}/pangu_models/pangu_weather_24.onnx}"
@@ -42,7 +46,7 @@ MODEL_PATH="${MODEL_PATH:-${WORK_DIR}/pangu_models/pangu_weather_24.onnx}"
 # INPUT_MODE=pair keeps the old path for pre-merged pressure/surface GRIB pairs.
 INPUT_MODE="${INPUT_MODE:-era5-dirs}"
 ERA5_ROOT="${ERA5_ROOT:-/sharedata/dataset/realtime/SD005-ERA5/0p25}"
-INIT_HOURS="${INIT_HOURS:-0,12}"
+INIT_HOURS="${INIT_HOURS:-0:12}"
 SKIP_MISSING_INIT="${SKIP_MISSING_INIT:-0}"
 PAIR_FILE="${PAIR_FILE:-}"
 UPPER_DIR="${UPPER_DIR:-${WORK_DIR}/pangu_init/era5_2025/pressure}"

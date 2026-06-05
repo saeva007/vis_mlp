@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -115,7 +116,7 @@ def parse_init_hours(value: str) -> List[int]:
     if raw_value in {"all", "*"}:
         return list(range(24))
     hours: List[int] = []
-    for raw in raw_value.replace(";", ",").split(","):
+    for raw in raw_value.replace(";", ",").replace(":", ",").split(","):
         raw = raw.strip()
         if not raw:
             continue
@@ -541,11 +542,25 @@ def build_output_dataset(
     return ds
 
 
-def netcdf_encoding(ds: xr.Dataset, compress_level: int) -> Dict[str, Dict[str, object]]:
+def choose_netcdf_engine() -> str:
+    candidates = (
+        ("h5netcdf", "h5netcdf"),
+        ("netCDF4", "netcdf4"),
+        ("scipy", "scipy"),
+    )
+    for module_name, engine_name in candidates:
+        if importlib.util.find_spec(module_name) is not None:
+            return engine_name
+    raise RuntimeError("No NetCDF writer is available. Install one of h5netcdf, netCDF4, or scipy.")
+
+
+def netcdf_encoding(ds: xr.Dataset, compress_level: int, engine: str) -> Dict[str, Dict[str, object]]:
     encoding: Dict[str, Dict[str, object]] = {}
     for name in ds.data_vars:
-        encoding[name] = {"dtype": "float32"}
-        if compress_level > 0:
+        encoding[name] = {}
+        if engine in {"h5netcdf", "netcdf4"}:
+            encoding[name]["dtype"] = "float32"
+        if engine in {"h5netcdf", "netcdf4"} and compress_level > 0:
             encoding[name].update({"zlib": True, "complevel": int(compress_level), "shuffle": True})
     return encoding
 
@@ -580,7 +595,9 @@ def flush_output_group(
     if len(unique) != ds.sizes["time"]:
         ds = ds.isel(time=np.sort(keep_idx))
     ds.attrs["time_count"] = int(ds.sizes["time"])
-    ds.to_netcdf(tmp_file, engine="h5netcdf", encoding=netcdf_encoding(ds, compress_level))
+    netcdf_engine = choose_netcdf_engine()
+    log(f"[netcdf] engine={netcdf_engine} file={out_file.name}")
+    ds.to_netcdf(tmp_file, engine=netcdf_engine, encoding=netcdf_encoding(ds, compress_level, netcdf_engine))
     tmp_file.replace(out_file)
     ds.close()
     for part in parts:
@@ -608,7 +625,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--init-hours",
         default="0",
-        help="Comma-separated initialization hours in UTC for era5-dirs mode, e.g. 0,12 or all.",
+        help="Initialization hours in UTC for era5-dirs mode, e.g. 0:12, 0,12, or all.",
     )
     parser.add_argument("--upper-dir", default="", help="Directory containing pressure-level GRIB files.")
     parser.add_argument("--surface-dir", default="", help="Directory containing surface GRIB files.")

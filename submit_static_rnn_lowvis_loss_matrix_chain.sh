@@ -32,6 +32,7 @@ loss_experiment_name() {
         0) echo "simple_ce_classification" ;;
         1) echo "simple_logvis_regression" ;;
         2) echo "proposed_rare_event_focal" ;;
+        3) echo "plain_focal_loss" ;;
         *)
             echo "ERROR: unknown loss experiment id: $1" >&2
             exit 2
