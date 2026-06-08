@@ -6,11 +6,19 @@ import pvlib
 import warnings
 import gc
 import shutil
+import json
 from tqdm import tqdm
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.lib.format import open_memmap
 
 warnings.filterwarnings('ignore')
+
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # ================= 配置区域 =================
 BASE_PATH = "/public/home/putianshu/vis_mlp"
@@ -18,7 +26,13 @@ FEATURE_DIR = os.path.join(BASE_PATH, 'station_data/station_data_merged')
 OBS_PATH = os.path.join(BASE_PATH, 'CMA_visibility_2021_2023_GeoCoords_1.nc')
 VEG_FILE = "/public/home/putianshu/vis_cnn/data_vegtype.nc"
 ORO_FILE = "/public/home/putianshu/vis_cnn/data_orography.nc"
-OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, 'ml_dataset_pmst_v5_aligned_12h_pm10_pm25')
+INCLUDE_PM = _env_bool("LOWVIS_INCLUDE_PM", True)
+DEFAULT_OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, 'ml_dataset_pmst_v5_aligned_12h_pm10_pm25')
+DEFAULT_AIRPORT25_OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, 'ml_dataset_pmst_v5_aligned_12h_airport25')
+OUTPUT_DATASET_DIR = os.environ.get(
+    "S1_OUTPUT_DATASET_DIR",
+    DEFAULT_OUTPUT_DATASET_DIR if INCLUDE_PM else DEFAULT_AIRPORT25_OUTPUT_DATASET_DIR,
+)
 TEMP_DIR = os.path.join(OUTPUT_DATASET_DIR, 'temp_chunks')
 
 VAR_CONFIG = {
@@ -48,6 +62,10 @@ FINAL_FEATURE_ORDER = [
     'V_925', 'DP_1000', 'DP_925', 'Q_1000', 'Q_925', 'W_925',
     'W_1000', 'DPD', 'INVERSION'
 ]
+ZENITH_FEATURE_NAME = "ZENITH" if INCLUDE_PM else "ZENITH_PROXY"
+DYNAMIC_FEATURE_ORDER = FINAL_FEATURE_ORDER + [ZENITH_FEATURE_NAME]
+if INCLUDE_PM:
+    DYNAMIC_FEATURE_ORDER = DYNAMIC_FEATURE_ORDER + ["PM10", "PM2P5"]
 
 YEARS_FOR_TRAIN_VAL = [2021, 2022, 2023]
 TRAIN_RATIO = 0.8
@@ -354,113 +372,114 @@ def process_year_data_optimized(year, ds_obs_full, data_veg, data_oro, pm10_da_y
     del X_met, zenith
     gc.collect()
 
-    # ========= 将 pm10 作为动态变量追加到 dyn 的最后一维 =========
-    # pm10 文件单位为 kg/m^3，这里转换为 ug/m^3 后留给训练脚本做 log1p。
-    if pm10_da_year is not None:
-        pm10_da = pm10_da_year
+    if INCLUDE_PM:
+        # ========= 将 pm10 作为动态变量追加到 dyn 的最后一维 =========
+        # pm10 文件单位为 kg/m^3，这里转换为 ug/m^3 后留给训练脚本做 log1p。
+        if pm10_da_year is not None:
+            pm10_da = pm10_da_year
 
-        # 确保维度顺序为 (time, station_id)
-        if set(pm10_da.dims) >= {'time', 'station_id'}:
-            pm10_da = pm10_da.transpose('time', 'station_id')
+            # 确保维度顺序为 (time, station_id)
+            if set(pm10_da.dims) >= {'time', 'station_id'}:
+                pm10_da = pm10_da.transpose('time', 'station_id')
+            else:
+                raise ValueError(
+                    f'pm10_da_year dims must contain \'time\' and \'station_id\', got {pm10_da.dims}'
+                )
+
+            pm10_da = pm10_da.load()
+
+            time_vals = pm10_da['time'].values
+            if np.issubdtype(time_vals.dtype, np.datetime64):
+                time_index = pd.DatetimeIndex(time_vals)
+            else:
+                # pm10 文件 time 是 float64 epoch 秒
+                time_index = pd.to_datetime(time_vals, unit='s', origin='unix')
+
+            ds_times = pd.DatetimeIndex(times)
+            sid_index = pd.Index(pm10_da['station_id'].values)
+            sids = station_ids.astype(pm10_da['station_id'].dtype)
+
+            # 最近邻时间；站点按 station_id 精确匹配
+            time_pos = time_index.get_indexer(ds_times, method='nearest')
+            sid_pos = sid_index.get_indexer(sids)
+
+            nt_ds, ns_ds = len(ds_times), len(sids)
+            nt_pm10, ns_pm10 = pm10_da.shape
+
+            pm10_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
+            base = np.asarray(pm10_da.values).reshape(-1)
+            linear_idx_grid = time_pos[:, None] * ns_pm10 + sid_pos[None, :]
+            ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
+
+            if ok_mask.any():
+                pm10_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
+
+            del base, linear_idx_grid, ok_mask
+            gc.collect()
+
+            pm10_grid = np.maximum(pm10_grid, 0.0)
+            pm10_ugm3 = pm10_grid * 1e12
+            del pm10_grid
+
+            # 避免缺失导致 windows 被 mask 掉
+            pm10_median = np.nanmedian(pm10_ugm3)
+            if not np.isfinite(pm10_median):
+                pm10_median = 0.0
+            pm10_ugm3 = np.where(np.isfinite(pm10_ugm3), pm10_ugm3, pm10_median).astype(np.float32)
+
+            X_dyn_base = np.concatenate([X_dyn_base, pm10_ugm3[..., None]], axis=-1)
+            del pm10_ugm3, pm10_da
+            gc.collect()
+
+        # 若 pm10 缺失，仍需保证 dyn 维度一致（为训练脚本提供固定 dyn_vars=26）
+        if pm10_da_year is None:
+            pm10_ugm3 = np.zeros((len(times), len(station_ids)), dtype=np.float32)
+            X_dyn_base = np.concatenate([X_dyn_base, pm10_ugm3[..., None]], axis=-1)
+
+        # ========= PM2.5（pm2p5），与 pm10 同一对齐方式；×1e12 → µg/m³ =========
+        if pm25_da_year is not None:
+            pm25_da = pm25_da_year
+            if set(pm25_da.dims) >= {"time", "station_id"}:
+                pm25_da = pm25_da.transpose("time", "station_id")
+            else:
+                raise ValueError(
+                    f"pm25_da_year dims must contain 'time' and 'station_id', got {pm25_da.dims}"
+                )
+            pm25_da = pm25_da.load()
+            time_vals = pm25_da["time"].values
+            if np.issubdtype(time_vals.dtype, np.datetime64):
+                time_index = pd.DatetimeIndex(time_vals)
+            else:
+                time_index = pd.to_datetime(time_vals, unit="s", origin="unix")
+            ds_times = pd.DatetimeIndex(times)
+            sid_index = pd.Index(pm25_da["station_id"].values)
+            sids = station_ids.astype(pm25_da["station_id"].dtype)
+            time_pos = time_index.get_indexer(ds_times, method="nearest")
+            sid_pos = sid_index.get_indexer(sids)
+            nt_ds, ns_ds = len(ds_times), len(sids)
+            _, ns_pm25 = pm25_da.shape
+            pm25_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
+            base = np.asarray(pm25_da.values, dtype=np.float32).reshape(-1)
+            del pm25_da
+            gc.collect()
+            linear_idx_grid = time_pos[:, None] * ns_pm25 + sid_pos[None, :]
+            ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
+            if ok_mask.any():
+                pm25_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
+            del base, linear_idx_grid, ok_mask
+            pm25_grid = np.maximum(pm25_grid, 0.0)
+            pm25_ugm3 = pm25_grid * 1e12
+            del pm25_grid
+            pm25_median = np.nanmedian(pm25_ugm3)
+            if not np.isfinite(pm25_median):
+                pm25_median = 0.0
+            pm25_ugm3 = np.where(np.isfinite(pm25_ugm3), pm25_ugm3, pm25_median).astype(np.float32)
+            X_dyn_base = np.concatenate([X_dyn_base, pm25_ugm3[..., None]], axis=-1)
+            del pm25_ugm3
+            gc.collect()
         else:
-            raise ValueError(
-                f'pm10_da_year dims must contain \'time\' and \'station_id\', got {pm10_da.dims}'
-            )
-
-        pm10_da = pm10_da.load()
-
-        time_vals = pm10_da['time'].values
-        if np.issubdtype(time_vals.dtype, np.datetime64):
-            time_index = pd.DatetimeIndex(time_vals)
-        else:
-            # pm10 文件 time 是 float64 epoch 秒
-            time_index = pd.to_datetime(time_vals, unit='s', origin='unix')
-
-        ds_times = pd.DatetimeIndex(times)
-        sid_index = pd.Index(pm10_da['station_id'].values)
-        sids = station_ids.astype(pm10_da['station_id'].dtype)
-
-        # 最近邻时间；站点按 station_id 精确匹配
-        time_pos = time_index.get_indexer(ds_times, method='nearest')
-        sid_pos = sid_index.get_indexer(sids)
-
-        nt_ds, ns_ds = len(ds_times), len(sids)
-        nt_pm10, ns_pm10 = pm10_da.shape
-
-        pm10_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
-        base = np.asarray(pm10_da.values).reshape(-1)
-        linear_idx_grid = time_pos[:, None] * ns_pm10 + sid_pos[None, :]
-        ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
-
-        if ok_mask.any():
-            pm10_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
-
-        del base, linear_idx_grid, ok_mask
-        gc.collect()
-
-        pm10_grid = np.maximum(pm10_grid, 0.0)
-        pm10_ugm3 = pm10_grid * 1e12
-        del pm10_grid
-
-        # 避免缺失导致 windows 被 mask 掉
-        pm10_median = np.nanmedian(pm10_ugm3)
-        if not np.isfinite(pm10_median):
-            pm10_median = 0.0
-        pm10_ugm3 = np.where(np.isfinite(pm10_ugm3), pm10_ugm3, pm10_median).astype(np.float32)
-
-        X_dyn_base = np.concatenate([X_dyn_base, pm10_ugm3[..., None]], axis=-1)
-        del pm10_ugm3, pm10_da
-        gc.collect()
-
-    # 若 pm10 缺失，仍需保证 dyn 维度一致（为训练脚本提供固定 dyn_vars=26）
-    if pm10_da_year is None:
-        pm10_ugm3 = np.zeros((len(times), len(station_ids)), dtype=np.float32)
-        X_dyn_base = np.concatenate([X_dyn_base, pm10_ugm3[..., None]], axis=-1)
-
-    # ========= PM2.5（pm2p5），与 pm10 同一对齐方式；×1e12 → µg/m³ =========
-    if pm25_da_year is not None:
-        pm25_da = pm25_da_year
-        if set(pm25_da.dims) >= {"time", "station_id"}:
-            pm25_da = pm25_da.transpose("time", "station_id")
-        else:
-            raise ValueError(
-                f"pm25_da_year dims must contain 'time' and 'station_id', got {pm25_da.dims}"
-            )
-        pm25_da = pm25_da.load()
-        time_vals = pm25_da["time"].values
-        if np.issubdtype(time_vals.dtype, np.datetime64):
-            time_index = pd.DatetimeIndex(time_vals)
-        else:
-            time_index = pd.to_datetime(time_vals, unit="s", origin="unix")
-        ds_times = pd.DatetimeIndex(times)
-        sid_index = pd.Index(pm25_da["station_id"].values)
-        sids = station_ids.astype(pm25_da["station_id"].dtype)
-        time_pos = time_index.get_indexer(ds_times, method="nearest")
-        sid_pos = sid_index.get_indexer(sids)
-        nt_ds, ns_ds = len(ds_times), len(sids)
-        _, ns_pm25 = pm25_da.shape
-        pm25_grid = np.full((nt_ds, ns_ds), np.nan, dtype=np.float32)
-        base = np.asarray(pm25_da.values, dtype=np.float32).reshape(-1)
-        del pm25_da
-        gc.collect()
-        linear_idx_grid = time_pos[:, None] * ns_pm25 + sid_pos[None, :]
-        ok_mask = (time_pos[:, None] >= 0) & (sid_pos[None, :] >= 0)
-        if ok_mask.any():
-            pm25_grid[ok_mask] = base[linear_idx_grid[ok_mask]].astype(np.float32)
-        del base, linear_idx_grid, ok_mask
-        pm25_grid = np.maximum(pm25_grid, 0.0)
-        pm25_ugm3 = pm25_grid * 1e12
-        del pm25_grid
-        pm25_median = np.nanmedian(pm25_ugm3)
-        if not np.isfinite(pm25_median):
-            pm25_median = 0.0
-        pm25_ugm3 = np.where(np.isfinite(pm25_ugm3), pm25_ugm3, pm25_median).astype(np.float32)
-        X_dyn_base = np.concatenate([X_dyn_base, pm25_ugm3[..., None]], axis=-1)
-        del pm25_ugm3
-        gc.collect()
-    else:
-        pm25_ugm3 = np.zeros((len(times), len(station_ids)), dtype=np.float32)
-        X_dyn_base = np.concatenate([X_dyn_base, pm25_ugm3[..., None]], axis=-1)
+            pm25_ugm3 = np.zeros((len(times), len(station_ids)), dtype=np.float32)
+            X_dyn_base = np.concatenate([X_dyn_base, pm25_ugm3[..., None]], axis=-1)
 
     print("  Generating sliding windows (Station-wise)...")
     X_list, y_list = [], []
@@ -634,6 +653,12 @@ def main():
     os.makedirs(TEMP_DIR)
 
     print("Loading auxiliary data...")
+    print(
+        f"Dataset output: {OUTPUT_DATASET_DIR}\n"
+        f"Include PM     : {INCLUDE_PM}\n"
+        f"Dynamic order  : {DYNAMIC_FEATURE_ORDER}",
+        flush=True,
+    )
     data_veg = xr.open_dataset(VEG_FILE, engine='h5netcdf')
     data_oro = xr.open_dataset(ORO_FILE, engine='h5netcdf')
     ds_obs = xr.open_dataset(OBS_PATH, engine='h5netcdf')
@@ -651,27 +676,33 @@ def main():
 
     print("\n================ Processing TRAIN/VAL Years ================")
     for year in YEARS_FOR_TRAIN_VAL:
-        pm10_path_year = os.path.join(BASE_PATH, "pm10_station", f"pm10_station_s1_{year}.nc")
-        if os.path.exists(pm10_path_year):
-            pm10_ds_year = xr.open_dataset(pm10_path_year, engine='h5netcdf')
-            pm10_da_year = pm10_ds_year["pm10"].load()
-            pm10_ds_year.close()
-            del pm10_ds_year
+        if INCLUDE_PM:
+            pm10_path_year = os.path.join(BASE_PATH, "pm10_station", f"pm10_station_s1_{year}.nc")
+            if os.path.exists(pm10_path_year):
+                pm10_ds_year = xr.open_dataset(pm10_path_year, engine='h5netcdf')
+                pm10_da_year = pm10_ds_year["pm10"].load()
+                pm10_ds_year.close()
+                del pm10_ds_year
+            else:
+                print(f"[WARN] pm10 file not found for year {year}: {pm10_path_year}, pm10 will be NaN.", flush=True)
+                pm10_da_year = None
         else:
-            print(f"[WARN] pm10 file not found for year {year}: {pm10_path_year}, pm10 will be NaN.", flush=True)
             pm10_da_year = None
 
-        pm25_path_year = os.path.join(BASE_PATH, "pm2.5_station", f"pm2p5_station_s1_{year}.nc")
-        if os.path.exists(pm25_path_year):
-            pm25_ds_year = xr.open_dataset(pm25_path_year, engine='h5netcdf')
-            if "pm2p5" in pm25_ds_year:
-                pm25_da_year = pm25_ds_year["pm2p5"].load()
+        if INCLUDE_PM:
+            pm25_path_year = os.path.join(BASE_PATH, "pm2.5_station", f"pm2p5_station_s1_{year}.nc")
+            if os.path.exists(pm25_path_year):
+                pm25_ds_year = xr.open_dataset(pm25_path_year, engine='h5netcdf')
+                if "pm2p5" in pm25_ds_year:
+                    pm25_da_year = pm25_ds_year["pm2p5"].load()
+                else:
+                    pm25_da_year = pm25_ds_year[list(pm25_ds_year.data_vars)[0]].load()
+                pm25_ds_year.close()
+                del pm25_ds_year
             else:
-                pm25_da_year = pm25_ds_year[list(pm25_ds_year.data_vars)[0]].load()
-            pm25_ds_year.close()
-            del pm25_ds_year
+                print(f"[WARN] pm2.5 file not found for year {year}: {pm25_path_year}, pm2.5 channel will be zeros.", flush=True)
+                pm25_da_year = None
         else:
-            print(f"[WARN] pm2.5 file not found for year {year}: {pm25_path_year}, pm2.5 channel will be zeros.", flush=True)
             pm25_da_year = None
 
         gc.collect()
@@ -713,6 +744,22 @@ def main():
     )
     if meta_val:
         pd.concat(meta_val).to_csv(os.path.join(OUTPUT_DATASET_DIR, 'meta_val.csv'), index=False)
+
+    dataset_config = {
+        "dataset": "s1_pmst_aligned_airport25" if not INCLUDE_PM else "s1_pmst_aligned_pm10_pm25",
+        "output_dataset_dir": OUTPUT_DATASET_DIR,
+        "window_size": int(WINDOW_SIZE),
+        "step_size": int(STEP_SIZE),
+        "dyn_vars": int(len(DYNAMIC_FEATURE_ORDER)),
+        "dyn_vars_count": int(len(DYNAMIC_FEATURE_ORDER)),
+        "dynamic_feature_order": DYNAMIC_FEATURE_ORDER,
+        "feature_engineering_dim": 36,
+        "static_columns": ["lat_norm", "lon_norm", "orography_norm", "htcc", "veg_type_index"],
+        "include_pm": bool(INCLUDE_PM),
+        "protocol": "airport25_no_pm" if not INCLUDE_PM else "main_pm10_pm25",
+    }
+    with open(os.path.join(OUTPUT_DATASET_DIR, "dataset_build_config.json"), "w", encoding="utf-8") as f:
+        json.dump(dataset_config, f, indent=2, ensure_ascii=False)
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)

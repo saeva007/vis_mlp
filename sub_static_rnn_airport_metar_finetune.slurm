@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -J static_rnn_airport
+#SBATCH -J static_rnn_airport_ft
 #SBATCH -p kshdexclu01
 #SBATCH -N 5
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=dcu:4
 #SBATCH --mem=0
-#SBATCH -t 240:00:00
+#SBATCH -t 120:00:00
 #SBATCH -D /public/home/putianshu/vis_mlp/train
 #SBATCH -o /public/home/putianshu/vis_mlp/train/logs/%j_%x.out
 #SBATCH -e /public/home/putianshu/vis_mlp/train/logs/%j_%x.err
@@ -19,9 +19,19 @@ DCUS_PER_NODE="${DCUS_PER_NODE:-4}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 AIRPORT_RNN_DATA_DIR="${AIRPORT_RNN_DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_static_rnn_airport_metar_2025_12h}"
 
+if [ -z "${LOWVIS_RNN_PRETRAINED_CKPT:-}" ] && [ -n "${AIRPORT25_MAIN_RUN_ID:-}" ]; then
+    LOWVIS_RNN_PRETRAINED_CKPT="/public/home/putianshu/vis_mlp/checkpoints/${AIRPORT25_MAIN_RUN_ID}_S2_PhaseB_best_score.pt"
+fi
+
+if [ -z "${LOWVIS_RNN_PRETRAINED_CKPT:-}" ]; then
+    echo "ERROR: set LOWVIS_RNN_PRETRAINED_CKPT or AIRPORT25_MAIN_RUN_ID to the mainline airport25 S2 checkpoint." >&2
+    exit 2
+fi
+
 echo "Job started at: $(date)"
 echo "SCRIPT_DIR=${SCRIPT_DIR}"
 echo "AIRPORT_RNN_DATA_DIR=${AIRPORT_RNN_DATA_DIR}"
+echo "PRETRAINED_CKPT=${LOWVIS_RNN_PRETRAINED_CKPT}"
 echo "Nodes=${SLURM_NNODES} CPUs/task=${CPUS_PER_TASK} DCUs/node=${DCUS_PER_NODE}"
 
 mkdir -p "${SCRIPT_DIR}/logs"
@@ -82,22 +92,27 @@ DIST_STORE_PORT=$(expr ${BASE_PORT} + 1)
 export MASTER_ADDR
 export DIST_STORE_PORT
 
-export LOWVIS_RNN_RUN_ID="${LOWVIS_RNN_RUN_ID:-airport_metar_static_mlp_gru_${SLURM_JOB_ID}}"
-export LOWVIS_RNN_S1_STEPS="${LOWVIS_RNN_S1_STEPS:-30000}"
-export LOWVIS_RNN_VAL_INTERVAL="${LOWVIS_RNN_VAL_INTERVAL:-500}"
+export LOWVIS_RNN_RUN_ID="${LOWVIS_RNN_RUN_ID:-airport_metar_static_mlp_gru_ft_${SLURM_JOB_ID}}"
+export LOWVIS_RNN_S2_A_STEPS="${LOWVIS_RNN_S2_A_STEPS:-3000}"
+export LOWVIS_RNN_S2_B_STEPS="${LOWVIS_RNN_S2_B_STEPS:-8000}"
+export LOWVIS_RNN_VAL_INTERVAL="${LOWVIS_RNN_VAL_INTERVAL:-250}"
 export LOWVIS_RNN_BATCH_SIZE="${LOWVIS_RNN_BATCH_SIZE:-512}"
 export LOWVIS_RNN_GRAD_ACCUM="${LOWVIS_RNN_GRAD_ACCUM:-2}"
 export LOWVIS_RNN_NUM_WORKERS="${LOWVIS_RNN_NUM_WORKERS:-0}"
-export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-12}"
+export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-10}"
 export LOWVIS_RNN_THRESHOLD_MODE="${LOWVIS_RNN_THRESHOLD_MODE:-argmax}"
-export LOWVIS_RNN_EXTRA_ARGS="${LOWVIS_RNN_EXTRA_ARGS:-}"
+if [ -z "${LOWVIS_RNN_EXTRA_ARGS:-}" ]; then
+    LOWVIS_RNN_EXTRA_ARGS="--s2-lr-head-a 3e-5 --s2-lr-backbone-b 1e-6 --s2-lr-head-b 3e-6 --fog-ratio-s2 0.08 --mist-ratio-s2 0.12 --class-weight-fog 1.5 --class-weight-mist 1.5 --class-weight-clear 1.0 --alpha-clear-fp 3.0"
+fi
+export LOWVIS_RNN_EXTRA_ARGS
 
 echo "Head Node       : ${head_node}"
 echo "MASTER_ADDR     : ${MASTER_ADDR}"
 echo "RDZV_PORT       : ${RDZV_PORT}       (torchrun rendezvous)"
 echo "DIST_STORE_PORT : ${DIST_STORE_PORT} (Python dist.TCPStore)"
 echo "RUN_ID          : ${LOWVIS_RNN_RUN_ID}"
-echo "S1_STEPS        : ${LOWVIS_RNN_S1_STEPS}"
+echo "S2_A_STEPS      : ${LOWVIS_RNN_S2_A_STEPS}"
+echo "S2_B_STEPS      : ${LOWVIS_RNN_S2_B_STEPS}"
 echo "THRESHOLD_MODE  : ${LOWVIS_RNN_THRESHOLD_MODE}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
@@ -108,7 +123,7 @@ srun --nodes=${SLURM_NNODES} \
      bash -c "rm -rf /dev/shm/torch_* /dev/shm/*static_rnn_airport* /dev/shm/*lowvis_rnn* 2>/dev/null; \
               echo \"\$(hostname) SHM Cleaned\""
 
-echo "Starting airport-only Static MLP + GRU low-vis experiment..."
+echo "Starting airport fine-tune from airport25 mainline S2 checkpoint..."
 srun --nodes=${SLURM_NNODES} \
      --ntasks=${SLURM_NNODES} \
      --ntasks-per-node=1 \
@@ -128,11 +143,13 @@ srun --nodes=${SLURM_NNODES} \
              --rdzv_id=${SLURM_JOBID} \
              --max_restarts=0 \
              \"${SCRIPT_DIR}/train_static_rnn_lowvis.py\" \
-             --mode s1 \
+             --mode s2 \
              --encoder gru \
              --run-id \"${LOWVIS_RNN_RUN_ID}\" \
-             --s1-data-dir \"${AIRPORT_RNN_DATA_DIR}\" \
-             --s1-steps \"${LOWVIS_RNN_S1_STEPS}\" \
+             --s2-data-dir \"${AIRPORT_RNN_DATA_DIR}\" \
+             --pretrained-ckpt \"${LOWVIS_RNN_PRETRAINED_CKPT}\" \
+             --s2-phase-a-steps \"${LOWVIS_RNN_S2_A_STEPS}\" \
+             --s2-phase-b-steps \"${LOWVIS_RNN_S2_B_STEPS}\" \
              --val-interval \"${LOWVIS_RNN_VAL_INTERVAL}\" \
              --batch-size \"${LOWVIS_RNN_BATCH_SIZE}\" \
              --grad-accum \"${LOWVIS_RNN_GRAD_ACCUM}\" \

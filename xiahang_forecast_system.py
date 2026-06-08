@@ -452,8 +452,11 @@ def build_static_rnn_forecast_model(config: Mapping) -> StaticRNNLowVisForecastN
 def predict_static_rnn_classes_from_probs(
     probabilities: np.ndarray,
     thresholds: Optional[Mapping[str, float]] = None,
+    threshold_mode: str = "argmax",
 ) -> np.ndarray:
     probs = np.asarray(probabilities, dtype=np.float32)
+    if str(threshold_mode).lower() == "argmax":
+        return np.argmax(probs, axis=1).astype(np.int64)
     th = thresholds or {}
     fog_th = float(th.get("fog", th.get("fog_threshold", 0.5)))
     mist_th = float(th.get("mist", th.get("mist_threshold", 0.5)))
@@ -2034,6 +2037,7 @@ class VisibilityForecastSystem:
         self.data_processor = None
         self.model_type = self.config.get("model_type", "legacy_mlp")
         self.airport_thresholds = {"fog": 0.5, "mist": 0.5}
+        self.airport_threshold_mode = str(self.config.get("threshold_mode", "")).lower()
         self.airport_temperature = 1.0
         self.airport_station_order = None
         self.airport_season_thresholds = None
@@ -2159,6 +2163,13 @@ class VisibilityForecastSystem:
                     or self.preprocessors.get('thresholds')
                     or {'fog': 0.5, 'mist': 0.5}
                 )
+                if not self.airport_threshold_mode:
+                    self.airport_threshold_mode = 'argmax' if self.model_type == 'static_rnn_airport' else 'threshold'
+                if self.airport_threshold_mode not in ('argmax', 'threshold'):
+                    raise ValueError(
+                        "threshold_mode must be either 'argmax' or 'threshold', "
+                        f"got {self.airport_threshold_mode!r}"
+                    )
                 self.airport_season_thresholds = (
                     self.config.get('season_thresholds')
                     or (checkpoint.get('season_thresholds') if isinstance(checkpoint, dict) else None)
@@ -2196,7 +2207,8 @@ class VisibilityForecastSystem:
                     self.model.load_state_dict(model_state_norm)
                     logger.info(
                         f"Static-RNN机场模型加载成功，dyn={model_config.get('dyn_vars_count')}, "
-                        f"fe={model_config.get('fe_dim')}, thresholds={self.airport_thresholds}, "
+                        f"fe={model_config.get('fe_dim')}, threshold_mode={self.airport_threshold_mode}, "
+                        f"thresholds={self.airport_thresholds}, "
                         f"T={self.airport_temperature:.3f}"
                     )
                 else:
@@ -2209,7 +2221,8 @@ class VisibilityForecastSystem:
                         self.model = build_airport_model(model_config).to(self.device)
                     self.model.load_state_dict(model_state_norm)
                     logger.info(
-                        f"机场PMST模型加载成功，type={self.model_type}, thresholds={self.airport_thresholds}, "
+                        f"机场PMST模型加载成功，type={self.model_type}, "
+                        f"threshold_mode={self.airport_threshold_mode}, thresholds={self.airport_thresholds}, "
                         f"T={self.airport_temperature:.3f}"
                     )
             else:
@@ -2456,9 +2469,15 @@ class VisibilityForecastSystem:
             logger.debug(f"无法写入预报时间戳日志: {e}")
 
     def predict_airport_classes(self, probabilities, coords):
+        if self.airport_threshold_mode == 'argmax':
+            return np.argmax(np.asarray(probabilities), axis=1).astype(np.int64)
         if not self.airport_season_thresholds:
             if self.model_type == 'static_rnn_airport':
-                return predict_static_rnn_classes_from_probs(probabilities, self.airport_thresholds)
+                return predict_static_rnn_classes_from_probs(
+                    probabilities,
+                    self.airport_thresholds,
+                    self.airport_threshold_mode,
+                )
             return predict_classes_from_probs(probabilities, self.airport_thresholds)
 
         time_values = pd.DatetimeIndex(pd.to_datetime(coords['time']))
@@ -2483,7 +2502,11 @@ class VisibilityForecastSystem:
             }
             sl = slice(i * station_dim, (i + 1) * station_dim)
             if self.model_type == 'static_rnn_airport':
-                predictions[sl] = predict_static_rnn_classes_from_probs(probabilities[sl], thresholds)
+                predictions[sl] = predict_static_rnn_classes_from_probs(
+                    probabilities[sl],
+                    thresholds,
+                    self.airport_threshold_mode,
+                )
             else:
                 predictions[sl] = predict_classes_from_probs(probabilities[sl], thresholds)
         return predictions
@@ -2567,6 +2590,7 @@ class VisibilityForecastSystem:
                     'class': ['<500m', '500-1000m', '>=1000m']
                 }, attrs={
                     'model_type': self.model_type,
+                    'threshold_mode': self.airport_threshold_mode,
                     'fog_threshold': float(self.airport_thresholds.get('fog', 0.5)),
                     'mist_threshold': float(self.airport_thresholds.get('mist', 0.5)),
                     'temperature': float(self.airport_temperature),
@@ -2953,9 +2977,10 @@ def create_default_config():
     config = {
         "data_root_dir": "/public/home/chenxi/PuTS/tianji",
         "model_type": "static_rnn_airport",
-        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/<airport_run_id>_S1_best_score.pt",
-        "scaler_path": "/public/home/putianshu/vis_mlp/checkpoints/robust_scaler_<airport_run_id>_s1_w12_dyn25_pm.pkl",
+        "model_path": "/public/home/putianshu/vis_mlp/checkpoints/<airport25_run_id>_S2_PhaseB_best_score.pt",
+        "scaler_path": "/public/home/putianshu/vis_mlp/checkpoints/robust_scaler_<airport25_run_id>_s2_w12_dyn25_nopm.pkl",
         "dataset_metadata_path": "/public/home/putianshu/vis_mlp/ml_dataset_static_rnn_airport_metar_2025_12h/dataset_metadata.json",
+        "threshold_mode": "argmax",
         "vegetation_file": "/public/home/chenxi/PuTS/tianji/data_vegtype.nc",
         "grid_data_base_dir": "/sharedata/dataset/GroupData/GD001-EC_Forcasting",
         "output_dir": "/public/home/chenxi/PuTS/tianji/forecasts",

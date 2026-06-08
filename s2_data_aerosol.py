@@ -42,6 +42,7 @@ BASE_PATH = "/public/home/putianshu/vis_mlp"
 INPUT_FILE = os.path.join(BASE_PATH, "tianji_auto_station", "merged_final_all_vars.nc")
 VEG_FILE = "/public/home/putianshu/vis_cnn/data_vegtype.nc"
 ORO_FILE = "/public/home/putianshu/vis_cnn/data_orography.nc"
+INCLUDE_PM = _env_bool("LOWVIS_INCLUDE_PM", True)
 
 SPLIT_POLICY = os.environ.get("S2_SPLIT_POLICY", "month_tail").strip().lower()
 if SPLIT_POLICY not in {"month_tail", "month_group"}:
@@ -53,13 +54,24 @@ MONTH_GROUP_TEST_MONTHS = _parse_months("S2_TEST_MONTHS", "2,4,6,8,10,12")
 MONTH_GROUP_DROP_CROSS_SPLIT_WINDOWS = _env_bool("S2_DROP_CROSS_SPLIT_WINDOWS", True)
 
 DEFAULT_OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, "ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2")
+DEFAULT_AIRPORT25_OUTPUT_DATASET_DIR = os.path.join(BASE_PATH, "ml_dataset_s2_tianji_12h_airport25_monthtail_2")
 DEFAULT_MONTH_GROUP_OUTPUT_DATASET_DIR = os.path.join(
     BASE_PATH,
     "ml_dataset_s2_tianji_12h_pm10_pm25_monthgroup_train13579_val11_test24681012",
 )
+DEFAULT_AIRPORT25_MONTH_GROUP_OUTPUT_DATASET_DIR = os.path.join(
+    BASE_PATH,
+    "ml_dataset_s2_tianji_12h_airport25_monthgroup_train13579_val11_test24681012",
+)
 OUTPUT_DATASET_DIR = os.environ.get(
     "S2_OUTPUT_DATASET_DIR",
-    DEFAULT_MONTH_GROUP_OUTPUT_DATASET_DIR if SPLIT_POLICY == "month_group" else DEFAULT_OUTPUT_DATASET_DIR,
+    (
+        DEFAULT_MONTH_GROUP_OUTPUT_DATASET_DIR
+        if INCLUDE_PM
+        else DEFAULT_AIRPORT25_MONTH_GROUP_OUTPUT_DATASET_DIR
+    )
+    if SPLIT_POLICY == "month_group"
+    else (DEFAULT_OUTPUT_DATASET_DIR if INCLUDE_PM else DEFAULT_AIRPORT25_OUTPUT_DATASET_DIR),
 )
 
 # PM10：优先单文件（与 48h 一致），否则尝试目录下多 nc 拼接
@@ -122,6 +134,10 @@ FINAL_FEATURE_ORDER = [
     "DPD",
     "INVERSION",
 ]
+ZENITH_FEATURE_NAME = "ZENITH" if INCLUDE_PM else "ZENITH_PROXY"
+DYNAMIC_FEATURE_ORDER = FINAL_FEATURE_ORDER + [ZENITH_FEATURE_NAME]
+if INCLUDE_PM:
+    DYNAMIC_FEATURE_ORDER = DYNAMIC_FEATURE_ORDER + ["PM10", "PM2P5"]
 
 # Monthly tail split with fixed retained val/test days plus 24h gaps
 VAL_LAST_DAYS = 3
@@ -315,7 +331,7 @@ def write_split_metadata(out_dir, split_policy, split_audit, split_indices, y_fl
     pd.DataFrame(month_rows).to_csv(os.path.join(out_dir, "split_month_summary.csv"), index=False)
 
     config = {
-        "dataset": "s2_tianji_12h_pm10_pm25",
+        "dataset": "s2_tianji_12h_pm10_pm25" if INCLUDE_PM else "s2_tianji_12h_airport25",
         "split_policy": split_policy,
         "split_name": SPLIT_NAME,
         "output_dataset_dir": out_dir,
@@ -324,9 +340,13 @@ def write_split_metadata(out_dir, split_policy, split_audit, split_indices, y_fl
         "max_visibility_m": float(MAX_VIS_THRESHOLD),
         "time_alignment": TIANJI_TIME_ALIGNMENT,
         "tianji_input_time_shift_hours": float(TIANJI_INPUT_TIME_SHIFT_HOURS),
-        "dynamic_feature_order": FINAL_FEATURE_ORDER + ["ZENITH", "PM10", "PM2P5"],
+        "dyn_vars": int(len(DYNAMIC_FEATURE_ORDER)),
+        "dyn_vars_count": int(len(DYNAMIC_FEATURE_ORDER)),
+        "dynamic_feature_order": DYNAMIC_FEATURE_ORDER,
         "feature_engineering_dim": int(fe_dim),
         "static_columns": ["lat_norm", "lon_norm", "orography_norm", "htcc", "veg_type_index"],
+        "include_pm": bool(INCLUDE_PM),
+        "protocol": "main_pm10_pm25" if INCLUDE_PM else "airport25_no_pm",
         "split_audit": split_audit,
         "outputs": {
             "split_summary": os.path.join(out_dir, "split_summary.csv"),
@@ -334,6 +354,8 @@ def write_split_metadata(out_dir, split_policy, split_audit, split_indices, y_fl
         },
     }
     with open(os.path.join(out_dir, "dataset_split_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(out_dir, "dataset_build_config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
@@ -752,6 +774,11 @@ def main():
         f"Split policy  : {SPLIT_POLICY} ({SPLIT_NAME})",
         flush=True,
     )
+    print(
+        f"Include PM    : {INCLUDE_PM}\n"
+        f"Dynamic order : {DYNAMIC_FEATURE_ORDER}",
+        flush=True,
+    )
     if SPLIT_POLICY == "month_group":
         print(
             "Month groups  : "
@@ -770,24 +797,25 @@ def main():
         flush=True,
     )
 
-    pm10_da = load_pm10_dataarray()
-    pm25_da = load_pm25_dataarray()
+    pm10_da = load_pm10_dataarray() if INCLUDE_PM else None
+    pm25_da = load_pm25_dataarray() if INCLUDE_PM else None
 
     X_dyn, X_stat, lats, lons, times, stats = prepare_raw_data(ds_in, data_veg, data_oro)
     vis_key = "vis" if "vis" in ds_in else "visibility"
 
-    # ========= pm10、pm2p5 作为动态变量末两维（×1e12 → µg/m³，与仅 pm10 单元格一致）=========
-    pm10_ugm3 = cams_station_pm_to_ugm3_grid(pm10_da, times, stats)
-    del pm10_da
-    gc.collect()
-    pm25_ugm3 = cams_station_pm_to_ugm3_grid(pm25_da, times, stats)
-    del pm25_da
-    gc.collect()
-    X_dyn = np.concatenate(
-        [X_dyn, pm10_ugm3[..., None], pm25_ugm3[..., None]], axis=-1
-    )
-    del pm10_ugm3, pm25_ugm3
-    gc.collect()
+    if INCLUDE_PM:
+        # ========= pm10、pm2p5 作为动态变量末两维（×1e12 → µg/m³，与仅 pm10 单元格一致）=========
+        pm10_ugm3 = cams_station_pm_to_ugm3_grid(pm10_da, times, stats)
+        del pm10_da
+        gc.collect()
+        pm25_ugm3 = cams_station_pm_to_ugm3_grid(pm25_da, times, stats)
+        del pm25_da
+        gc.collect()
+        X_dyn = np.concatenate(
+            [X_dyn, pm10_ugm3[..., None], pm25_ugm3[..., None]], axis=-1
+        )
+        del pm10_ugm3, pm25_ugm3
+        gc.collect()
 
     print(
         f"  Generating Windows ({WINDOW_SIZE}), chunk={TIME_CHUNK_WINS} wins (low-RAM)...",

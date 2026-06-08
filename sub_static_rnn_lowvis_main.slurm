@@ -85,12 +85,15 @@ export LOWVIS_RNN_MODE="${LOWVIS_RNN_MODE:-both}"
 export LOWVIS_RNN_S1_STEPS="${LOWVIS_RNN_S1_STEPS:-15000}"
 export LOWVIS_RNN_S2_A_STEPS="${LOWVIS_RNN_S2_A_STEPS:-8000}"
 export LOWVIS_RNN_S2_B_STEPS="${LOWVIS_RNN_S2_B_STEPS:-22000}"
+export LOWVIS_RNN_S1_DATA_DIR="${LOWVIS_RNN_S1_DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_pmst_v5_aligned_12h_pm10_pm25}"
+export LOWVIS_RNN_S2_DATA_DIR="${LOWVIS_RNN_S2_DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2}"
 export LOWVIS_RNN_VAL_INTERVAL="${LOWVIS_RNN_VAL_INTERVAL:-500}"
 export LOWVIS_RNN_BATCH_SIZE="${LOWVIS_RNN_BATCH_SIZE:-512}"
 export LOWVIS_RNN_GRAD_ACCUM="${LOWVIS_RNN_GRAD_ACCUM:-2}"
 export LOWVIS_RNN_NUM_WORKERS="${LOWVIS_RNN_NUM_WORKERS:-0}"
 export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-10}"
 export LOWVIS_RNN_PRETRAINED_CKPT="${LOWVIS_RNN_PRETRAINED_CKPT:-}"
+export LOWVIS_RNN_THRESHOLD_MODE="${LOWVIS_RNN_THRESHOLD_MODE:-val_search}"
 export LOWVIS_RNN_EXTRA_ARGS="${LOWVIS_RNN_EXTRA_ARGS:-}"
 
 echo "Head Node       : ${head_node}"
@@ -102,6 +105,9 @@ echo "MODE            : ${LOWVIS_RNN_MODE}"
 echo "S1_STEPS        : ${LOWVIS_RNN_S1_STEPS}"
 echo "S2_A_STEPS      : ${LOWVIS_RNN_S2_A_STEPS}"
 echo "S2_B_STEPS      : ${LOWVIS_RNN_S2_B_STEPS}"
+echo "S1_DATA_DIR     : ${LOWVIS_RNN_S1_DATA_DIR}"
+echo "S2_DATA_DIR     : ${LOWVIS_RNN_S2_DATA_DIR}"
+echo "THRESHOLD_MODE  : ${LOWVIS_RNN_THRESHOLD_MODE}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
 echo "Cleaning /dev/shm on all allocated nodes..."
@@ -134,6 +140,8 @@ srun --nodes=${SLURM_NNODES} \
              --mode \"${LOWVIS_RNN_MODE}\" \
              --encoder gru \
              --run-id \"${LOWVIS_RNN_RUN_ID}\" \
+             --s1-data-dir \"${LOWVIS_RNN_S1_DATA_DIR}\" \
+             --s2-data-dir \"${LOWVIS_RNN_S2_DATA_DIR}\" \
              --pooling mean \
              --rnn-layers 1 \
              --hidden-dim 256 \
@@ -142,6 +150,7 @@ srun --nodes=${SLURM_NNODES} \
              --dropout 0.2 \
              --selection-metric recall_csi \
              --pretrained-ckpt \"${LOWVIS_RNN_PRETRAINED_CKPT}\" \
+             --threshold-mode \"${LOWVIS_RNN_THRESHOLD_MODE}\" \
              ${LOWVIS_RNN_EXTRA_ARGS}
      "
 

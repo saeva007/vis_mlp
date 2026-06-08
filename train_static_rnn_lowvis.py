@@ -238,6 +238,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-weight-cap", type=float, default=4.0)
 
     p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall"], default="recall_csi")
+    p.add_argument(
+        "--threshold-mode",
+        choices=["val_search", "argmax"],
+        default="val_search",
+        help="Decision rule used during validation and best-checkpoint selection.",
+    )
     p.add_argument("--min-fog-precision", type=float, default=0.10)
     p.add_argument("--min-mist-precision", type=float, default=0.10)
     p.add_argument("--min-clear-recall", type=float, default=0.88)
@@ -1033,7 +1039,13 @@ def evaluate(
     all_probs = all_probs[:n_actual]
     all_targets = all_targets[:n_actual]
     if rank == 0:
-        score, th, metrics = threshold_search(args, all_probs, all_targets.astype(np.int64))
+        if args.threshold_mode == "argmax":
+            pred = np.argmax(all_probs, axis=1)
+            metrics = build_metrics(all_targets.astype(np.int64), pred)
+            score = score_metrics(args, metrics)
+            th = {"mode": "argmax"}
+        else:
+            score, th, metrics = threshold_search(args, all_probs, all_targets.astype(np.int64))
         return score, th, metrics
     return -1.0, {"fog": 0.5, "mist": 0.5}, {}
 
@@ -1387,7 +1399,12 @@ def train_stage(
                 "metrics": metrics,
                 "selection_metric": args.selection_metric,
                 "loss_mode": getattr(args, "loss_mode", "designed_focal"),
-                "decision_type": "regression_threshold" if getattr(args, "loss_mode", "designed_focal") == "regression" else "probability_threshold",
+                "decision_type": (
+                    "regression_threshold"
+                    if getattr(args, "loss_mode", "designed_focal") == "regression"
+                    else ("argmax" if args.threshold_mode == "argmax" else "probability_threshold")
+                ),
+                "threshold_mode": args.threshold_mode,
                 "loss_terms": {
                     "class_weight_fog": float(args.class_weight_fog),
                     "class_weight_mist": float(args.class_weight_mist),
