@@ -40,8 +40,14 @@ get_experiment() {
             MODEL_ARGS="$(base_model_args) --loss-mode designed_focal"
             ;;
         3)
+            PLAIN_FOCAL_ALPHA_FOG="${LOWVIS_RNN_PLAIN_FOCAL_ALPHA_FOG:-1.0}"
+            PLAIN_FOCAL_ALPHA_MIST="${LOWVIS_RNN_PLAIN_FOCAL_ALPHA_MIST:-1.0}"
+            PLAIN_FOCAL_ALPHA_CLEAR="${LOWVIS_RNN_PLAIN_FOCAL_ALPHA_CLEAR:-1.0}"
+            PLAIN_FOCAL_GAMMA_FOG="${LOWVIS_RNN_PLAIN_FOCAL_GAMMA_FOG:-2.0}"
+            PLAIN_FOCAL_GAMMA_MIST="${LOWVIS_RNN_PLAIN_FOCAL_GAMMA_MIST:-2.0}"
+            PLAIN_FOCAL_GAMMA_CLEAR="${LOWVIS_RNN_PLAIN_FOCAL_GAMMA_CLEAR:-2.0}"
             EXP_NAME="plain_focal_loss"
-            MODEL_ARGS="$(base_model_args) --loss-mode designed_focal --no-label-smoothing --class-weight-fog 1.0 --class-weight-mist 1.0 --class-weight-clear 1.0 --focal-gamma-fog 2.0 --focal-gamma-mist 2.0 --focal-gamma-clear 2.0 --alpha-clear-fp 0.0 --alpha-recall-boost 0.0 --ordinal-cost-weight 0.0 --aux-reg-weight 0.0 --boundary-weight 0.0 --physical-hard-weight 0.0 --aerosol-hard-weight 0.0 --sample-weight-cap 1.0"
+            MODEL_ARGS="$(base_model_args) --loss-mode designed_focal --no-label-smoothing --class-weight-fog ${PLAIN_FOCAL_ALPHA_FOG} --class-weight-mist ${PLAIN_FOCAL_ALPHA_MIST} --class-weight-clear ${PLAIN_FOCAL_ALPHA_CLEAR} --focal-gamma-fog ${PLAIN_FOCAL_GAMMA_FOG} --focal-gamma-mist ${PLAIN_FOCAL_GAMMA_MIST} --focal-gamma-clear ${PLAIN_FOCAL_GAMMA_CLEAR} --alpha-clear-fp 0.0 --alpha-recall-boost 0.0 --ordinal-cost-weight 0.0 --aux-reg-weight 0.0 --boundary-weight 0.0 --physical-hard-weight 0.0 --aerosol-hard-weight 0.0 --sample-weight-cap 1.0"
             ;;
         *)
             echo "Unknown loss experiment id: $1" >&2
