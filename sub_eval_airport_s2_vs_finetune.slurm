@@ -26,7 +26,7 @@ echo "AIRPORT25_MAIN_RUN_ID=${AIRPORT25_MAIN_RUN_ID:-}"
 echo "AIRPORT25_FT_RUN_ID=${AIRPORT25_FT_RUN_ID:-}"
 echo "OUT_DIR=${OUT_DIR}"
 
-source /public/home/putianshu/miniconda3/bin/activate
+source /public/home/jarvis226/miniconda3/bin/activate
 conda activate torch
 
 cd "${SCRIPT_DIR}"
