@@ -26,11 +26,25 @@ echo "AIRPORT25_MAIN_RUN_ID=${AIRPORT25_MAIN_RUN_ID:-}"
 echo "AIRPORT25_FT_RUN_ID=${AIRPORT25_FT_RUN_ID:-}"
 echo "OUT_DIR=${OUT_DIR}"
 
+module purge
+module load compiler/devtoolset/7.3.1
+module load mpi/hpcx/2.11.0/gcc-7.3.1
+source /public/home/xichen/ncydata/dtk/dtk-24.04.1/env.sh
+export LD_LIBRARY_PATH=/public/home/xichen/ncydata/dtk/dtk-24.04.1/.hyhal/lib:$LD_LIBRARY_PATH
 source /public/home/jarvis226/miniconda3/bin/activate
 conda activate torch
+export LD_LIBRARY_PATH=/public/home/xichen/.conda/envs/py310_ppy/openssl/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/public/home/xichen/ncydata/panpy_test_liud/hipnn/lib/release/:$LD_LIBRARY_PATH
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
+export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 
 cd "${SCRIPT_DIR}"
 mkdir -p logs "${OUT_DIR}"
+
+python -c "import torch; print('torch import ok:', torch.__version__)"
 
 args=(
   --data-dir "${AIRPORT_RNN_DATA_DIR}"
