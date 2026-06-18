@@ -195,6 +195,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=int(os.environ.get("LOWVIS_RNN_BATCH_SIZE", "512")))
     p.add_argument("--grad-accum", type=int, default=int(os.environ.get("LOWVIS_RNN_GRAD_ACCUM", "2")))
     p.add_argument("--epoch-length", type=int, default=2000)
+    p.add_argument(
+        "--sampler-mode",
+        choices=["stratified_balanced", "natural_shuffle"],
+        default=os.environ.get("LOWVIS_RNN_SAMPLER_MODE", "stratified_balanced"),
+        help=(
+            "Training batch sampler. 'stratified_balanced' is the current "
+            "low-vis oversampling protocol; 'natural_shuffle' preserves the "
+            "dataset class distribution and only shuffles rows."
+        ),
+    )
     p.add_argument("--num-workers", type=int, default=int(os.environ.get("LOWVIS_RNN_NUM_WORKERS", "0")))
     p.add_argument("--patience", type=int, default=int(os.environ.get("LOWVIS_RNN_PATIENCE", "10")))
 
@@ -1236,27 +1246,41 @@ def make_loaders(
     mist_ratio: float,
     rank: int,
     world_size: int,
-) -> Tuple[DataLoader, DataLoader, StratifiedBalancedBatchSampler]:
+) -> Tuple[DataLoader, DataLoader, object]:
     def worker_init_fn(worker_id: int) -> None:
         info = torch.utils.data.get_worker_info()
         if info is not None:
             info.dataset.X = None
 
-    sampler = StratifiedBalancedBatchSampler(
-        train_ds,
-        args.batch_size,
-        fog_ratio=fog_ratio,
-        mist_ratio=mist_ratio,
-        rank=rank,
-        world_size=world_size,
-        epoch_length=args.epoch_length,
-    )
-    loader_kwargs = {
-        "batch_sampler": sampler,
-        "num_workers": args.num_workers,
-        "pin_memory": True,
-        "worker_init_fn": worker_init_fn,
-    }
+    if args.sampler_mode == "stratified_balanced":
+        sampler = StratifiedBalancedBatchSampler(
+            train_ds,
+            args.batch_size,
+            fog_ratio=fog_ratio,
+            mist_ratio=mist_ratio,
+            rank=rank,
+            world_size=world_size,
+            epoch_length=args.epoch_length,
+        )
+        loader_kwargs = {
+            "batch_sampler": sampler,
+            "num_workers": args.num_workers,
+            "pin_memory": True,
+            "worker_init_fn": worker_init_fn,
+        }
+    elif args.sampler_mode == "natural_shuffle":
+        sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=42) if world_size > 1 else None
+        loader_kwargs = {
+            "batch_size": args.batch_size,
+            "shuffle": sampler is None,
+            "sampler": sampler,
+            "drop_last": True,
+            "num_workers": args.num_workers,
+            "pin_memory": True,
+            "worker_init_fn": worker_init_fn,
+        }
+    else:
+        raise ValueError(f"Unknown sampler_mode: {args.sampler_mode}")
     if args.num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 1
@@ -1273,6 +1297,42 @@ def make_loaders(
         worker_init_fn=worker_init_fn,
     )
     return train_loader, val_loader, sampler
+
+
+def sampling_metadata(
+    args: argparse.Namespace,
+    train_ds: LowVisDataset,
+    fog_ratio: float,
+    mist_ratio: float,
+) -> Dict[str, object]:
+    y = train_ds.y_cls.numpy()
+    counts = np.bincount(y.astype(np.int64), minlength=3)
+    meta: Dict[str, object] = {
+        "sampler_mode": args.sampler_mode,
+        "batch_size": int(args.batch_size),
+        "train_class_counts": {
+            "fog": int(counts[0]),
+            "mist": int(counts[1]),
+            "clear": int(counts[2]),
+        },
+    }
+    if args.sampler_mode == "stratified_balanced":
+        n_fog = max(1, int(args.batch_size * float(fog_ratio)))
+        n_mist = max(1, int(args.batch_size * float(mist_ratio)))
+        n_clear = int(args.batch_size) - n_fog - n_mist
+        meta.update(
+            {
+                "fog_ratio": float(fog_ratio),
+                "mist_ratio": float(mist_ratio),
+                "epoch_length": int(args.epoch_length),
+                "batch_class_counts": {
+                    "fog": int(n_fog),
+                    "mist": int(n_mist),
+                    "clear": int(n_clear),
+                },
+            }
+        )
+    return meta
 
 
 def train_stage(
@@ -1315,6 +1375,7 @@ def train_stage(
         [args.focal_gamma_fog, args.focal_gamma_mist, args.focal_gamma_clear],
     ).to(device)
     train_loader, val_loader, batch_sampler = make_loaders(args, train_ds, val_ds, fog_ratio, mist_ratio, rank, world_size)
+    sampling_meta = sampling_metadata(args, train_ds, fog_ratio, mist_ratio)
     if world_size > 1:
         dist.all_reduce(torch.zeros(1, device=device), op=dist.ReduceOp.SUM)
         torch.cuda.synchronize(device)
@@ -1322,7 +1383,7 @@ def train_stage(
         rank,
         f"[{tag}] start steps={total_steps} trainable={trainable} "
         f"loss_mode={getattr(args, 'loss_mode', 'designed_focal')} "
-        f"fog_ratio={fog_ratio} mist_ratio={mist_ratio}",
+        f"sampler_mode={args.sampler_mode} fog_ratio={fog_ratio} mist_ratio={mist_ratio}",
     )
 
     ckpt_best = os.path.join(args.ckpt_dir, f"{args.run_id}_{tag}_best_score.pt")
@@ -1343,7 +1404,8 @@ def train_stage(
             bx, by, breg, braw, bw = next(iterator)
         except StopIteration:
             epoch += 1
-            batch_sampler.set_epoch(epoch)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
             iterator = iter(train_loader)
             bx, by, breg, braw, bw = next(iterator)
         bx = bx.to(device, non_blocking=True)
@@ -1405,6 +1467,7 @@ def train_stage(
                     else ("argmax" if args.threshold_mode == "argmax" else "probability_threshold")
                 ),
                 "threshold_mode": args.threshold_mode,
+                "sampling": sampling_meta,
                 "loss_terms": {
                     "class_weight_fog": float(args.class_weight_fog),
                     "class_weight_mist": float(args.class_weight_mist),

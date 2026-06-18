@@ -627,6 +627,7 @@ def build_pmst_inference_matrix(
     local_time_offset_hours: float = LOCAL_TIME_OFFSET_HOURS,
     use_source_zenith: bool = True,
     feature_order: Sequence[str] = DYNAMIC_FEATURE_ORDER,
+    drop_unknown_static: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
     cube, times, source_stations = extract_dynamic_cube(
         source,
@@ -641,9 +642,17 @@ def build_pmst_inference_matrix(
     else:
         station_names = [str(v) for v in station_names]
 
+    unknown = [str(name) for name in station_names if str(name) not in station_static]
+    if drop_unknown_static and unknown:
+        keep_idx = [i for i, name in enumerate(station_names) if str(name) in station_static]
+        if not keep_idx:
+            raise ValueError("No forecast stations match station_static metadata.")
+        cube = cube[:, keep_idx, :]
+        station_names = [station_names[i] for i in keep_idx]
+        ns = len(station_names)
+
     static_cont = np.zeros((ns, 5), dtype=np.float32)
     veg_idx = np.zeros(ns, dtype=np.float32)
-    unknown = []
     for i, name in enumerate(station_names):
         rec = station_static.get(str(name))
         if rec is None:

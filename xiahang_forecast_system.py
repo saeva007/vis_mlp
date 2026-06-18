@@ -1512,6 +1512,10 @@ def add_additional_features(ds_merged, vegetation_data=None, grid_data_base_dir=
         'station_lat': ds_merged.coords['station_lat'],
         'station_lon': ds_merged.coords['station_lon']
     }
+    if 'station_name' in ds_merged.coords:
+        station_name_values = np.asarray(ds_merged.coords['station_name'].values)
+        if len(station_name_values) == len(station_coords):
+            reference_coords['station_name'] = ('num_station', station_name_values)
 
     # 基础气象特征顺序 - 修改为包含风相关变量
     ordered_feature_vars = [
@@ -1885,6 +1889,10 @@ class DataProcessor:
                             reference_coords['time'] = ds.coords['time']
                         if 'num_station' in ds.coords:
                             reference_coords['num_station'] = ds.coords['num_station']
+                        if 'station_name' in ds.coords:
+                            station_name_values = np.asarray(ds.coords['station_name'].values)
+                            if 'num_station' in reference_coords and len(station_name_values) == len(reference_coords['num_station']):
+                                reference_coords['station_name'] = ('num_station', station_name_values)
 
                         reference_dims = ds.dims
                         logger.info(f"使用 {key} 作为参考坐标系，站点数: {len(ds.coords['station_lat'])}")
@@ -2281,17 +2289,92 @@ class VisibilityForecastSystem:
                 f"机场站点名数量与输入站点数不一致: names={len(names)}, station_dim={station_dim}; "
                 "将回退为输入坐标值"
             )
-            if 'num_station' in coords:
-                names = [str(v) for v in coords['num_station'].values]
+            if 'station_name' in coords:
+                names = [str(v) for v in coords['station_name'].values]
             elif 'station' in coords:
                 names = [str(v) for v in coords['station'].values]
+            elif 'num_station' in coords:
+                names = [str(v) for v in coords['num_station'].values]
         return names
+
+    def resolve_airport_station_names(self, coords, names):
+        """Resolve ICAO station names, falling back to lat/lon metadata matching."""
+        station_static = {}
+        if isinstance(self.preprocessors, dict):
+            station_static = self.preprocessors.get('station_static', {}) or {}
+        if not station_static:
+            return names
+
+        known_names = {str(name) for name in station_static.keys()}
+        names = [str(v) for v in names] if names else []
+        known_count = sum(1 for name in names if name in known_names)
+        if names and known_count == len(names):
+            return names
+
+        if 'station_lat' not in coords or 'station_lon' not in coords:
+            logger.warning(
+                f"机场站名匹配: {known_count}/{len(names)} 个站名在 metadata 中，"
+                "但输入缺少 station_lat/station_lon，无法按经纬度兜底匹配。"
+            )
+            return names
+
+        lat_values = np.asarray(coords['station_lat'].values, dtype=np.float64)
+        lon_values = np.asarray(coords['station_lon'].values, dtype=np.float64)
+        n_stations = len(lat_values)
+        if len(lon_values) != n_stations:
+            logger.warning("机场站名匹配: station_lat/station_lon 长度不一致，跳过经纬度匹配。")
+            return names
+        if len(names) != n_stations:
+            names = [""] * n_stations
+
+        static_points = []
+        for name, rec in station_static.items():
+            try:
+                lat = float(rec.get('lat'))
+                lon = float(rec.get('lon'))
+            except Exception:
+                continue
+            if np.isfinite(lat) and np.isfinite(lon):
+                static_points.append((str(name), lat, lon))
+
+        if not static_points:
+            return names
+
+        max_dist = float(self.config.get('station_match_max_distance_deg', 0.05))
+        resolved = list(names)
+        used = {name for name in resolved if name in known_names}
+        matched_by_coord = 0
+        for i, (lat, lon) in enumerate(zip(lat_values, lon_values)):
+            if resolved[i] in known_names:
+                continue
+            best_name = None
+            best_dist = float('inf')
+            for cand_name, cand_lat, cand_lon in static_points:
+                if cand_name in used:
+                    continue
+                dist = float(np.hypot(lat - cand_lat, lon - cand_lon))
+                if dist < best_dist:
+                    best_name = cand_name
+                    best_dist = dist
+            if best_name is not None and best_dist <= max_dist:
+                resolved[i] = best_name
+                used.add(best_name)
+                matched_by_coord += 1
+
+        final_known = sum(1 for name in resolved if name in known_names)
+        logger.info(
+            f"机场站名匹配: input={n_stations}, metadata={len(known_names)}, "
+            f"name_match={known_count}, latlon_match={matched_by_coord}, "
+            f"known_after_match={final_known}, max_dist_deg={max_dist}"
+        )
+        return resolved
 
     def preprocess_data(self, features_ds):
         """预处理数据 - 修复维度处理"""
         try:
             if self.model_type in ('airport_pmst', 'improved_dual_stream_pmst', 'static_rnn_airport'):
                 station_names = self.get_airport_station_names(features_ds.coords)
+                station_names = self.resolve_airport_station_names(features_ds.coords, station_names)
                 scaler = self.preprocessors.get('scaler')
                 fill_values = self.preprocessors.get('fill_values', {})
                 model_config = self.preprocessors.get('model_config', {})
@@ -2324,6 +2407,7 @@ class VisibilityForecastSystem:
                         local_time_offset_hours=local_time_offset_hours,
                         use_source_zenith=True,
                         feature_order=feature_order,
+                        drop_unknown_static=(self.model_type == 'static_rnn_airport'),
                     )
                 else:
                     station_to_idx = self.preprocessors.get('station_to_idx', {})
@@ -2339,7 +2423,17 @@ class VisibilityForecastSystem:
                         feature_order=feature_order,
                     )
                 if unknown:
-                    logger.warning(f"存在未见过的机场站点，将使用默认静态/站点特征: {unknown[:10]}")
+                    if self.model_type == 'static_rnn_airport':
+                        logger.warning(
+                            f"存在未见过的机场站点，已在推理输出中跳过: {unknown[:10]}"
+                        )
+                    else:
+                        logger.warning(f"存在未见过的机场站点，将使用默认静态/站点特征: {unknown[:10]}")
+                    if self.model_type != 'static_rnn_airport' and len(unknown) > max(10, 0.5 * len(station_names)):
+                        raise ValueError(
+                            "超过一半机场站点没有匹配到 dataset_metadata.json 中的 station_static。"
+                            "请检查输入文件是否包含 station_name 坐标，以及站点名是否为 ICAO 代码。"
+                        )
                 logger.info(f"机场PMST预处理完成，type={self.model_type}, 输入形状: {X_scaled.shape}")
                 return X_scaled, out_coords
 
@@ -2582,12 +2676,12 @@ class VisibilityForecastSystem:
                 predictions = predictions.reshape(time_dim, station_dim)
                 probabilities = probabilities.reshape(time_dim, station_dim, 3)
                 result_ds = xr.Dataset({
-                    'predicted_class': (['time', 'station'], predictions.astype(np.int16)),
-                    'class_probabilities': (['time', 'station', 'class'], probabilities.astype(np.float32))
+                    'predicted_class': (['time', 'station_name'], predictions.astype(np.int16)),
+                    'class_probabilities': (['time', 'station_name', 'class'], probabilities.astype(np.float32))
                 }, coords={
                     'time': coords['time'],
-                    'station': station_names,
-                    'class': ['<500m', '500-1000m', '>=1000m']
+                    'station_name': station_names,
+                    'class': ['<500m', '500-1000m', '>1000m']
                 }, attrs={
                     'model_type': self.model_type,
                     'threshold_mode': self.airport_threshold_mode,

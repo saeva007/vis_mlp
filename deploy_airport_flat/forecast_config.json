@@ -1,0 +1,17 @@
+{
+  "data_root_dir": "/data2/share/chenxi/PuTS/tianji/tianji_data",
+  "model_type": "static_rnn_airport",
+  "model_path": "/data2/share/chenxi/PuTS/tianji/forecast/model/airport_finetune_best.pt",
+  "scaler_path": "/data2/share/chenxi/PuTS/tianji/forecast/model/airport_finetune_scaler.pkl",
+  "dataset_metadata_path": "/data2/share/chenxi/PuTS/tianji/forecast/model/dataset_metadata.json",
+  "threshold_mode": "argmax",
+  "vegetation_file": "/data2/share/chenxi/PuTS/tianji/data_vegtype.nc",
+  "grid_data_base_dir": "/sharedata/dataset/GroupData/GD001-EC_Forcasting",
+  "output_dir": "/data2/share/chenxi/PuTS/tianji/forecast_data",
+  "check_interval": 60,
+  "batch_size": 1000,
+  "idw_power": 2.0,
+  "idw_max_distance": 5.0,
+  "local_time_offset_hours": 8,
+  "use_source_zenith": false
+}
