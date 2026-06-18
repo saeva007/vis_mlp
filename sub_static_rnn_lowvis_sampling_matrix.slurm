@@ -122,6 +122,8 @@ EXPERIMENT_LIST="${LOWVIS_RNN_SAMPLING_EXPERIMENTS//,/ }"
 EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
 export LOWVIS_RNN_RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-${LOWVIS_RNN_RUN_ID:-exp_${SLURM_JOB_ID}_static_rnn_sampling_matrix}}"
 export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-${LOWVIS_RNN_RUN_PREFIX}_shared_data}"
+export LOWVIS_RNN_LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+export LOWVIS_RNN_CLEAN_LOCAL_CACHE="${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-1}"
 export LOWVIS_RNN_SLEEP_BETWEEN="${LOWVIS_RNN_SLEEP_BETWEEN:-15}"
 export LOWVIS_RNN_S1_DATA_DIR="${LOWVIS_RNN_S1_DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_pmst_v5_aligned_12h_pm10_pm25}"
 export LOWVIS_RNN_S2_DATA_DIR="${LOWVIS_RNN_S2_DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2}"
@@ -134,6 +136,8 @@ echo "MODE            : ${LOWVIS_RNN_MODE}"
 echo "PRETRAINED_CKPT : ${LOWVIS_RNN_PRETRAINED_CKPT}"
 echo "RUN_PREFIX      : ${LOWVIS_RNN_RUN_PREFIX}"
 echo "LOCAL_CACHE_ID  : ${LOWVIS_RNN_LOCAL_CACHE_ID}"
+echo "LOCAL_CACHE_DIR : ${LOWVIS_RNN_LOCAL_CACHE_DIR}"
+echo "CLEAN_LOCAL_CACHE: ${LOWVIS_RNN_CLEAN_LOCAL_CACHE}"
 echo "S1_DATA_DIR     : ${LOWVIS_RNN_S1_DATA_DIR}"
 echo "S2_DATA_DIR     : ${LOWVIS_RNN_S2_DATA_DIR}"
 echo "CKPT_DIR        : ${LOWVIS_RNN_CKPT_DIR}"
@@ -143,6 +147,27 @@ echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
 if [ "${LOWVIS_RNN_MODE}" = "s2" ] && [ -z "${LOWVIS_RNN_PRETRAINED_CKPT}" ]; then
     echo "[WARN] LOWVIS_RNN_MODE=s2 but LOWVIS_RNN_PRETRAINED_CKPT is empty; S2 experiments will train without S1 initialization."
+fi
+
+if [ "${LOWVIS_RNN_CLEAN_LOCAL_CACHE}" = "1" ]; then
+    echo "Cleaning user-owned stale Static-RNN local cache files on allocated nodes..."
+    srun --nodes=${SLURM_NNODES} \
+         --ntasks=${SLURM_NNODES} \
+         --ntasks-per-node=1 \
+         /bin/bash -c '
+             cache_dir="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+             mkdir -p "${cache_dir}" 2>/dev/null || cache_dir="/tmp"
+             echo "[$(hostname)] local cache dir: ${cache_dir}"
+             df -h "${cache_dir}" | tail -1 || true
+             find "${cache_dir}" -maxdepth 1 -user "$USER" -type f \
+                 \( -name "X_train_*.npy" -o -name "X_val_*.npy" \
+                    -o -name "y_train_*.npy" -o -name "y_val_*.npy" \
+                    -o -name "X_train_*.npy.tmp" -o -name "X_val_*.npy.tmp" \
+                    -o -name "y_train_*.npy.tmp" -o -name "y_val_*.npy.tmp" \
+                    -o -name "*.nfs_fallback" \) \
+                 -print -delete 2>/dev/null || true
+             df -h "${cache_dir}" | tail -1 || true
+         '
 fi
 
 run_one_experiment() {
