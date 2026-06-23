@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Create China station-map assets for the PMST low-visibility architecture figure.
+Create China station-map assets for the PMST low-vis event architecture figure.
 
 This script is intended to run on the remote project machine, not locally.  It
 uses the S2 month-tail test set and the existing China shapefile to create
@@ -11,8 +11,8 @@ mostly annotation-free PNG layers for an architecture schematic:
   - an angled 12-h RH2M window stack for the dynamic sequence icon.
   - one static/feature-engineering station stack.
   - one gridded China orography map clipped to the national boundary.
-  - several three-class output maps selected for adequate low-visibility count
-    and high low-visibility precision/recall when evaluation CSV is available.
+  - several three-class output maps selected for adequate low-vis event count
+    and high low-vis event precision/recall when evaluation CSV is available.
   - a small categorical output colorbar for the three visibility classes.
 
 The script avoids importing the training model; it only visualizes data already
@@ -192,19 +192,19 @@ def parse_args() -> argparse.Namespace:
         "--output_min_lowvis",
         type=int,
         default=40,
-        help="Preferred minimum observed low-visibility station count when selecting output times.",
+        help="Preferred minimum observed low-vis event station count when selecting output times.",
     )
     parser.add_argument(
         "--output_min_precision",
         type=float,
         default=0.22,
-        help="Preferred minimum low-visibility precision when selecting output times from eval_csv.",
+        help="Preferred minimum low-vis event precision when selecting output times from eval_csv.",
     )
     parser.add_argument(
         "--output_min_recall",
         type=float,
         default=0.35,
-        help="Preferred minimum low-visibility recall when selecting output times from eval_csv.",
+        help="Preferred minimum low-vis event recall when selecting output times from eval_csv.",
     )
     parser.add_argument(
         "--eval_csv",
@@ -949,7 +949,7 @@ def choose_output_times(
     min_gap_hours: float,
     prefer_unique_dates: bool,
 ) -> Tuple[List[pd.Timestamp], pd.DataFrame]:
-    """Pick visually useful output times, preferring good low-vis PMST skill."""
+    """Pick visually useful output times, preferring good low-vis event PMST skill."""
     n = max(1, int(n))
     true_col, pred_col = eval_class_columns(eval_df)
     if eval_df is not None and true_col and pred_col and "time" in eval_df.columns:

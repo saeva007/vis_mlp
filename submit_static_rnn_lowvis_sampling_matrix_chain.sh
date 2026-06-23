@@ -14,7 +14,7 @@ RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-exp_$(date +%Y%m%d_%H%M%S)_static_rnn_sampl
 CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-${RUN_PREFIX}_shared_data}"
 LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
 CLEAN_LOCAL_CACHE="${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-1}"
-EXPERIMENTS_RAW="${LOWVIS_RNN_SAMPLING_EXPERIMENTS:-0 1 2 3}"
+EXPERIMENTS_RAW="${LOWVIS_RNN_SAMPLING_EXPERIMENTS:-0 1}"
 EXPERIMENT_LIST="${EXPERIMENTS_RAW//,/ }"
 EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-sub_static_rnn_lowvis_sampling_matrix.slurm}"
@@ -112,4 +112,4 @@ if [ "${SUBMIT_EVAL}" = "1" ]; then
     echo "sampling eval: afterok:${dep} -> job ${eval_job}"
 fi
 
-echo "Submitted sampling matrix. Use LOWVIS_RNN_SAMPLING_EXPERIMENTS='0 1' for the minimal no-sampling-vs-current comparison."
+echo "Submitted sampling matrix. Default comparison is no Low-vis event oversampling vs current oversampling (0 1)."

@@ -170,9 +170,9 @@ def export_source_data(
 def plot_kpis(ax: plt.Axes, summary: pd.Series) -> None:
     metrics = [
         ("总体准确率", "accuracy", BLUE),
-        ("低能见度召回率", "low_vis_recall", TEAL),
-        ("低能见度精确率", "low_vis_precision", CORAL),
-        ("低能见度CSI", "low_vis_csi", GOLD),
+        ("低能见度事件召回率", "low_vis_recall", TEAL),
+        ("低能见度事件精确率", "low_vis_precision", CORAL),
+        ("低能见度事件CSI", "low_vis_csi", GOLD),
         ("误报率", "false_positive_rate", MUTED),
     ]
     y = np.arange(len(metrics))[::-1]
@@ -206,9 +206,9 @@ def plot_kpis(ax: plt.Axes, summary: pd.Series) -> None:
 
 def plot_event_metrics(ax: plt.Axes, summary: pd.Series) -> None:
     groups = [
-        ("低能见度\n(<1000 m)", "low_vis_precision", "low_vis_recall", "low_vis_csi"),
-        ("雾\n(<500 m)", "Fog_P", "Fog_R", "Fog_CSI"),
-        ("轻雾\n(500-1000 m)", "Mist_P", "Mist_R", "Mist_CSI"),
+        ("低能见度事件\n(<1000 m)", "low_vis_precision", "low_vis_recall", "low_vis_csi"),
+        ("超低能见度\n(<500 m)", "Fog_P", "Fog_R", "Fog_CSI"),
+        ("中度低能见度\n(500-1000 m)", "Mist_P", "Mist_R", "Mist_CSI"),
     ]
     metric_labels = ["精确率", "召回率", "CSI"]
     colors = [CORAL, TEAL, GOLD]
@@ -285,14 +285,14 @@ def plot_station_scatter(ax: plt.Axes, summary: pd.Series, stations: pd.DataFram
 
     ax.set_xlim(-1, 101)
     ax.set_ylim(-1, 104)
-    ax.set_xlabel("站点低能见度精确率 (%)")
-    ax.set_ylabel("站点低能见度召回率 (%)")
+    ax.set_xlabel("站点低能见度事件精确率 (%)")
+    ax.set_ylabel("站点低能见度事件召回率 (%)")
     ax.grid(color=GRID, lw=0.45, alpha=0.8)
     ax.set_title("机场站点表现", loc="left", fontsize=7.5, fontweight="bold", pad=5)
     ax.text(
         1,
         100,
-        f"有低能见度样本的站点: n={event_sites['station'].nunique()}",
+        f"有低能见度事件样本的站点: n={event_sites['station'].nunique()}",
         ha="left",
         va="top",
         fontsize=5.9,
@@ -302,7 +302,7 @@ def plot_station_scatter(ax: plt.Axes, summary: pd.Series, stations: pd.DataFram
 
 
 def plot_confusion(ax: plt.Axes, cm: pd.DataFrame) -> None:
-    labels = ["雾", "轻雾", "正常"]
+    labels = ["超低能见度", "中度低能见度", "正常"]
     arr = cm.to_numpy(dtype=float)
     row_sum = np.maximum(arr.sum(axis=1, keepdims=True), 1.0)
     norm = arr / row_sum * 100.0
@@ -350,13 +350,13 @@ def write_qa_notes(
         "- 核心结论: 直接汇总机场 METAR 微调业务模型在测试集上的表现，不展示微调前对比。",
         "- 数据划分: test。",
         "- 判别规则: 最大概率类别。",
-        f"- 样本数: n={int(summary['n'])}; 真实雾={int(summary['true_fog'])}; 真实轻雾={int(summary['true_mist'])}; 真实正常={int(summary['true_clear'])}。",
-        f"- 低能见度精确率: {fmt_pct(summary['low_vis_precision'])}。",
-        f"- 低能见度召回率: {fmt_pct(summary['low_vis_recall'])}。",
-        f"- 低能见度 CSI: {fmt_pct(summary['low_vis_csi'])}。",
+        f"- 样本数: n={int(summary['n'])}; 真实超低能见度={int(summary['true_fog'])}; 真实中度低能见度={int(summary['true_mist'])}; 真实正常={int(summary['true_clear'])}。",
+        f"- 低能见度事件精确率: {fmt_pct(summary['low_vis_precision'])}。",
+        f"- 低能见度事件召回率: {fmt_pct(summary['low_vis_recall'])}。",
+        f"- 低能见度事件 CSI: {fmt_pct(summary['low_vis_csi'])}。",
         f"- 误报率: {fmt_pct(summary['false_positive_rate'])}。",
         f"- 总体准确率: {fmt_pct(summary['accuracy'])}。",
-        f"- 站点面板仅纳入有低能见度观测样本的站点: n={event_sites['station'].nunique()}。",
+        f"- 站点面板仅纳入有低能见度事件观测样本的站点: n={event_sites['station'].nunique()}。",
         "- 导出检查: SVG/PDF 保留可编辑文本; TIFF 为 600 dpi; PNG 预览为 300 dpi。",
         "- 源数据: airport_operational_performance_source_data.csv。",
     ]

@@ -355,7 +355,7 @@ def add_static_elements(canvas: SvgCanvas | PngCanvas) -> None:
     canvas.text(
         150,
         108,
-        "End-to-End Low-Visibility Classification Forecast Model",
+        "End-to-End Low-Vis Event Classification Forecast Model",
         66,
         COLORS["ink"],
         bold=True,
@@ -489,8 +489,8 @@ def draw_boxes(canvas: SvgCanvas | PngCanvas) -> dict[str, Box]:
             "Class head",
             [
                 "logits/probs [B, 3]",
-                "Fog: <500 m",
-                "Mist: 500-1000 m",
+                "Ultra-low: <500 m",
+                "Moderate-low: 500-1000 m",
                 "Clear: >=1000 m",
             ],
             COLORS["blue_l"],
@@ -525,7 +525,7 @@ def draw_boxes(canvas: SvgCanvas | PngCanvas) -> dict[str, Box]:
             [
                 "S1 aligned 12 h dataset",
                 "train all parameters",
-                "balanced fog / mist / clear batches",
+                "balanced ultra-low / moderate-low / clear batches",
             ],
             COLORS["blue_l"],
             COLORS["blue"],
@@ -576,7 +576,7 @@ def draw_boxes(canvas: SvgCanvas | PngCanvas) -> dict[str, Box]:
             [
                 "weighted focal loss",
                 "FP penalty + recall boost",
-                "fog/mist threshold search",
+                "ultra-low/moderate-low threshold search",
             ],
             COLORS["gray_l"],
             COLORS["line"],
