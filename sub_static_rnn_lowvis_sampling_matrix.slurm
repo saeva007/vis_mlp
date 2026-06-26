@@ -43,6 +43,10 @@ get_experiment() {
             EXP_NAME="heavy_lowvis_oversample"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.25 --mist-ratio-s1 0.25 --fog-ratio-s2 0.25 --mist-ratio-s2 0.25"
             ;;
+        4)
+            EXP_NAME="mild_lowvis_oversample"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.15 --mist-ratio-s1 0.15 --fog-ratio-s2 0.14 --mist-ratio-s2 0.16"
+            ;;
         *)
             echo "Unknown sampling experiment id: $1" >&2
             exit 2

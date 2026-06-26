@@ -24,6 +24,9 @@ EVAL_SBATCH_SCRIPT="${EVAL_SBATCH_SCRIPT:-${BASE}/paper_eval/sub_static_rnn_lowv
 EVAL_OUT_DIR="${EVAL_OUT_DIR:-static_rnn_sampling_eval_results}"
 EVAL_THRESHOLD_SOURCE="${EVAL_THRESHOLD_SOURCE:-argmax}"
 EVAL_DEVICE="${EVAL_DEVICE:-cpu}"
+EVAL_EXPERIMENTS_RAW="${EVAL_EXPERIMENTS:-}"
+CURRENT_MAIN_RUN_ID="${CURRENT_MAIN_RUN_ID:-${MAIN_RUN_ID:-}}"
+CURRENT_MAIN_CKPT="${CURRENT_MAIN_CKPT:-${MAIN_CKPT:-}}"
 
 case "${RUN_PREFIX}${CACHE_ID}${LOCAL_CACHE_DIR}${CLEAN_LOCAL_CACHE}${CKPT_DIR}${BASE}" in
     *","*|*" "*)
@@ -38,6 +41,7 @@ sampling_experiment_name() {
         1) echo "current_stratified" ;;
         2) echo "light_lowvis_oversample" ;;
         3) echo "heavy_lowvis_oversample" ;;
+        4) echo "mild_lowvis_oversample" ;;
         *)
             echo "ERROR: unknown sampling experiment id: $1" >&2
             exit 2
@@ -67,6 +71,9 @@ echo "EXPERIMENTS=${EXPERIMENT_LIST}"
 echo "SBATCH_SCRIPT=${SBATCH_SCRIPT}"
 echo "CKPT_DIR=${CKPT_DIR}"
 echo "SUBMIT_EVAL=${SUBMIT_EVAL}"
+echo "EVAL_EXPERIMENTS=${EVAL_EXPERIMENTS_RAW:-<submitted experiments>}"
+echo "CURRENT_MAIN_RUN_ID=${CURRENT_MAIN_RUN_ID}"
+echo "CURRENT_MAIN_CKPT=${CURRENT_MAIN_CKPT}"
 
 s2_jobs=()
 eval_experiments=()
@@ -103,10 +110,13 @@ if [ "${SUBMIT_EVAL}" = "1" ]; then
     fi
     dep="$(join_by_colon "${s2_jobs[@]}")"
     eval_exp="$(join_by_colon "${eval_experiments[@]}")"
+    if [ -n "${EVAL_EXPERIMENTS_RAW}" ]; then
+        eval_exp="${EVAL_EXPERIMENTS_RAW}"
+    fi
     eval_job="$(
         sbatch --parsable \
             --dependency=afterok:${dep} \
-            --export=ALL,SAMPLING_RUN_PREFIX=${RUN_PREFIX},EXPERIMENTS=${eval_exp},OUT_DIR=${EVAL_OUT_DIR},THRESHOLD_SOURCE=${EVAL_THRESHOLD_SOURCE},DEVICE=${EVAL_DEVICE} \
+            --export=ALL,SAMPLING_RUN_PREFIX=${RUN_PREFIX},CURRENT_MAIN_RUN_ID=${CURRENT_MAIN_RUN_ID},CURRENT_MAIN_CKPT=${CURRENT_MAIN_CKPT},EXPERIMENTS=${eval_exp},OUT_DIR=${EVAL_OUT_DIR},THRESHOLD_SOURCE=${EVAL_THRESHOLD_SOURCE},DEVICE=${EVAL_DEVICE} \
             "${EVAL_SBATCH_SCRIPT}"
     )"
     echo "sampling eval: afterok:${dep} -> job ${eval_job}"
