@@ -30,6 +30,7 @@ import datetime
 import json
 import math
 import os
+import random
 import time
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -140,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["s1", "s2", "both"], default="both")
     p.add_argument("--encoder", choices=["gru", "lstm"], default="gru")
     p.add_argument("--run-id", default=os.environ.get("LOWVIS_RNN_RUN_ID", f"exp_{int(time.time())}_static_rnn"))
+    p.add_argument("--seed", type=int, default=int(os.environ.get("LOWVIS_RNN_SEED", "42")))
     p.add_argument(
         "--local-cache-id",
         default=os.environ.get("LOWVIS_RNN_LOCAL_CACHE_ID", ""),
@@ -231,8 +233,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--focal-gamma-clear", type=float, default=0.5)
     p.add_argument("--alpha-clear-fp", type=float, default=2.0)
     p.add_argument("--alpha-recall-boost", type=float, default=0.2)
+    p.add_argument(
+        "--event-fp-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for the Low-vis event false-positive rate surrogate. Used "
+            "when --event-loss-normalization=conditional; defaults to "
+            "--alpha-clear-fp for backward-compatible configuration loading."
+        ),
+    )
+    p.add_argument(
+        "--event-fn-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for the Low-vis event false-negative rate surrogate. Used "
+            "when --event-loss-normalization=conditional; defaults to "
+            "--alpha-recall-boost."
+        ),
+    )
+    p.add_argument(
+        "--event-loss-normalization",
+        choices=["legacy_batch", "conditional"],
+        default=os.environ.get("LOWVIS_RNN_EVENT_LOSS_NORMALIZATION", "legacy_batch"),
+        help=(
+            "legacy_batch preserves the historical batch-average clear-FP and "
+            "class recall terms. conditional averages FP only over Clear and FN "
+            "only over Low-vis samples, making their scale invariant to sampler ratios."
+        ),
+    )
     p.add_argument("--label-smoothing", action="store_true", default=True)
     p.add_argument("--no-label-smoothing", dest="label_smoothing", action="store_false")
+    p.add_argument("--soft-fog-mist-low", type=float, default=400.0)
+    p.add_argument("--soft-fog-mist-high", type=float, default=600.0)
+    p.add_argument("--soft-mist-clear-low", type=float, default=800.0)
+    p.add_argument("--soft-mist-clear-high", type=float, default=1200.0)
     p.add_argument("--boundary-weight", type=float, default=0.0, help="Extra sample weight near 500 m and 1000 m boundaries.")
     p.add_argument("--boundary-fog-sigma", type=float, default=100.0, help="Width for the 500 m Fog/Mist boundary kernel.")
     p.add_argument("--boundary-mist-sigma", type=float, default=200.0, help="Width for the 1000 m Mist/Clear boundary kernel.")
@@ -260,7 +296,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threshold-grid-low", type=float, default=0.10)
     p.add_argument("--threshold-grid-high", type=float, default=0.95)
     p.add_argument("--threshold-grid-step", type=float, default=0.03)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.soft_fog_mist_high <= args.soft_fog_mist_low:
+        p.error("--soft-fog-mist-high must be greater than --soft-fog-mist-low")
+    if args.soft_mist_clear_high <= args.soft_mist_clear_low:
+        p.error("--soft-mist-clear-high must be greater than --soft-mist-clear-low")
+    if args.event_fp_weight is not None and args.event_fp_weight < 0:
+        p.error("--event-fp-weight must be non-negative")
+    if args.event_fn_weight is not None and args.event_fn_weight < 0:
+        p.error("--event-fn-weight must be non-negative")
+    return args
 
 
 def rank0(rank: int, text: str) -> None:
@@ -794,17 +839,26 @@ class WeightedFocalLoss(nn.Module):
         return loss.mean()
 
 
-def soft_targets_from_visibility(raw: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def soft_targets_from_visibility(
+    raw: torch.Tensor,
+    labels: torch.Tensor,
+    fog_mist_low: float = 400.0,
+    fog_mist_high: float = 600.0,
+    mist_clear_low: float = 800.0,
+    mist_clear_high: float = 1200.0,
+) -> torch.Tensor:
     soft = F.one_hot(labels, 3).float()
-    fm = (raw >= 400.0) & (raw < 600.0)
+    fm_width = max(float(fog_mist_high) - float(fog_mist_low), 1e-6)
+    mc_width = max(float(mist_clear_high) - float(mist_clear_low), 1e-6)
+    fm = (raw >= float(fog_mist_low)) & (raw < float(fog_mist_high))
     if fm.any():
-        alpha = (raw[fm] - 400.0) / 200.0
+        alpha = (raw[fm] - float(fog_mist_low)) / fm_width
         soft[fm, 0] = 1.0 - alpha
         soft[fm, 1] = alpha
         soft[fm, 2] = 0.0
-    mc = (raw >= 800.0) & (raw < 1200.0)
+    mc = (raw >= float(mist_clear_low)) & (raw < float(mist_clear_high))
     if mc.any():
-        alpha = (raw[mc] - 800.0) / 400.0
+        alpha = (raw[mc] - float(mist_clear_low)) / mc_width
         soft[mc, 0] = 0.0
         soft[mc, 1] = 1.0 - alpha
         soft[mc, 2] = alpha
@@ -817,6 +871,23 @@ def weighted_mean(value: torch.Tensor, sample_weight: Optional[torch.Tensor]) ->
     sw = sample_weight.to(value.device, dtype=value.dtype).clamp_min(0.0)
     sw = sw / sw.mean().clamp_min(1e-6)
     return torch.mean(value * sw)
+
+
+def conditional_weighted_mean(
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Average ``value`` within ``mask`` without sampler-prevalence scaling."""
+    m = mask.to(value.device, dtype=value.dtype).clamp_min(0.0)
+    if sample_weight is None:
+        weights = m
+    else:
+        weights = sample_weight.to(value.device, dtype=value.dtype).clamp_min(0.0) * m
+    denom = weights.sum()
+    if float(denom.detach()) <= 0.0:
+        return value.sum() * 0.0
+    return torch.sum(value * weights) / denom.clamp_min(1e-6)
 
 
 def combined_loss(
@@ -857,18 +928,40 @@ def combined_loss(
             "reg": float(l_reg.detach()),
         }
 
-    soft = soft_targets_from_visibility(y_raw, y) if args.label_smoothing else None
+    soft = (
+        soft_targets_from_visibility(
+            y_raw,
+            y,
+            args.soft_fog_mist_low,
+            args.soft_fog_mist_high,
+            args.soft_mist_clear_low,
+            args.soft_mist_clear_high,
+        )
+        if args.label_smoothing
+        else None
+    )
     l_cls = focal(logits, y, soft, sample_weight, 0.0)
     probs = torch.softmax(logits, dim=1)
     clear = (y == 2).float()
     fog = (y == 0).float()
     mist = (y == 1).float()
     p_low = torch.clamp(probs[:, 0] + probs[:, 1], 0.0, 1.0)
-    l_fp = weighted_mean((p_low ** 2) * clear, sample_weight)
-    l_boost = weighted_mean(((1.0 - probs[:, 0]) ** 2) * fog, sample_weight) + weighted_mean(
-        ((1.0 - probs[:, 1]) ** 2) * mist,
-        sample_weight,
-    )
+    event_fp_weight = float(args.alpha_clear_fp if args.event_fp_weight is None else args.event_fp_weight)
+    event_fn_weight = float(args.alpha_recall_boost if args.event_fn_weight is None else args.event_fn_weight)
+    if args.event_loss_normalization == "conditional":
+        low_vis = fog + mist
+        l_fp = conditional_weighted_mean(p_low ** 2, clear, sample_weight)
+        l_boost = conditional_weighted_mean((1.0 - p_low) ** 2, low_vis, sample_weight)
+        fp_weight = event_fp_weight
+        boost_weight = event_fn_weight
+    else:
+        l_fp = weighted_mean((p_low ** 2) * clear, sample_weight)
+        l_boost = weighted_mean(((1.0 - probs[:, 0]) ** 2) * fog, sample_weight) + weighted_mean(
+            ((1.0 - probs[:, 1]) ** 2) * mist,
+            sample_weight,
+        )
+        fp_weight = float(args.alpha_clear_fp)
+        boost_weight = float(args.alpha_recall_boost)
     if args.ordinal_cost_weight > 0:
         cls_ids = torch.arange(probs.size(1), device=probs.device, dtype=probs.dtype).unsqueeze(0)
         ordinal_distance = torch.abs(cls_ids - y.float().unsqueeze(1))
@@ -880,8 +973,8 @@ def combined_loss(
     l_reg = weighted_mean((reg - y_reg) ** 2, sample_weight) if args.aux_reg_weight > 0 else reg.sum() * 0.0
     total = (
         l_cls
-        + args.alpha_clear_fp * l_fp
-        + args.alpha_recall_boost * l_boost
+        + fp_weight * l_fp
+        + boost_weight * l_boost
         + args.ordinal_cost_weight * l_ord
         + args.aux_reg_weight * l_reg
     )
@@ -1260,6 +1353,7 @@ def make_loaders(
             mist_ratio=mist_ratio,
             rank=rank,
             world_size=world_size,
+            seed=args.seed,
             epoch_length=args.epoch_length,
         )
         loader_kwargs = {
@@ -1269,7 +1363,7 @@ def make_loaders(
             "worker_init_fn": worker_init_fn,
         }
     elif args.sampler_mode == "natural_shuffle":
-        sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=42) if world_size > 1 else None
+        sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed) if world_size > 1 else None
         loader_kwargs = {
             "batch_size": args.batch_size,
             "shuffle": sampler is None,
@@ -1450,6 +1544,7 @@ def train_stage(
             raw_for_meta = unwrap(model)
             ckpt_meta = {
                 "run_id": args.run_id,
+                "seed": int(args.seed),
                 "tag": tag,
                 "step": step,
                 "layout": asdict(raw_for_meta.layout),
@@ -1477,7 +1572,14 @@ def train_stage(
                     "focal_gamma_clear": float(args.focal_gamma_clear),
                     "alpha_clear_fp": float(args.alpha_clear_fp),
                     "alpha_recall_boost": float(args.alpha_recall_boost),
+                    "event_fp_weight": float(args.alpha_clear_fp if args.event_fp_weight is None else args.event_fp_weight),
+                    "event_fn_weight": float(args.alpha_recall_boost if args.event_fn_weight is None else args.event_fn_weight),
+                    "event_loss_normalization": str(args.event_loss_normalization),
                     "label_smoothing": bool(args.label_smoothing),
+                    "soft_fog_mist_low": float(args.soft_fog_mist_low),
+                    "soft_fog_mist_high": float(args.soft_fog_mist_high),
+                    "soft_mist_clear_low": float(args.soft_mist_clear_low),
+                    "soft_mist_clear_high": float(args.soft_mist_clear_high),
                     "boundary_weight": float(args.boundary_weight),
                     "physical_hard_weight": float(args.physical_hard_weight),
                     "aerosol_hard_weight": float(args.aerosol_hard_weight),
@@ -1549,6 +1651,12 @@ def main() -> None:
 
     local_rank, rank, world_size = init_distributed()
     device = torch.device(f"cuda:{local_rank}")
+    seed = int(args.seed) + int(rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     write_run_config(args, rank)
 
     model = None

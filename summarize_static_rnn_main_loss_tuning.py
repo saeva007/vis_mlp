@@ -56,7 +56,15 @@ PREFERRED_FIELDS = (
     "focal_gamma_clear",
     "alpha_clear_fp",
     "alpha_recall_boost",
+    "event_fp_weight",
+    "event_fn_weight",
+    "event_loss_normalization",
     "boundary_weight",
+    "physical_hard_weight",
+    "aerosol_hard_weight",
+    "soft_mist_clear_low",
+    "soft_mist_clear_high",
+    "seed",
     "extra_args",
 )
 
@@ -142,8 +150,8 @@ def summarize_row(row: Mapping[str, str], checkpoint_dir: Path, stage_tag: str, 
     if not ckpt.exists():
         if allow_missing:
             return {
-                "variant_id": row.get("variant_id", ""),
-                "variant_label": row.get("variant_label", ""),
+                "variant_id": row.get("variant_id", row.get("candidate_id", "")),
+                "variant_label": row.get("variant_label", row.get("candidate_label", "")),
                 "run_id": run_id,
                 "checkpoint": str(ckpt),
                 "status": "missing",
@@ -158,8 +166,8 @@ def summarize_row(row: Mapping[str, str], checkpoint_dir: Path, stage_tag: str, 
     thresholds = meta.get("thresholds", {}) if isinstance(meta, Mapping) else {}
 
     out: Dict[str, object] = {
-        "variant_id": row.get("variant_id", ""),
-        "variant_label": row.get("variant_label", ""),
+        "variant_id": row.get("variant_id", row.get("candidate_id", "")),
+        "variant_label": row.get("variant_label", row.get("candidate_label", "")),
         "run_id": meta.get("run_id", run_id),
         "checkpoint": str(ckpt),
         "status": "ok",
@@ -189,7 +197,15 @@ def summarize_row(row: Mapping[str, str], checkpoint_dir: Path, stage_tag: str, 
         "focal_gamma_clear": fnum(loss_terms.get("focal_gamma_clear", "")),
         "alpha_clear_fp": fnum(loss_terms.get("alpha_clear_fp", "")),
         "alpha_recall_boost": fnum(loss_terms.get("alpha_recall_boost", "")),
+        "event_fp_weight": fnum(loss_terms.get("event_fp_weight", "")),
+        "event_fn_weight": fnum(loss_terms.get("event_fn_weight", "")),
+        "event_loss_normalization": loss_terms.get("event_loss_normalization", ""),
         "boundary_weight": fnum(loss_terms.get("boundary_weight", "")),
+        "physical_hard_weight": fnum(loss_terms.get("physical_hard_weight", "")),
+        "aerosol_hard_weight": fnum(loss_terms.get("aerosol_hard_weight", "")),
+        "soft_mist_clear_low": fnum(loss_terms.get("soft_mist_clear_low", "")),
+        "soft_mist_clear_high": fnum(loss_terms.get("soft_mist_clear_high", "")),
+        "seed": fnum(meta.get("seed", row.get("seed", ""))),
         "extra_args": row.get("extra_args", ""),
     }
     return out
