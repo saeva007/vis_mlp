@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-moderate-csi", type=float, default=0.09)
     p.add_argument("--top-k", type=int, default=2)
     p.add_argument("--allow-missing-events", action="store_true")
+    p.add_argument(
+        "--allow-infeasible-fallback",
+        action="store_true",
+        help="Fill top-k with constraint-violating candidates for diagnostics only.",
+    )
     p.add_argument("--out-csv", default="")
     p.add_argument("--out-json", default="")
     return p.parse_args()
@@ -123,7 +128,7 @@ def main() -> None:
     ranked["selected_for_full_training"] = False
     feasible_idx = ranked.index[ranked["feasible"]].tolist()
     chosen_idx = feasible_idx[: max(0, args.top_k)]
-    if len(chosen_idx) < max(0, args.top_k):
+    if args.allow_infeasible_fallback and len(chosen_idx) < max(0, args.top_k):
         for idx in ranked.index:
             if idx not in chosen_idx:
                 chosen_idx.append(idx)
@@ -136,6 +141,12 @@ def main() -> None:
     ranked.to_csv(out_csv, index=False, float_format="%.8f")
 
     selected = ranked.loc[ranked["selected_for_full_training"]]
+    if selected.empty:
+        selection_status = "no_feasible_candidates"
+    elif bool((~selected["feasible"]).any()):
+        selection_status = "infeasible_fallback_selected"
+    else:
+        selection_status = "feasible_candidates_selected"
     payload = {
         "experiment_status": "candidate_only",
         "replaces_mainline": False,
@@ -149,11 +160,15 @@ def main() -> None:
         },
         "n_candidates": int(len(ranked)),
         "n_feasible": int(ranked["feasible"].sum()),
+        "selection_status": selection_status,
+        "allow_infeasible_fallback": bool(args.allow_infeasible_fallback),
         "selected": selected[[args.candidate_key, "selection_rank", "feasible"]].to_dict("records"),
         "ranking_csv": str(out_csv),
     }
     out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(ranked[["selection_rank", args.candidate_key, "feasible", "selection_fpr", "min_validation_event_recall", "selection_low_vis_csi"]].to_string(index=False))
+    if selected.empty:
+        print("[warn] No feasible candidates; no run was selected for full training.")
     print(f"[table] {out_csv}")
     print(f"[json] {out_json}")
 

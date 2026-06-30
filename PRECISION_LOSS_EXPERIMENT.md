@@ -39,6 +39,19 @@ candidate runs:
   validation false-alarm diagnostic reports at least 35% of Clear→Moderate
   false alarms in the 1000–1200 m band.
 
+If P0–P3 and their validation-only gates have no feasible solution, a separate
+recall-protection screen may be launched explicitly (these are not default
+candidates):
+
+- P5: conditional FP/FN weights `1.0/0.30`;
+- P6: conditional FP/FN weights `1.0/0.50`;
+- P7: conditional FP/FN weights `1.25/0.50`.
+
+P5–P7 retain the original sampling, class weights, Fog/Mist focal gamma, and
+soft-label windows. They do not use physical/aerosol hard-negative weights.
+The screen is intended to test whether the weakest validation event can recover
+recall before any full multi-seed training is considered.
+
 Screening reuses one Stage-1 checkpoint and trains equal-step Stage-2 jobs.
 Only the validation-selected top two configurations proceed to full S1→S2
 training with seeds 42, 314, and 2718.
@@ -113,6 +126,10 @@ python select_static_rnn_precision_candidates.py \
   --out-csv ${SCREEN_VAL_DIR}/constraint_ranking.csv \
   --out-json ${SCREEN_VAL_DIR}/constraint_ranking.json
 ```
+
+The selector does not fill `top-k` with infeasible runs by default. When
+`n_feasible=0`, `selected` is empty and no full training should be submitted.
+The optional `--allow-infeasible-fallback` flag is diagnostic-only.
 
 Then submit only those two candidate ids with three fixed seeds:
 
