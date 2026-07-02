@@ -52,6 +52,9 @@ candidate_label() {
         p5) echo "conditional_recall_guard_030" ;;
         p6) echo "conditional_recall_guard_050" ;;
         p7) echo "conditional_balanced_recall_125_050" ;;
+        p8) echo "clear_ultra_pair_lite" ;;
+        p9) echo "clear_ultra_pair_balanced" ;;
+        p10) echo "clear_ultra_pair_strong" ;;
         *) echo "ERROR: unknown precision-loss candidate: $1" >&2; exit 2 ;;
     esac
 }
@@ -81,6 +84,15 @@ candidate_args() {
             ;;
         p7)
             echo "--loss-mode designed_focal --focal-gamma-clear 0.5 --event-loss-normalization conditional --event-fp-weight 1.25 --event-fn-weight 0.50"
+            ;;
+        p8)
+            echo "--loss-mode designed_focal --focal-gamma-clear 0.5 --selection-metric csi --clear-pair-vis-min 3000 --clear-to-fog-weight 0.5 --clear-to-mist-weight 0.10 --moderate-fn-weight 0.20"
+            ;;
+        p9)
+            echo "--loss-mode designed_focal --focal-gamma-clear 0.5 --selection-metric csi --clear-pair-vis-min 3000 --clear-to-fog-weight 1.0 --clear-to-mist-weight 0.10 --moderate-fn-weight 0.25"
+            ;;
+        p10)
+            echo "--loss-mode designed_focal --focal-gamma-clear 0.5 --selection-metric csi --clear-pair-vis-min 3000 --clear-to-fog-weight 1.5 --clear-to-mist-weight 0.15 --moderate-fn-weight 0.35"
             ;;
     esac
 }

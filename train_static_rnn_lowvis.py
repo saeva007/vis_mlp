@@ -263,6 +263,30 @@ def parse_args() -> argparse.Namespace:
             "only over Low-vis samples, making their scale invariant to sampler ratios."
         ),
     )
+    p.add_argument(
+        "--clear-to-fog-weight",
+        type=float,
+        default=0.0,
+        help="Conditional penalty on Ultra-low probability for high-visibility Clear samples.",
+    )
+    p.add_argument(
+        "--clear-to-mist-weight",
+        type=float,
+        default=0.0,
+        help="Conditional penalty on Moderate-low probability for high-visibility Clear samples.",
+    )
+    p.add_argument(
+        "--clear-pair-vis-min",
+        type=float,
+        default=3000.0,
+        help="Minimum observed visibility for pair-specific Clear false-alarm penalties.",
+    )
+    p.add_argument(
+        "--moderate-fn-weight",
+        type=float,
+        default=0.0,
+        help="Conditional Moderate-low false-negative guard used with pair-specific Clear penalties.",
+    )
     p.add_argument("--label-smoothing", action="store_true", default=True)
     p.add_argument("--no-label-smoothing", dest="label_smoothing", action="store_false")
     p.add_argument("--soft-fog-mist-low", type=float, default=400.0)
@@ -305,6 +329,14 @@ def parse_args() -> argparse.Namespace:
         p.error("--event-fp-weight must be non-negative")
     if args.event_fn_weight is not None and args.event_fn_weight < 0:
         p.error("--event-fn-weight must be non-negative")
+    if args.clear_to_fog_weight < 0:
+        p.error("--clear-to-fog-weight must be non-negative")
+    if args.clear_to_mist_weight < 0:
+        p.error("--clear-to-mist-weight must be non-negative")
+    if args.clear_pair_vis_min < 1000:
+        p.error("--clear-pair-vis-min must be at least 1000 m")
+    if args.moderate_fn_weight < 0:
+        p.error("--moderate-fn-weight must be non-negative")
     return args
 
 
@@ -911,6 +943,9 @@ def combined_loss(
             "cls": float(l_cls.detach()),
             "fp": zero,
             "boost": zero,
+            "clear_fog": zero,
+            "clear_mist": zero,
+            "mist_guard": zero,
             "ord": zero,
             "reg": zero,
         }
@@ -924,6 +959,9 @@ def combined_loss(
             "cls": zero,
             "fp": zero,
             "boost": zero,
+            "clear_fog": zero,
+            "clear_mist": zero,
+            "mist_guard": zero,
             "ord": zero,
             "reg": float(l_reg.detach()),
         }
@@ -962,6 +1000,10 @@ def combined_loss(
         )
         fp_weight = float(args.alpha_clear_fp)
         boost_weight = float(args.alpha_recall_boost)
+    high_vis_clear = clear * (y_raw >= float(args.clear_pair_vis_min)).to(clear.dtype)
+    l_clear_fog = conditional_weighted_mean(probs[:, 0] ** 2, high_vis_clear, sample_weight)
+    l_clear_mist = conditional_weighted_mean(probs[:, 1] ** 2, high_vis_clear, sample_weight)
+    l_mist_guard = conditional_weighted_mean((1.0 - probs[:, 1]) ** 2, mist, sample_weight)
     if args.ordinal_cost_weight > 0:
         cls_ids = torch.arange(probs.size(1), device=probs.device, dtype=probs.dtype).unsqueeze(0)
         ordinal_distance = torch.abs(cls_ids - y.float().unsqueeze(1))
@@ -975,6 +1017,9 @@ def combined_loss(
         l_cls
         + fp_weight * l_fp
         + boost_weight * l_boost
+        + float(args.clear_to_fog_weight) * l_clear_fog
+        + float(args.clear_to_mist_weight) * l_clear_mist
+        + float(args.moderate_fn_weight) * l_mist_guard
         + args.ordinal_cost_weight * l_ord
         + args.aux_reg_weight * l_reg
     )
@@ -982,6 +1027,9 @@ def combined_loss(
         "cls": float(l_cls.detach()),
         "fp": float(l_fp.detach()),
         "boost": float(l_boost.detach()),
+        "clear_fog": float(l_clear_fog.detach()),
+        "clear_mist": float(l_clear_mist.detach()),
+        "mist_guard": float(l_mist_guard.detach()),
         "ord": float(l_ord.detach()),
         "reg": float(l_reg.detach()),
     }
@@ -1533,6 +1581,8 @@ def train_stage(
                 f"[{tag}] step={step}/{total_steps} loss={float(loss):.4f} "
                 f"cls={loss_parts['cls']:.4f} fp={loss_parts['fp']:.4f} "
                 f"boost={loss_parts['boost']:.4f} ord={loss_parts['ord']:.4f} "
+                f"cf={loss_parts['clear_fog']:.4f} cm={loss_parts['clear_mist']:.4f} "
+                f"mg={loss_parts['mist_guard']:.4f} "
                 f"reg={loss_parts['reg']:.4f} "
                 f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
                 flush=True,
@@ -1575,6 +1625,10 @@ def train_stage(
                     "event_fp_weight": float(args.alpha_clear_fp if args.event_fp_weight is None else args.event_fp_weight),
                     "event_fn_weight": float(args.alpha_recall_boost if args.event_fn_weight is None else args.event_fn_weight),
                     "event_loss_normalization": str(args.event_loss_normalization),
+                    "clear_to_fog_weight": float(args.clear_to_fog_weight),
+                    "clear_to_mist_weight": float(args.clear_to_mist_weight),
+                    "clear_pair_vis_min": float(args.clear_pair_vis_min),
+                    "moderate_fn_weight": float(args.moderate_fn_weight),
                     "label_smoothing": bool(args.label_smoothing),
                     "soft_fog_mist_low": float(args.soft_fog_mist_low),
                     "soft_fog_mist_high": float(args.soft_fog_mist_high),

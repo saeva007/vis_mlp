@@ -52,6 +52,27 @@ soft-label windows. They do not use physical/aerosol hard-negative weights.
 The screen is intended to test whether the weakest validation event can recover
 recall before any full multi-seed training is considered.
 
+If the operational objective changes from recall recovery to reducing visible
+event-footprint overprediction, use the separate pair-specific screen:
+
+- P8: light Clear→Ultra penalty on observed visibility >=3000 m;
+- P9: balanced Clear→Ultra penalty plus Moderate false-negative guard;
+- P10: stronger Clear→Ultra penalty and Moderate guard.
+
+P8–P10 keep the original sampler and soft-label windows. Unlike P1–P3, their
+extra loss does not suppress the combined Low-vis probability for every Clear
+sample. It penalizes Ultra/Moderate probability separately on unambiguously
+high-visibility Clear samples and explicitly protects Moderate-low recall.
+They use validation CSI checkpoint selection and remain candidate-only.
+
+The event-footprint screen should report argmax metrics and should prefer a
+candidate only when all of the following validation diagnostics improve over
+P0: global Clear FPR, Clear→Ultra count, event-mean predicted/observed area
+ratio, event footprint FAR, and predicted-count overshoot. Suggested screening
+targets are event-mean area ratio <=1.8, each event recall >=0.55, Ultra recall
+>=0.55, and Moderate recall >=0.25. These are screening targets rather than an
+automatic mainline promotion rule.
+
 Screening reuses one Stage-1 checkpoint and trains equal-step Stage-2 jobs.
 Only the validation-selected top two configurations proceed to full S1→S2
 training with seeds 42, 314, and 2718.
