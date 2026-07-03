@@ -46,6 +46,8 @@ from sklearn.preprocessing import RobustScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 
+from static_rnn_threshold_search import metrics_from_threshold_counts, threshold_prediction_counts
+
 # Reuse the repository's already-debugged DCU/DDP and local-copy utilities.
 from PMST_net_test_11_s2_pm10 import copy_to_local, init_distributed, safe_barrier
 
@@ -1104,15 +1106,18 @@ def score_metrics(args: argparse.Namespace, metrics: Dict[str, float]) -> float:
 def threshold_search(args: argparse.Namespace, probs: np.ndarray, y_true: np.ndarray) -> Tuple[float, Dict[str, float], Dict[str, float]]:
     grid = np.arange(args.threshold_grid_low, args.threshold_grid_high + 1e-9, args.threshold_grid_step)
     best = (-1e9, {"fog": 0.5, "mist": 0.5}, build_metrics(y_true, np.argmax(probs, axis=1)))
+    fog_counts, mist_counts, class_counts = threshold_prediction_counts(probs, y_true, grid)
     tiers = [
         (args.min_fog_precision, args.min_mist_precision, args.min_clear_recall),
         (max(0.05, args.min_fog_precision - 0.05), max(0.05, args.min_mist_precision - 0.05), max(0.84, args.min_clear_recall - 0.04)),
     ]
     for tier_id, (min_fp, min_mp, min_cr) in enumerate(tiers, start=1):
         found = False
-        for fth in grid:
-            for mth in grid:
-                metrics = build_metrics(y_true, pred_from_thresholds(probs, float(fth), float(mth)))
+        for fog_idx, fth in enumerate(grid):
+            for mist_idx, mth in enumerate(grid):
+                metrics = metrics_from_threshold_counts(
+                    fog_counts[fog_idx], mist_counts[mist_idx], class_counts
+                )
                 if metrics["Fog_P"] >= min_fp and metrics["Mist_P"] >= min_mp and metrics["Clear_R"] >= min_cr:
                     score = score_metrics(args, metrics) - 0.02 * (tier_id - 1)
                     if score > best[0]:
