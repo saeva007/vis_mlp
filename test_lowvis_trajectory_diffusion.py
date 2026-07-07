@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+import torch
+
+import lowvis_trajectory_diffusion as common
+
+
+class TrajectoryContractTests(unittest.TestCase):
+    def test_feature_and_lead_contract(self):
+        self.assertEqual(len(common.DYNAMIC_FEATURE_ORDER), 27)
+        self.assertEqual(common.CONDITION_LEADS, tuple(range(49)))
+        self.assertEqual(common.TARGET_LEADS, tuple(range(12, 49)))
+
+    def test_exact_leads_reject_gap(self):
+        leads = np.arange(49, dtype=np.float32)
+        self.assertTrue(np.array_equal(common.exact_lead_indices(leads), np.arange(49)))
+        self.assertIsNone(common.exact_lead_indices(np.delete(leads, 17)))
+
+    def test_full_trajectory_split_containment(self):
+        # January test is the final three days; this trajectory stays inside it.
+        inside = np.array("2025-01-29T00", dtype="datetime64[h]") + np.arange(12, 49).astype("timedelta64[h]")
+        self.assertEqual(common.full_trajectory_split(inside), "test")
+        crossing = np.array("2025-01-27T00", dtype="datetime64[h]") + np.arange(12, 49).astype("timedelta64[h]")
+        self.assertIsNone(common.full_trajectory_split(crossing))
+
+    def test_scaler_round_trip_and_train_only_fill(self):
+        rng = np.random.default_rng(4)
+        dynamic = rng.normal(size=(8, 49, 27)).astype(np.float32)
+        dynamic[0, 0, 0] = np.nan
+        static = rng.normal(size=(8, 5)).astype(np.float32)
+        visibility = rng.uniform(100.0, 5000.0, size=(8, 37)).astype(np.float32)
+        mask = np.ones((8, 37), dtype=bool)
+        scaler = common.TrajectoryScaler.fit_arrays(dynamic, static, visibility, mask, max_rows=8)
+        encoded = scaler.transform_target(visibility, mask)
+        decoded = scaler.inverse_target(encoded)
+        np.testing.assert_allclose(decoded, visibility, rtol=2e-5, atol=2e-3)
+        transformed, valid = scaler.transform_dynamic(dynamic[0])
+        self.assertTrue(np.isfinite(transformed).all())
+        self.assertEqual(valid[0, 0], 0.0)
+
+    def test_diffusion_forward_sampling_and_probabilities(self):
+        model = common.ConditionalTrajectoryDenoiser(
+            d_model=32, nhead=4, condition_layers=1, denoiser_layers=1, dropout=0.0
+        ).eval()
+        schedule = common.DiffusionSchedule(10)
+        batch = {
+            "condition": torch.randn(2, 49, 54),
+            "static": torch.randn(2, 5),
+            "veg": torch.tensor([1, 2]),
+            "time_features": torch.randn(2, 4),
+            "target": torch.randn(2, 37),
+            "target_mask": torch.ones(2, 37),
+        }
+        step = torch.tensor([2, 5])
+        noisy, noise = schedule.q_sample(batch["target"], step)
+        predicted = model(noisy, step, batch["condition"], batch["static"], batch["veg"], batch["time_features"])
+        self.assertEqual(tuple(predicted.shape), (2, 37))
+        self.assertTrue(torch.isfinite(common.masked_diffusion_loss(predicted, noise, batch["target_mask"])))
+        samples = common.ddim_sample(model, schedule, batch, members=2, steps=2)
+        self.assertEqual(tuple(samples.shape), (2, 2, 37))
+        probs = common.visibility_class_probabilities(np.abs(samples.numpy()) * 1200.0)
+        np.testing.assert_allclose(probs.sum(axis=-1), 1.0, atol=1e-6)
+
+    def test_gaussian_baseline_shape_and_loss(self):
+        model = common.GaussianTrajectoryModel(
+            d_model=32, nhead=4, condition_layers=1, decoder_layers=1, dropout=0.0
+        ).eval()
+        batch = {
+            "condition": torch.randn(2, 49, 54),
+            "static": torch.randn(2, 5),
+            "veg": torch.tensor([1, 2]),
+            "time_features": torch.randn(2, 4),
+            "target": torch.randn(2, 37),
+            "target_mask": torch.ones(2, 37),
+        }
+        mean, log_scale = model(batch["condition"], batch["static"], batch["veg"], batch["time_features"])
+        self.assertEqual(tuple(mean.shape), (2, 37))
+        self.assertTrue(torch.isfinite(common.masked_gaussian_nll(mean, log_scale, batch["target"], batch["target_mask"])))
+        self.assertEqual(tuple(common.gaussian_sample(model, batch, members=3).shape), (2, 3, 37))
+
+    def test_canonical_pm_policy(self):
+        policy_dir = Path(__file__).resolve().parents[1] / "ifs_baseline"
+        sys.path.insert(0, str(policy_dir))
+        sys.modules.setdefault("pvlib", types.ModuleType("pvlib"))
+        import pmst_overlap_common as policy
+
+        raw_kgm3 = np.array([1.0e-8, 2.0e-8], dtype=np.float32)
+        ugm3 = policy.canonicalize_pm_concentration(raw_kgm3, "kg m-3")
+        np.testing.assert_allclose(ugm3, [10.0, 20.0], rtol=1e-6)
+        self.assertEqual(policy.CANONICAL_UNIT_POLICY_VERSION, common.PM_UNIT_POLICY_VERSION)
+        self.assertEqual(policy.PM_QC_POLICY_VERSION, common.PM_QC_POLICY_VERSION)
+
+
+if __name__ == "__main__":
+    unittest.main()
