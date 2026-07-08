@@ -34,6 +34,11 @@ if [[ "${STAGE}" == "screen" && -z "${PRETRAINED_S1}" ]]; then
     echo "ERROR: screen stage requires LOWVIS_RNN_PRETRAINED_CKPT=<shared S1 checkpoint>." >&2
     exit 2
 fi
+if [[ "${STAGE}" == "screen" && ! -f "${PRETRAINED_S1}" ]]; then
+    echo "ERROR: screen stage S1 checkpoint not found: ${PRETRAINED_S1}" >&2
+    echo "Set MAIN_RUN_ID to a real run id before deriving LOWVIS_RNN_PRETRAINED_CKPT." >&2
+    exit 2
+fi
 
 normalize_list() {
     local value="$1"

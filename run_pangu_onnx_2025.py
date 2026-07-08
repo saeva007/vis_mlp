@@ -524,6 +524,21 @@ def build_output_dataset(
     fields["INVERSION"] = (fields["T_925"] - fields["T2M"]).astype(np.float32)
 
     ds = xr.Dataset({name: as_dataarray(fields[name], valid_time, out_lat, out_lon) for name in OUTPUT_ORDER if name in fields})
+    for name in ds.data_vars:
+        if name.startswith("Q_"):
+            ds[name].attrs.update({"units": "kg kg-1", "provenance": "native Pangu upper-air output"})
+        elif name.startswith("DP_"):
+            ds[name].attrs.update({"units": "K", "provenance": "derived from native Pangu specific humidity"})
+        elif name.startswith("RH_"):
+            ds[name].attrs.update({"units": "%", "provenance": "derived from native Pangu temperature and specific humidity"})
+        elif name.startswith("T") or name == "INVERSION":
+            ds[name].attrs["units"] = "K"
+        elif name == "MSLP":
+            ds[name].attrs["units"] = "Pa"
+        elif name.startswith(("U", "V", "WSPD")):
+            ds[name].attrs["units"] = "m s-1"
+        elif name.startswith("WDIR"):
+            ds[name].attrs["units"] = "degree"
     ds = ds.assign_coords(init_time=("time", [np.datetime64(init_time.to_datetime64())]))
     ds.attrs.update(
         {
@@ -663,6 +678,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if int(args.lead_hours) != 24:
+        raise ValueError(
+            "run_pangu_onnx_2025.py is a pangu_weather_24.onnx entry point; "
+            "--lead-hours must be 24. Relabelling a 24 h model output as 12--23 h is invalid."
+        )
+    model_lead_match = re.search(r"pangu_weather_(\d+)", Path(args.model_path).name.lower())
+    if model_lead_match and int(model_lead_match.group(1)) != 24:
+        raise ValueError(
+            f"This entry point requires pangu_weather_24.onnx, got {args.model_path}"
+        )
     save_steps = parse_steps(args.save_steps)
     max_step = max(save_steps)
     start = parse_date(args.start_date)
