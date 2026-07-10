@@ -44,15 +44,47 @@ if [[ -f "${STOP_FILE}" ]]; then
     exit 0
 fi
 
+clean_library_path() {
+    local cleaned=""
+    local part=""
+    local old_ifs="${IFS}"
+    IFS=':'
+    for part in ${LD_LIBRARY_PATH:-}; do
+        case "${part}" in
+            *"/public/home/elpt_2023_000171/anaconda3/lib"*) ;;
+            "") ;;
+            *)
+                if [[ -z "${cleaned}" ]]; then
+                    cleaned="${part}"
+                else
+                    cleaned="${cleaned}:${part}"
+                fi
+                ;;
+        esac
+    done
+    IFS="${old_ifs}"
+    export LD_LIBRARY_PATH="${cleaned}"
+    unset LD_PRELOAD || true
+    if [[ -n "${CONDA_PREFIX:-}" && -d "${CONDA_PREFIX}/lib" ]]; then
+        if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+            export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+        else
+            export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib"
+        fi
+    fi
+}
+
 source /lustre/chenxi/yliang/miniforge3/bin/activate
 module purge
 module load compiler/devtoolset/7.3.1
+clean_library_path
 
 if ! python -c "import torch" >/dev/null 2>&1; then
     echo "Base Python has no torch; loading the existing DTK/cast3 runtime for PyTorch."
     module load compiler/dtk/23.10
     module load mpi/hpcx/2.7.4/gcc-7.3.1
     source /lustre/chenxi/yliang/work/cast3/env.sh
+    clean_library_path
 fi
 
 export CUDA_VISIBLE_DEVICES=""

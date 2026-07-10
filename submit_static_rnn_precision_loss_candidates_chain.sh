@@ -60,6 +60,8 @@ candidate_label() {
         p8) echo "clear_ultra_pair_lite" ;;
         p9) echo "clear_ultra_pair_balanced" ;;
         p10) echo "clear_ultra_pair_strong" ;;
+        p11) echo "p3_event_footprint_beta050" ;;
+        p12) echo "p3_event_footprint_beta075" ;;
         *) echo "ERROR: unknown precision-loss candidate: $1" >&2; exit 2 ;;
     esac
 }
@@ -99,6 +101,12 @@ candidate_args() {
         p10)
             echo "--loss-mode designed_focal --focal-gamma-clear 0.5 --selection-metric csi --clear-pair-vis-min 3000 --clear-to-fog-weight 1.5 --clear-to-mist-weight 0.15 --moderate-fn-weight 0.35"
             ;;
+        p11)
+            echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-c-steps 5000 --s2-lr-head-c 2e-5 --phase-c-prior-beta 0.50 --event-footprint-csi-weight 0.50 --event-footprint-area-ratio-cap 1.50 --event-footprint-area-slack 0.005 --event-footprint-min-recall 0.50 --event-footprint-min-fog-count 40 --event-footprint-event-batch-ratio 0.50 --event-footprint-dual-init 1.0 --event-footprint-dual-rho 5.0 --event-footprint-dual-lr 0.05 --event-footprint-dual-max 20.0 --phase-c-selection-metric footprint_csi --phase-c-min-low-vis-recall 0.55 --phase-c-max-fpr 0.03 --phase-c-min-event-mean-recall 0.55 --phase-c-min-event-recall 0.40 --phase-c-max-event-area-ratio-mean 1.80 --phase-c-max-event-area-ratio 2.20"
+            ;;
+        p12)
+            echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-c-steps 5000 --s2-lr-head-c 2e-5 --phase-c-prior-beta 0.75 --event-footprint-csi-weight 0.50 --event-footprint-area-ratio-cap 1.50 --event-footprint-area-slack 0.005 --event-footprint-min-recall 0.50 --event-footprint-min-fog-count 40 --event-footprint-event-batch-ratio 0.50 --event-footprint-dual-init 1.0 --event-footprint-dual-rho 5.0 --event-footprint-dual-lr 0.05 --event-footprint-dual-max 20.0 --phase-c-selection-metric footprint_csi --phase-c-min-low-vis-recall 0.55 --phase-c-max-fpr 0.03 --phase-c-min-event-mean-recall 0.55 --phase-c-min-event-recall 0.40 --phase-c-max-event-area-ratio-mean 1.80 --phase-c-max-event-area-ratio 2.20"
+            ;;
     esac
 }
 
@@ -124,7 +132,11 @@ for seed in ${SEEDS}; do
         candidate_prefix="${BASE_PREFIX}_${candidate_id}_seed${seed}"
         run_id="${candidate_prefix}_2_proposed_rare_event_focal"
         s1_ckpt="${CKPT_DIR}/${run_id}_S1_best_score.pt"
-        s2_ckpt="${CKPT_DIR}/${run_id}_S2_PhaseB_best_score.pt"
+        s2_tag="S2_PhaseB"
+        if [[ "${candidate_id}" = "p11" || "${candidate_id}" = "p12" ]]; then
+            s2_tag="S2_PhaseC"
+        fi
+        s2_ckpt="${CKPT_DIR}/${run_id}_${s2_tag}_best_score.pt"
         extra_args="${COMMON_ARGS} --seed ${seed} $(candidate_args "${candidate_id}")"
         extra_args="$(echo "${extra_args}" | xargs)"
         s1_job=""

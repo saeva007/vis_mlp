@@ -18,8 +18,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--validation-event-csv", default="")
     p.add_argument("--candidate-key", default="run_id")
     p.add_argument("--event-recall-column", default="pmst_low_vis_recall_mean")
+    p.add_argument("--event-csi-column", default="pmst_low_vis_csi_mean")
+    p.add_argument("--event-area-ratio-column", default="pmst_low_vis_area_ratio_mean")
     p.add_argument("--max-fpr", type=float, default=0.04)
     p.add_argument("--min-event-recall", type=float, default=0.60)
+    p.add_argument("--min-mean-event-recall", type=float, default=0.0)
+    p.add_argument("--min-mean-event-csi", type=float, default=0.0)
+    p.add_argument("--max-mean-event-area-ratio", type=float, default=0.0)
+    p.add_argument("--max-event-area-ratio", type=float, default=0.0)
+    p.add_argument("--min-low-vis-csi", type=float, default=0.0)
+    p.add_argument("--min-low-vis-recall", type=float, default=0.0)
     p.add_argument("--min-ultra-recall", type=float, default=0.55)
     p.add_argument("--min-moderate-recall", type=float, default=0.30)
     p.add_argument("--min-moderate-csi", type=float, default=0.09)
@@ -59,6 +67,7 @@ def main() -> None:
     moderate_r_col = first_existing(summary.columns, ["Moderate_low_R", "Mist_R"])
     moderate_csi_col = first_existing(summary.columns, ["Moderate_low_CSI", "Mist_CSI"])
     low_csi_col = first_existing(summary.columns, ["Low_vis_CSI", "low_vis_csi"])
+    low_recall_col = first_existing(summary.columns, ["Low_vis_R", "low_vis_recall"])
 
     summary = summary.copy()
     summary["selection_fpr"] = numeric(summary, fpr_col)
@@ -66,6 +75,7 @@ def main() -> None:
     summary["selection_moderate_recall"] = numeric(summary, moderate_r_col)
     summary["selection_moderate_csi"] = numeric(summary, moderate_csi_col)
     summary["selection_low_vis_csi"] = numeric(summary, low_csi_col)
+    summary["selection_low_vis_recall"] = numeric(summary, low_recall_col)
 
     if args.validation_event_csv:
         events = pd.read_csv(args.validation_event_csv)
@@ -75,10 +85,27 @@ def main() -> None:
             events.columns,
             [args.event_recall_column, "pmst_low_vis_recall_mean", "low_vis_recall"],
         )
+        csi_col = first_existing(
+            events.columns,
+            [args.event_csi_column, "pmst_low_vis_csi_mean", "low_vis_csi"],
+        )
+        area_col = first_existing(
+            events.columns,
+            [args.event_area_ratio_column, "pmst_low_vis_area_ratio_mean", "low_vis_area_ratio"],
+        )
         events[recall_col] = pd.to_numeric(events[recall_col], errors="coerce")
+        events[csi_col] = pd.to_numeric(events[csi_col], errors="coerce")
+        events[area_col] = pd.to_numeric(events[area_col], errors="coerce")
         event_agg = (
-            events.groupby(args.candidate_key, dropna=False)[recall_col]
-            .agg(validation_event_count="count", min_validation_event_recall="min", mean_validation_event_recall="mean")
+            events.groupby(args.candidate_key, dropna=False)
+            .agg(
+                validation_event_count=(recall_col, "count"),
+                min_validation_event_recall=(recall_col, "min"),
+                mean_validation_event_recall=(recall_col, "mean"),
+                mean_validation_event_csi=(csi_col, "mean"),
+                mean_validation_event_area_ratio=(area_col, "mean"),
+                max_validation_event_area_ratio=(area_col, "max"),
+            )
             .reset_index()
         )
         summary = summary.merge(event_agg, on=args.candidate_key, how="left")
@@ -88,6 +115,9 @@ def main() -> None:
         summary["validation_event_count"] = 0
         summary["min_validation_event_recall"] = np.nan
         summary["mean_validation_event_recall"] = np.nan
+        summary["mean_validation_event_csi"] = np.nan
+        summary["mean_validation_event_area_ratio"] = np.nan
+        summary["max_validation_event_area_ratio"] = np.nan
 
     event_ok = (
         summary["min_validation_event_recall"].ge(args.min_event_recall)
@@ -95,13 +125,39 @@ def main() -> None:
         else pd.Series(True, index=summary.index)
     )
     summary["passes_event_recall"] = event_ok
+    if args.validation_event_csv:
+        summary["passes_mean_event_recall"] = summary["mean_validation_event_recall"].ge(args.min_mean_event_recall)
+        summary["passes_mean_event_csi"] = summary["mean_validation_event_csi"].ge(args.min_mean_event_csi)
+        summary["passes_mean_event_area"] = (
+            True
+            if args.max_mean_event_area_ratio <= 0
+            else summary["mean_validation_event_area_ratio"].le(args.max_mean_event_area_ratio)
+        )
+        summary["passes_max_event_area"] = (
+            True
+            if args.max_event_area_ratio <= 0
+            else summary["max_validation_event_area_ratio"].le(args.max_event_area_ratio)
+        )
+    else:
+        summary["passes_mean_event_recall"] = True
+        summary["passes_mean_event_csi"] = True
+        summary["passes_mean_event_area"] = True
+        summary["passes_max_event_area"] = True
     summary["passes_fpr"] = summary["selection_fpr"].le(args.max_fpr)
+    summary["passes_low_vis_csi"] = summary["selection_low_vis_csi"].ge(args.min_low_vis_csi)
+    summary["passes_low_vis_recall"] = summary["selection_low_vis_recall"].ge(args.min_low_vis_recall)
     summary["passes_ultra_recall"] = summary["selection_ultra_recall"].ge(args.min_ultra_recall)
     summary["passes_moderate_recall"] = summary["selection_moderate_recall"].ge(args.min_moderate_recall)
     summary["passes_moderate_csi"] = summary["selection_moderate_csi"].ge(args.min_moderate_csi)
     pass_cols = [
         "passes_event_recall",
+        "passes_mean_event_recall",
+        "passes_mean_event_csi",
+        "passes_mean_event_area",
+        "passes_max_event_area",
         "passes_fpr",
+        "passes_low_vis_csi",
+        "passes_low_vis_recall",
         "passes_ultra_recall",
         "passes_moderate_recall",
         "passes_moderate_csi",
@@ -113,15 +169,31 @@ def main() -> None:
         + (args.min_ultra_recall - summary["selection_ultra_recall"]).clip(lower=0.0).fillna(1.0)
         + (args.min_moderate_recall - summary["selection_moderate_recall"]).clip(lower=0.0).fillna(1.0)
         + (args.min_moderate_csi - summary["selection_moderate_csi"]).clip(lower=0.0).fillna(1.0)
+        + (args.min_low_vis_csi - summary["selection_low_vis_csi"]).clip(lower=0.0).fillna(1.0)
+        + (args.min_low_vis_recall - summary["selection_low_vis_recall"]).clip(lower=0.0).fillna(1.0)
     )
     if args.validation_event_csv:
         summary["constraint_shortfall"] += (
             args.min_event_recall - summary["min_validation_event_recall"]
         ).clip(lower=0.0).fillna(1.0)
+        summary["constraint_shortfall"] += (
+            args.min_mean_event_recall - summary["mean_validation_event_recall"]
+        ).clip(lower=0.0).fillna(1.0)
+        summary["constraint_shortfall"] += (
+            args.min_mean_event_csi - summary["mean_validation_event_csi"]
+        ).clip(lower=0.0).fillna(1.0)
+        if args.max_mean_event_area_ratio > 0:
+            summary["constraint_shortfall"] += (
+                summary["mean_validation_event_area_ratio"] - args.max_mean_event_area_ratio
+            ).clip(lower=0.0).fillna(1.0)
+        if args.max_event_area_ratio > 0:
+            summary["constraint_shortfall"] += (
+                summary["max_validation_event_area_ratio"] - args.max_event_area_ratio
+            ).clip(lower=0.0).fillna(1.0)
 
     ranked = summary.sort_values(
-        ["feasible", "constraint_shortfall", "selection_fpr", "selection_low_vis_csi", "selection_moderate_csi"],
-        ascending=[False, True, True, False, False],
+        ["feasible", "constraint_shortfall", "mean_validation_event_area_ratio", "selection_fpr", "selection_low_vis_csi", "selection_moderate_csi"],
+        ascending=[False, True, True, True, False, False],
         kind="stable",
     ).reset_index(drop=True)
     ranked.insert(0, "selection_rank", np.arange(1, len(ranked) + 1))
@@ -154,6 +226,12 @@ def main() -> None:
         "constraints": {
             "max_fpr": args.max_fpr,
             "min_event_recall": args.min_event_recall,
+            "min_mean_event_recall": args.min_mean_event_recall,
+            "min_mean_event_csi": args.min_mean_event_csi,
+            "max_mean_event_area_ratio": args.max_mean_event_area_ratio,
+            "max_event_area_ratio": args.max_event_area_ratio,
+            "min_low_vis_csi": args.min_low_vis_csi,
+            "min_low_vis_recall": args.min_low_vis_recall,
             "min_ultra_recall": args.min_ultra_recall,
             "min_moderate_recall": args.min_moderate_recall,
             "min_moderate_csi": args.min_moderate_csi,
@@ -166,7 +244,20 @@ def main() -> None:
         "ranking_csv": str(out_csv),
     }
     out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(ranked[["selection_rank", args.candidate_key, "feasible", "selection_fpr", "min_validation_event_recall", "selection_low_vis_csi"]].to_string(index=False))
+    print(
+        ranked[
+            [
+                "selection_rank",
+                args.candidate_key,
+                "feasible",
+                "selection_fpr",
+                "min_validation_event_recall",
+                "mean_validation_event_csi",
+                "mean_validation_event_area_ratio",
+                "selection_low_vis_csi",
+            ]
+        ].to_string(index=False)
+    )
     if selected.empty:
         print("[warn] No feasible candidates; no run was selected for full training.")
     print(f"[table] {out_csv}")

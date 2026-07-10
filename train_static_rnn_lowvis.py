@@ -37,6 +37,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import joblib
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -76,6 +77,22 @@ class Layout:
     @property
     def total_expected_dim(self) -> int:
         return self.split_dyn + 5 + 1 + self.fe_dim
+
+
+@dataclass
+class TimeGroupIndex:
+    order: np.ndarray
+    group_values: np.ndarray
+    starts: np.ndarray
+    counts: np.ndarray
+    fog_counts: np.ndarray
+    low_vis_counts: np.ndarray
+
+
+@dataclass
+class FootprintDualState:
+    area: float
+    recall: float
 
 
 class StratifiedBalancedBatchSampler(Sampler[List[int]]):
@@ -137,6 +154,72 @@ class StratifiedBalancedBatchSampler(Sampler[List[int]]):
         return self.epoch_length
 
 
+class EventTimeBatchSampler(Sampler[List[int]]):
+    """Sample natural station sets within one valid time per batch."""
+
+    def __init__(
+        self,
+        group_index: TimeGroupIndex,
+        batch_size: int,
+        min_fog_count: int,
+        event_batch_ratio: float,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 42,
+        epoch_length: int = 2000,
+    ) -> None:
+        self.group_index = group_index
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.epoch_length = int(epoch_length)
+        self.epoch = 0
+        self.event_batch_ratio = float(event_batch_ratio)
+
+        event = np.flatnonzero(group_index.fog_counts >= int(min_fog_count))
+        background = np.flatnonzero(group_index.fog_counts < int(min_fog_count))
+        self.event_groups = self._rank_shard(event)
+        self.background_groups = self._rank_shard(background)
+        self.all_groups = self._rank_shard(np.arange(len(group_index.starts), dtype=np.int64))
+        if len(self.all_groups) == 0:
+            raise ValueError("EventTimeBatchSampler received no valid-time groups")
+        self.event_group_values = set(
+            np.asarray(group_index.group_values[event], dtype=np.int64).tolist()
+        )
+
+    def _rank_shard(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.int64)
+        if len(values) == 0:
+            return values
+        chunks = np.array_split(values, max(1, self.world_size))
+        shard = chunks[self.rank % len(chunks)]
+        return shard if len(shard) else values
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        rng = np.random.default_rng(self.seed + self.rank + 1543 * self.epoch)
+        for _ in range(self.epoch_length):
+            use_event = len(self.event_groups) > 0 and rng.random() < self.event_batch_ratio
+            pool = self.event_groups if use_event else self.background_groups
+            if len(pool) == 0:
+                pool = self.all_groups
+            group_pos = int(rng.choice(pool))
+            start = int(self.group_index.starts[group_pos])
+            count = int(self.group_index.counts[group_pos])
+            rows = self.group_index.order[start : start + count]
+            chosen = rng.choice(rows, size=self.batch_size, replace=count < self.batch_size)
+            yield np.asarray(chosen, dtype=np.int64).tolist()
+
+    def __len__(self) -> int:
+        return self.epoch_length
+
+    def is_event_group(self, group_id: int) -> bool:
+        return int(group_id) in self.event_group_values
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Static MLP + GRU/LSTM low-vis training")
 
@@ -195,6 +278,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s1-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S1_STEPS", "15000")))
     p.add_argument("--s2-phase-a-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_A_STEPS", "8000")))
     p.add_argument("--s2-phase-b-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_B_STEPS", "22000")))
+    p.add_argument("--s2-phase-c-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_C_STEPS", "0")))
     p.add_argument("--val-interval", type=int, default=int(os.environ.get("LOWVIS_RNN_VAL_INTERVAL", "500")))
     p.add_argument("--batch-size", type=int, default=int(os.environ.get("LOWVIS_RNN_BATCH_SIZE", "512")))
     p.add_argument("--grad-accum", type=int, default=int(os.environ.get("LOWVIS_RNN_GRAD_ACCUM", "2")))
@@ -216,6 +300,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-lr-head-a", type=float, default=8e-5)
     p.add_argument("--s2-lr-backbone-b", type=float, default=3e-6)
     p.add_argument("--s2-lr-head-b", type=float, default=1e-5)
+    p.add_argument("--s2-lr-head-c", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--grad-clip", type=float, default=0.5)
@@ -309,7 +394,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ordinal-cost-weight", type=float, default=0.0, help="Penalty on probability mass assigned far from the ordered target class.")
     p.add_argument("--sample-weight-cap", type=float, default=4.0)
 
-    p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall"], default="recall_csi")
+    p.add_argument(
+        "--phase-c-prior-beta",
+        type=float,
+        default=0.0,
+        help=(
+            "Tempered natural/sampler prior correction applied only to the Phase-C focal term. "
+            "Zero preserves historical behavior."
+        ),
+    )
+    p.add_argument("--event-footprint-csi-weight", type=float, default=0.0)
+    p.add_argument("--event-footprint-area-ratio-cap", type=float, default=1.5)
+    p.add_argument("--event-footprint-area-slack", type=float, default=0.005)
+    p.add_argument("--event-footprint-min-recall", type=float, default=0.50)
+    p.add_argument("--event-footprint-min-fog-count", type=int, default=40)
+    p.add_argument("--event-footprint-event-batch-ratio", type=float, default=0.50)
+    p.add_argument("--event-footprint-smoothmax-temperature", type=float, default=0.10)
+    p.add_argument("--event-footprint-decision-temperature", type=float, default=0.15)
+    p.add_argument("--event-footprint-dual-init", type=float, default=1.0)
+    p.add_argument("--event-footprint-dual-rho", type=float, default=5.0)
+    p.add_argument("--event-footprint-dual-lr", type=float, default=0.05)
+    p.add_argument("--event-footprint-dual-max", type=float, default=20.0)
+
+    p.add_argument(
+        "--phase-c-selection-metric",
+        choices=["recall_csi", "csi", "recall", "footprint_csi"],
+        default="footprint_csi",
+    )
+    p.add_argument("--phase-c-min-low-vis-recall", type=float, default=0.55)
+    p.add_argument("--phase-c-max-fpr", type=float, default=0.03)
+    p.add_argument("--phase-c-min-event-mean-recall", type=float, default=0.55)
+    p.add_argument("--phase-c-min-event-recall", type=float, default=0.40)
+    p.add_argument("--phase-c-max-event-area-ratio-mean", type=float, default=1.80)
+    p.add_argument("--phase-c-max-event-area-ratio", type=float, default=2.20)
+
+    p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall", "footprint_csi"], default="recall_csi")
     p.add_argument(
         "--threshold-mode",
         choices=["val_search", "argmax"],
@@ -339,6 +458,26 @@ def parse_args() -> argparse.Namespace:
         p.error("--clear-pair-vis-min must be at least 1000 m")
     if args.moderate_fn_weight < 0:
         p.error("--moderate-fn-weight must be non-negative")
+    if not 0.0 <= args.phase_c_prior_beta <= 1.0:
+        p.error("--phase-c-prior-beta must be within [0, 1]")
+    if args.s2_phase_c_steps < 0:
+        p.error("--s2-phase-c-steps must be non-negative")
+    if args.event_footprint_csi_weight < 0:
+        p.error("--event-footprint-csi-weight must be non-negative")
+    if args.event_footprint_area_ratio_cap <= 0:
+        p.error("--event-footprint-area-ratio-cap must be positive")
+    if args.event_footprint_area_slack < 0:
+        p.error("--event-footprint-area-slack must be non-negative")
+    if not 0.0 <= args.event_footprint_min_recall <= 1.0:
+        p.error("--event-footprint-min-recall must be within [0, 1]")
+    if not 0.0 <= args.event_footprint_event_batch_ratio <= 1.0:
+        p.error("--event-footprint-event-batch-ratio must be within [0, 1]")
+    if args.event_footprint_smoothmax_temperature <= 0 or args.event_footprint_decision_temperature <= 0:
+        p.error("event-footprint temperatures must be positive")
+    if args.event_footprint_dual_init < 0 or args.event_footprint_dual_rho < 0:
+        p.error("event-footprint dual init/rho must be non-negative")
+    if args.event_footprint_dual_lr < 0 or args.event_footprint_dual_max <= 0:
+        p.error("event-footprint dual lr/max are invalid")
     return args
 
 
@@ -561,6 +700,106 @@ def scaler_cache_path(args: argparse.Namespace, stage: str, layout: Layout, use_
     return os.path.join(args.ckpt_dir, name)
 
 
+def event_footprint_enabled(args: argparse.Namespace) -> bool:
+    return bool(args.s2_phase_c_steps > 0 and args.event_footprint_csi_weight > 0)
+
+
+def build_time_group_index(group_ids: np.ndarray, y_cls: np.ndarray) -> TimeGroupIndex:
+    groups = np.asarray(group_ids, dtype=np.int64)
+    labels = np.asarray(y_cls, dtype=np.int64)
+    if groups.ndim != 1 or labels.ndim != 1 or len(groups) != len(labels):
+        raise ValueError("group_ids and y_cls must be aligned one-dimensional arrays")
+    if len(groups) == 0:
+        raise ValueError("cannot build an event-time index for an empty dataset")
+    order = np.argsort(groups, kind="stable")
+    sorted_groups = groups[order]
+    starts = np.r_[0, np.flatnonzero(sorted_groups[1:] != sorted_groups[:-1]) + 1].astype(np.int64)
+    counts = np.diff(np.r_[starts, len(order)]).astype(np.int64)
+    sorted_labels = labels[order]
+    fog_counts = np.add.reduceat((sorted_labels == 0).astype(np.int64), starts)
+    low_vis_counts = np.add.reduceat((sorted_labels <= 1).astype(np.int64), starts)
+    return TimeGroupIndex(
+        order=order.astype(np.int64, copy=False),
+        group_values=sorted_groups[starts].astype(np.int64, copy=False),
+        starts=starts,
+        counts=counts,
+        fog_counts=fog_counts.astype(np.int64, copy=False),
+        low_vis_counts=low_vis_counts.astype(np.int64, copy=False),
+    )
+
+
+def ensure_time_group_ids(
+    args: argparse.Namespace,
+    data_dir: str,
+    stage: str,
+    split: str,
+    n_rows: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    meta_path = os.path.join(data_dir, f"meta_{split}.csv")
+    if not os.path.isfile(meta_path):
+        raise FileNotFoundError(f"Phase-C event footprint requires {meta_path}")
+    cache_path = os.path.join(args.ckpt_dir, f"{args.run_id}_{stage}_{split}_time_group_ids.npy")
+    safe_barrier(world_size, device)
+    if rank == 0 and not os.path.isfile(cache_path):
+        tmp_path = cache_path + ".tmp.npy"
+        out = np.lib.format.open_memmap(tmp_path, mode="w+", dtype=np.int64, shape=(int(n_rows),))
+        offset = 0
+        for chunk in pd.read_csv(meta_path, usecols=["time"], chunksize=1_000_000):
+            times = pd.to_datetime(chunk["time"], errors="coerce", utc=True)
+            values = times.astype("int64", copy=False).to_numpy(dtype=np.int64, copy=False)
+            if np.any(values == np.iinfo(np.int64).min):
+                raise ValueError(f"Unparseable time values in {meta_path}")
+            end = offset + len(values)
+            if end > n_rows:
+                raise ValueError(f"{meta_path} has more than the expected {n_rows} rows")
+            out[offset:end] = values
+            offset = end
+        out.flush()
+        del out
+        if offset != n_rows:
+            raise ValueError(f"{meta_path} has {offset} rows, expected {n_rows}")
+        os.replace(tmp_path, cache_path)
+        print(f"[EventFootprint] cached time groups: {cache_path}", flush=True)
+    safe_barrier(world_size, device)
+    groups = np.load(cache_path, mmap_mode="r")
+    if len(groups) != n_rows:
+        raise ValueError(f"time-group cache length mismatch: {len(groups)} != {n_rows}")
+    return groups
+
+
+def ensure_train_group_index(
+    args: argparse.Namespace,
+    stage: str,
+    group_ids: np.ndarray,
+    y_cls: np.ndarray,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> TimeGroupIndex:
+    prefix = os.path.join(args.ckpt_dir, f"{args.run_id}_{stage}_train_time_index")
+    paths = {
+        "order": prefix + "_order.npy",
+        "group_values": prefix + "_group_values.npy",
+        "starts": prefix + "_starts.npy",
+        "counts": prefix + "_counts.npy",
+        "fog_counts": prefix + "_fog_counts.npy",
+        "low_vis_counts": prefix + "_low_vis_counts.npy",
+    }
+    safe_barrier(world_size, device)
+    if rank == 0 and not all(os.path.isfile(path) for path in paths.values()):
+        index = build_time_group_index(group_ids, y_cls)
+        for name, path in paths.items():
+            tmp_path = path + ".tmp.npy"
+            np.save(tmp_path, getattr(index, name))
+            os.replace(tmp_path, path)
+        print(f"[EventFootprint] cached train time index: {prefix}", flush=True)
+    safe_barrier(world_size, device)
+    return TimeGroupIndex(**{name: np.load(path, mmap_mode="r") for name, path in paths.items()})
+
+
 class LowVisDataset(Dataset):
     def __init__(
         self,
@@ -572,6 +811,8 @@ class LowVisDataset(Dataset):
         use_fe: bool,
         use_pm: bool,
         args: argparse.Namespace,
+        time_group_ids: Optional[np.ndarray] = None,
+        time_group_index: Optional[TimeGroupIndex] = None,
     ) -> None:
         self.x_path = x_path
         self.layout = layout
@@ -579,6 +820,8 @@ class LowVisDataset(Dataset):
         self.use_fe = bool(use_fe)
         self.use_pm = bool(use_pm)
         self.args = args
+        self.time_group_ids = time_group_ids
+        self.time_group_index = time_group_index
         self.y_raw = torch.as_tensor(np.maximum(y_raw, 0.0), dtype=torch.float32)
         self.y_cls = torch.as_tensor(y_cls, dtype=torch.long)
         self.y_reg = torch.log1p(self.y_raw)
@@ -650,7 +893,15 @@ class LowVisDataset(Dataset):
             parts.append(np.clip(fe.astype(np.float32), -10.0, 10.0))
         final = np.nan_to_num(np.concatenate(parts), nan=0.0, posinf=10.0, neginf=-10.0)
         sample_weight = np.asarray(self._physical_weight(row, idx), dtype=np.float32)
-        return torch.from_numpy(final).float(), self.y_cls[idx], self.y_reg[idx], self.y_raw[idx], torch.from_numpy(sample_weight)
+        group_id = -1 if self.time_group_ids is None else int(self.time_group_ids[idx])
+        return (
+            torch.from_numpy(final).float(),
+            self.y_cls[idx],
+            self.y_reg[idx],
+            self.y_raw[idx],
+            torch.from_numpy(sample_weight),
+            torch.tensor(group_id, dtype=torch.long),
+        )
 
 
 def load_split_paths(
@@ -730,8 +981,42 @@ def load_data(
     if len(y_raw_va) != np.load(x_va, mmap_mode="r").shape[0]:
         raise ValueError("val X/y length mismatch")
     scaler = fit_or_load_scaler(args, stage, x_tr, layout, use_pm, rank, world_size, device)
-    tr_ds = LowVisDataset(x_tr, y_raw_tr, y_cls_tr, layout, scaler, use_fe, use_pm, args)
-    va_ds = LowVisDataset(x_va, y_raw_va, y_cls_va, layout, scaler, use_fe, use_pm, args)
+    train_groups = None
+    val_groups = None
+    train_group_index = None
+    if stage == "s2" and event_footprint_enabled(args):
+        train_groups = ensure_time_group_ids(
+            args, data_dir, stage, "train", len(y_cls_tr), rank, world_size, device
+        )
+        val_groups = ensure_time_group_ids(
+            args, data_dir, stage, "val", len(y_cls_va), rank, world_size, device
+        )
+        train_group_index = ensure_train_group_index(
+            args, stage, train_groups, y_cls_tr, rank, world_size, device
+        )
+    tr_ds = LowVisDataset(
+        x_tr,
+        y_raw_tr,
+        y_cls_tr,
+        layout,
+        scaler,
+        use_fe,
+        use_pm,
+        args,
+        time_group_ids=train_groups,
+        time_group_index=train_group_index,
+    )
+    va_ds = LowVisDataset(
+        x_va,
+        y_raw_va,
+        y_cls_va,
+        layout,
+        scaler,
+        use_fe,
+        use_pm,
+        args,
+        time_group_ids=val_groups,
+    )
     rank0(rank, f"[Data:{stage}] train={len(tr_ds)} val={len(va_ds)} layout={layout} use_fe={use_fe} use_pm={use_pm}")
     return tr_ds, va_ds, layout, scaler
 
@@ -924,6 +1209,91 @@ def conditional_weighted_mean(
     return torch.sum(value * weights) / denom.clamp_min(1e-6)
 
 
+def class_prior_correction_weights(
+    y_cls: np.ndarray,
+    sampler_prior: np.ndarray,
+    beta: float,
+) -> np.ndarray:
+    beta = float(beta)
+    if beta <= 0:
+        return np.ones(3, dtype=np.float32)
+    counts = np.bincount(np.asarray(y_cls, dtype=np.int64), minlength=3).astype(np.float64)
+    natural_prior = counts / max(float(counts.sum()), 1.0)
+    sampler = np.asarray(sampler_prior, dtype=np.float64)
+    if sampler.shape != (3,) or np.any(sampler <= 0):
+        raise ValueError(f"sampler_prior must contain three positive values, got {sampler}")
+    weights = np.power(natural_prior / sampler, beta)
+    return weights.astype(np.float32)
+
+
+def event_footprint_loss(
+    args: argparse.Namespace,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    dual_state: FootprintDualState,
+    is_widespread_event: Optional[bool] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    smooth_t = float(args.event_footprint_smoothmax_temperature)
+    decision_t = float(args.event_footprint_decision_temperature)
+    low_logit = smooth_t * torch.logsumexp(logits[:, :2] / smooth_t, dim=1)
+    soft_low = torch.sigmoid((low_logit - logits[:, 2]) / decision_t)
+    low_true = (labels <= 1).to(dtype=logits.dtype)
+    obs_area = low_true.mean()
+    pred_area = soft_low.mean()
+    tp = torch.mean(soft_low * low_true)
+    fp = torch.mean(soft_low * (1.0 - low_true))
+    fn = torch.mean((1.0 - soft_low) * low_true)
+    soft_csi = tp / (tp + fp + fn).clamp_min(1e-6)
+    soft_recall = tp / obs_area.clamp_min(1e-6)
+    has_low_vis = (torch.sum(low_true) > 0).to(dtype=logits.dtype)
+    if is_widespread_event is None:
+        is_widespread = (torch.sum(labels == 0) >= int(args.event_footprint_min_fog_count)).to(dtype=logits.dtype)
+    else:
+        is_widespread = logits.new_tensor(float(bool(is_widespread_event)))
+
+    area_violation = F.relu(
+        pred_area
+        - float(args.event_footprint_area_ratio_cap) * obs_area
+        - float(args.event_footprint_area_slack)
+    )
+    recall_violation = F.relu(float(args.event_footprint_min_recall) - soft_recall) * is_widespread
+    rho = float(args.event_footprint_dual_rho)
+    loss = (
+        float(args.event_footprint_csi_weight) * (1.0 - soft_csi) * has_low_vis
+        + float(dual_state.area) * area_violation
+        + 0.5 * rho * area_violation.square()
+        + float(dual_state.recall) * recall_violation
+        + 0.5 * rho * recall_violation.square()
+    )
+    return loss, {
+        "footprint": loss,
+        "soft_csi": soft_csi,
+        "soft_recall": soft_recall,
+        "pred_area": pred_area,
+        "obs_area": obs_area,
+        "area_violation": area_violation,
+        "recall_violation": recall_violation,
+        "is_widespread": is_widespread,
+    }
+
+
+def update_footprint_duals(
+    args: argparse.Namespace,
+    state: FootprintDualState,
+    area_violation: torch.Tensor,
+    recall_violation: torch.Tensor,
+    world_size: int,
+) -> None:
+    violations = torch.stack([area_violation.detach(), recall_violation.detach()]).to(dtype=torch.float32)
+    if world_size > 1:
+        dist.all_reduce(violations, op=dist.ReduceOp.SUM)
+        violations /= float(world_size)
+    lr = float(args.event_footprint_dual_lr)
+    upper = float(args.event_footprint_dual_max)
+    state.area = float(np.clip(state.area + lr * float(violations[0].item()), 0.0, upper))
+    state.recall = float(np.clip(state.recall + lr * float(violations[1].item()), 0.0, upper))
+
+
 def combined_loss(
     args: argparse.Namespace,
     focal: WeightedFocalLoss,
@@ -933,6 +1303,7 @@ def combined_loss(
     y_reg: torch.Tensor,
     y_raw: torch.Tensor,
     sample_weight: Optional[torch.Tensor],
+    focal_prior_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     loss_mode = getattr(args, "loss_mode", "designed_focal")
 
@@ -980,7 +1351,11 @@ def combined_loss(
         if args.label_smoothing
         else None
     )
-    l_cls = focal(logits, y, soft, sample_weight, 0.0)
+    focal_sample_weight = sample_weight
+    if focal_prior_weights is not None:
+        prior = focal_prior_weights.to(logits.device, dtype=logits.dtype)[y]
+        focal_sample_weight = prior if sample_weight is None else sample_weight * prior
+    l_cls = focal(logits, y, soft, focal_sample_weight, 0.0)
     probs = torch.softmax(logits, dim=1)
     clear = (y == 2).float()
     fog = (y == 0).float()
@@ -1088,10 +1463,108 @@ def build_metrics(y_true: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
     }
 
 
-def score_metrics(args: argparse.Namespace, metrics: Dict[str, float]) -> float:
-    if args.selection_metric == "csi":
+def event_group_metrics(
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    group_ids: np.ndarray,
+    min_fog_count: int,
+) -> Dict[str, float]:
+    labels = np.asarray(y_true, dtype=np.int64)
+    predictions = np.asarray(pred, dtype=np.int64)
+    groups = np.asarray(group_ids, dtype=np.int64)
+    valid = groups >= 0
+    if not np.any(valid):
+        return {}
+    labels = labels[valid]
+    predictions = predictions[valid]
+    groups = groups[valid]
+    _, inverse = np.unique(groups, return_inverse=True)
+    low_true = labels <= 1
+    low_pred = predictions <= 1
+    fog_true = labels == 0
+    n_groups = int(inverse.max()) + 1
+    obs_low = np.bincount(inverse, weights=low_true.astype(np.float64), minlength=n_groups)
+    obs_fog = np.bincount(inverse, weights=fog_true.astype(np.float64), minlength=n_groups)
+    pred_low = np.bincount(inverse, weights=low_pred.astype(np.float64), minlength=n_groups)
+    tp = np.bincount(inverse, weights=(low_true & low_pred).astype(np.float64), minlength=n_groups)
+    fp = np.bincount(inverse, weights=(~low_true & low_pred).astype(np.float64), minlength=n_groups)
+    fn = np.bincount(inverse, weights=(low_true & ~low_pred).astype(np.float64), minlength=n_groups)
+    event = (obs_fog >= int(min_fog_count)) & (obs_low > 0)
+    if not np.any(event):
+        return {"event_group_count": 0.0}
+    recall = tp[event] / np.maximum(obs_low[event], 1.0)
+    csi = tp[event] / np.maximum(tp[event] + fp[event] + fn[event], 1.0)
+    area_ratio = pred_low[event] / np.maximum(obs_low[event], 1.0)
+    return {
+        "event_group_count": float(np.sum(event)),
+        "event_low_vis_recall_mean": float(np.mean(recall)),
+        "event_low_vis_recall_min": float(np.min(recall)),
+        "event_low_vis_csi_mean": float(np.mean(csi)),
+        "event_low_vis_area_ratio_mean": float(np.mean(area_ratio)),
+        "event_low_vis_area_ratio_max": float(np.max(area_ratio)),
+    }
+
+
+def footprint_constraint_shortfall(args: argparse.Namespace, metrics: Dict[str, float]) -> float:
+    terms = [
+        max(0.0, float(args.phase_c_min_low_vis_recall) - metrics.get("low_vis_recall", 0.0))
+        / max(float(args.phase_c_min_low_vis_recall), 1e-6),
+        max(0.0, metrics.get("false_positive_rate", 1.0) - float(args.phase_c_max_fpr))
+        / max(float(args.phase_c_max_fpr), 1e-6),
+    ]
+    if metrics.get("event_group_count", 0.0) > 0:
+        terms.extend(
+            [
+                max(
+                    0.0,
+                    float(args.phase_c_min_event_mean_recall)
+                    - metrics.get("event_low_vis_recall_mean", 0.0),
+                )
+                / max(float(args.phase_c_min_event_mean_recall), 1e-6),
+                max(
+                    0.0,
+                    float(args.phase_c_min_event_recall)
+                    - metrics.get("event_low_vis_recall_min", 0.0),
+                )
+                / max(float(args.phase_c_min_event_recall), 1e-6),
+                max(
+                    0.0,
+                    metrics.get("event_low_vis_area_ratio_mean", float("inf"))
+                    - float(args.phase_c_max_event_area_ratio_mean),
+                )
+                / max(float(args.phase_c_max_event_area_ratio_mean), 1e-6),
+                max(
+                    0.0,
+                    metrics.get("event_low_vis_area_ratio_max", float("inf"))
+                    - float(args.phase_c_max_event_area_ratio),
+                )
+                / max(float(args.phase_c_max_event_area_ratio), 1e-6),
+            ]
+        )
+    else:
+        # A footprint-selected checkpoint must have auditable event groups.
+        terms.append(4.0)
+    return float(np.sum(terms))
+
+
+def score_metrics(
+    args: argparse.Namespace,
+    metrics: Dict[str, float],
+    selection_metric: Optional[str] = None,
+) -> float:
+    metric_name = selection_metric or args.selection_metric
+    if metric_name == "footprint_csi":
+        base = (
+            0.55 * metrics["low_vis_csi"]
+            + 0.15 * metrics["Fog_CSI"]
+            + 0.15 * metrics["Mist_CSI"]
+            + 0.15 * metrics["low_vis_precision"]
+            - 0.25 * metrics["false_positive_rate"]
+        )
+        return float(base - 2.0 * footprint_constraint_shortfall(args, metrics))
+    if metric_name == "csi":
         return 0.45 * metrics["Fog_CSI"] + 0.45 * metrics["Mist_CSI"] + 0.10 * metrics["low_vis_precision"] - 0.05 * metrics["false_positive_rate"]
-    if args.selection_metric == "recall":
+    if metric_name == "recall":
         return 0.45 * metrics["Fog_R"] + 0.45 * metrics["Mist_R"] + 0.10 * metrics["low_vis_precision"] - 0.10 * metrics["false_positive_rate"]
     return (
         0.25 * metrics["Fog_CSI"]
@@ -1132,10 +1605,12 @@ def threshold_search(args: argparse.Namespace, probs: np.ndarray, y_true: np.nda
 def gather_eval_arrays(
     probs: torch.Tensor,
     targets: torch.Tensor,
+    group_ids: Optional[torch.Tensor],
     world_size: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     if world_size <= 1:
-        return probs.cpu().numpy(), targets.cpu().numpy()
+        groups_np = group_ids.cpu().numpy() if group_ids is not None else None
+        return probs.cpu().numpy(), targets.cpu().numpy(), groups_np
     local_n = torch.tensor([probs.shape[0]], dtype=torch.long, device=probs.device)
     max_n = local_n.clone()
     dist.all_reduce(max_n, op=dist.ReduceOp.MAX)
@@ -1143,6 +1618,11 @@ def gather_eval_arrays(
     if pad_n:
         probs = torch.cat([probs, torch.zeros((pad_n, probs.shape[1]), dtype=probs.dtype, device=probs.device)], dim=0)
         targets = torch.cat([targets, torch.full((pad_n,), -1, dtype=targets.dtype, device=targets.device)], dim=0)
+        if group_ids is not None:
+            group_ids = torch.cat(
+                [group_ids, torch.full((pad_n,), -1, dtype=group_ids.dtype, device=group_ids.device)],
+                dim=0,
+            )
     gp = [torch.zeros_like(probs) for _ in range(world_size)]
     gt = [torch.zeros_like(targets) for _ in range(world_size)]
     dist.all_gather(gp, probs)
@@ -1150,7 +1630,12 @@ def gather_eval_arrays(
     all_probs = torch.cat(gp, dim=0).cpu().numpy()
     all_targets = torch.cat(gt, dim=0).cpu().numpy()
     m = all_targets >= 0
-    return all_probs[m], all_targets[m]
+    all_groups = None
+    if group_ids is not None:
+        gg = [torch.zeros_like(group_ids) for _ in range(world_size)]
+        dist.all_gather(gg, group_ids)
+        all_groups = torch.cat(gg, dim=0).cpu().numpy()[m]
+    return all_probs[m], all_targets[m], all_groups
 
 
 def evaluate(
@@ -1161,11 +1646,12 @@ def evaluate(
     rank: int,
     world_size: int,
     n_actual: int,
+    selection_metric: Optional[str] = None,
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
     model.eval()
-    probs_l, targets_l, reg_l = [], [], []
+    probs_l, targets_l, reg_l, groups_l = [], [], [], []
     with torch.no_grad():
-        for bx, by, _, braw, _ in loader:
+        for bx, by, _, braw, _, bgroups in loader:
             bx = bx.to(device, non_blocking=True)
             logits, reg = model(bx)
             if getattr(args, "loss_mode", "designed_focal") == "regression":
@@ -1173,10 +1659,12 @@ def evaluate(
             else:
                 probs_l.append(torch.softmax(logits, dim=1))
             targets_l.append(by.to(device))
+            groups_l.append(bgroups.to(device))
     targets = torch.cat(targets_l, dim=0)
+    group_ids = torch.cat(groups_l, dim=0)
     if getattr(args, "loss_mode", "designed_focal") == "regression":
         reg_pack = torch.cat(reg_l, dim=0)
-        all_reg, all_targets = gather_eval_arrays(reg_pack, targets, world_size)
+        all_reg, all_targets, _ = gather_eval_arrays(reg_pack, targets, None, world_size)
         all_reg = all_reg[:n_actual]
         all_targets = all_targets[:n_actual]
         if rank == 0:
@@ -1187,18 +1675,33 @@ def evaluate(
             err = vis_pred - vis_true
             metrics["regression_mae_m"] = float(np.mean(np.abs(err)))
             metrics["regression_rmse_m"] = float(np.sqrt(np.mean(err ** 2)))
-            return score_metrics(args, metrics), {"fog_vis_m": 500.0, "mist_vis_m": 1000.0}, metrics
+            return score_metrics(args, metrics, selection_metric), {"fog_vis_m": 500.0, "mist_vis_m": 1000.0}, metrics
         return -1.0, {"fog_vis_m": 500.0, "mist_vis_m": 1000.0}, {}
 
     probs = torch.cat(probs_l, dim=0)
-    all_probs, all_targets = gather_eval_arrays(probs, targets, world_size)
+    all_probs, all_targets, all_groups = gather_eval_arrays(probs, targets, group_ids, world_size)
     all_probs = all_probs[:n_actual]
     all_targets = all_targets[:n_actual]
+    if all_groups is not None:
+        all_groups = all_groups[:n_actual]
     if rank == 0:
         if args.threshold_mode == "argmax":
             pred = np.argmax(all_probs, axis=1)
             metrics = build_metrics(all_targets.astype(np.int64), pred)
-            score = score_metrics(args, metrics)
+            if all_groups is not None:
+                metrics.update(
+                    event_group_metrics(
+                        all_targets.astype(np.int64),
+                        pred,
+                        all_groups,
+                        args.event_footprint_min_fog_count,
+                    )
+                )
+            score = score_metrics(args, metrics, selection_metric)
+            if (selection_metric or args.selection_metric) == "footprint_csi":
+                shortfall = footprint_constraint_shortfall(args, metrics)
+                metrics["selection_constraint_shortfall"] = shortfall
+                metrics["selection_feasible"] = float(shortfall <= 1e-12)
             th = {"mode": "argmax"}
         else:
             score, th, metrics = threshold_search(args, all_probs, all_targets.astype(np.int64))
@@ -1446,6 +1949,41 @@ def make_loaders(
     return train_loader, val_loader, sampler
 
 
+def make_event_footprint_loader(
+    args: argparse.Namespace,
+    train_ds: LowVisDataset,
+    rank: int,
+    world_size: int,
+) -> Tuple[DataLoader, EventTimeBatchSampler]:
+    if train_ds.time_group_index is None:
+        raise ValueError("Phase-C event footprint requires a train time-group index")
+
+    def worker_init_fn(worker_id: int) -> None:
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            info.dataset.X = None
+
+    sampler = EventTimeBatchSampler(
+        train_ds.time_group_index,
+        args.batch_size,
+        min_fog_count=args.event_footprint_min_fog_count,
+        event_batch_ratio=args.event_footprint_event_batch_ratio,
+        rank=rank,
+        world_size=world_size,
+        seed=args.seed + 7001,
+        epoch_length=args.epoch_length,
+    )
+    loader_kwargs = {
+        "batch_sampler": sampler,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "worker_init_fn": worker_init_fn,
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 1, "timeout": 900})
+    return DataLoader(train_ds, **loader_kwargs), sampler
+
+
 def sampling_metadata(
     args: argparse.Namespace,
     train_ds: LowVisDataset,
@@ -1523,6 +2061,42 @@ def train_stage(
     ).to(device)
     train_loader, val_loader, batch_sampler = make_loaders(args, train_ds, val_ds, fog_ratio, mist_ratio, rank, world_size)
     sampling_meta = sampling_metadata(args, train_ds, fog_ratio, mist_ratio)
+    is_phase_c = tag == "S2_PhaseC"
+    selection_metric = args.phase_c_selection_metric if is_phase_c else args.selection_metric
+    prior_beta = float(args.phase_c_prior_beta) if is_phase_c else 0.0
+    if args.sampler_mode == "stratified_balanced":
+        sampler_prior = np.asarray([fog_ratio, mist_ratio, 1.0 - fog_ratio - mist_ratio], dtype=np.float64)
+    else:
+        counts = np.bincount(train_ds.y_cls.numpy().astype(np.int64), minlength=3).astype(np.float64)
+        sampler_prior = counts / max(float(counts.sum()), 1.0)
+    prior_weights_np = class_prior_correction_weights(train_ds.y_cls.numpy(), sampler_prior, prior_beta)
+    focal_prior_weights = torch.as_tensor(prior_weights_np, dtype=torch.float32, device=device)
+    sampling_meta.update(
+        {
+            "phase_c_prior_beta": prior_beta,
+            "phase_c_sampler_prior": sampler_prior.tolist(),
+            "phase_c_focal_prior_weights": prior_weights_np.tolist(),
+        }
+    )
+    use_footprint = bool(is_phase_c and event_footprint_enabled(args))
+    footprint_loader = None
+    footprint_sampler = None
+    footprint_iterator = None
+    footprint_epoch = 0
+    dual_state = FootprintDualState(
+        area=float(args.event_footprint_dual_init),
+        recall=float(args.event_footprint_dual_init),
+    )
+    if use_footprint:
+        footprint_loader, footprint_sampler = make_event_footprint_loader(args, train_ds, rank, world_size)
+        footprint_iterator = iter(footprint_loader)
+        sampling_meta["event_footprint"] = {
+            "enabled": True,
+            "min_fog_count": int(args.event_footprint_min_fog_count),
+            "event_batch_ratio": float(args.event_footprint_event_batch_ratio),
+            "n_event_groups_rank": int(len(footprint_sampler.event_groups)),
+            "n_background_groups_rank": int(len(footprint_sampler.background_groups)),
+        }
     if world_size > 1:
         dist.all_reduce(torch.zeros(1, device=device), op=dist.ReduceOp.SUM)
         torch.cuda.synchronize(device)
@@ -1530,7 +2104,8 @@ def train_stage(
         rank,
         f"[{tag}] start steps={total_steps} trainable={trainable} "
         f"loss_mode={getattr(args, 'loss_mode', 'designed_focal')} "
-        f"sampler_mode={args.sampler_mode} fog_ratio={fog_ratio} mist_ratio={mist_ratio}",
+        f"sampler_mode={args.sampler_mode} fog_ratio={fog_ratio} mist_ratio={mist_ratio} "
+        f"prior_beta={prior_beta} footprint={use_footprint} selection={selection_metric}",
     )
 
     ckpt_best = os.path.join(args.ckpt_dir, f"{args.run_id}_{tag}_best_score.pt")
@@ -1548,13 +2123,13 @@ def train_stage(
 
     while step < total_steps:
         try:
-            bx, by, breg, braw, bw = next(iterator)
+            bx, by, breg, braw, bw, _ = next(iterator)
         except StopIteration:
             epoch += 1
             if hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(epoch)
             iterator = iter(train_loader)
-            bx, by, breg, braw, bw = next(iterator)
+            bx, by, breg, braw, bw, _ = next(iterator)
         bx = bx.to(device, non_blocking=True)
         by = by.to(device, non_blocking=True)
         breg = breg.to(device, non_blocking=True)
@@ -1562,10 +2137,66 @@ def train_stage(
         bw = bw.to(device, non_blocking=True)
         batch_count += 1
         is_sync = batch_count % args.grad_accum == 0
+        fx = None
+        fy = None
+        footprint_is_event = False
+        if use_footprint:
+            assert footprint_loader is not None and footprint_sampler is not None
+            assert footprint_iterator is not None
+            try:
+                fx, fy, _, _, _, fgroups = next(footprint_iterator)
+            except StopIteration:
+                footprint_epoch += 1
+                footprint_sampler.set_epoch(footprint_epoch)
+                footprint_iterator = iter(footprint_loader)
+                fx, fy, _, _, _, fgroups = next(footprint_iterator)
+            fx = fx.to(device, non_blocking=True)
+            fy = fy.to(device, non_blocking=True)
+            footprint_is_event = footprint_sampler.is_event_group(int(fgroups[0]))
         ctx = model.no_sync() if world_size > 1 and not is_sync else contextlib.nullcontext()
         with ctx:
-            logits, reg = model(bx)
-            loss, loss_parts = combined_loss(args, focal, logits, reg, by, breg, braw, bw)
+            if use_footprint:
+                assert fx is not None and fy is not None
+                joined_logits, joined_reg = model(torch.cat([bx, fx], dim=0))
+                logits = joined_logits[: len(bx)]
+                reg = joined_reg[: len(bx)]
+                footprint_logits = joined_logits[len(bx) :]
+            else:
+                logits, reg = model(bx)
+                footprint_logits = None
+            loss, loss_parts = combined_loss(
+                args,
+                focal,
+                logits,
+                reg,
+                by,
+                breg,
+                braw,
+                bw,
+                focal_prior_weights=focal_prior_weights,
+            )
+            footprint_parts = None
+            if use_footprint:
+                assert footprint_logits is not None and fy is not None
+                footprint_term, footprint_parts = event_footprint_loss(
+                    args,
+                    footprint_logits,
+                    fy,
+                    dual_state,
+                    is_widespread_event=footprint_is_event,
+                )
+                loss = loss + footprint_term
+                loss_parts.update(
+                    {
+                        "footprint": float(footprint_parts["footprint"].detach()),
+                        "soft_csi": float(footprint_parts["soft_csi"].detach()),
+                        "soft_recall": float(footprint_parts["soft_recall"].detach()),
+                        "pred_area": float(footprint_parts["pred_area"].detach()),
+                        "obs_area": float(footprint_parts["obs_area"].detach()),
+                        "area_violation": float(footprint_parts["area_violation"].detach()),
+                        "recall_violation": float(footprint_parts["recall_violation"].detach()),
+                    }
+                )
             if l2sp_ref and l2sp_alpha > 0:
                 loss = loss + l2sp_alpha * l2sp_penalty(model, l2sp_ref)
             (loss / args.grad_accum).backward()
@@ -1575,6 +2206,14 @@ def train_stage(
         if torch.isfinite(grad_norm):
             optimizer.step()
             scheduler.step()
+            if use_footprint and footprint_parts is not None:
+                update_footprint_duals(
+                    args,
+                    dual_state,
+                    footprint_parts["area_violation"],
+                    footprint_parts["recall_violation"],
+                    world_size,
+                )
         else:
             rank0(rank, f"[{tag}] nonfinite grad norm at step={step}: {grad_norm}")
         optimizer.zero_grad(set_to_none=True)
@@ -1582,6 +2221,14 @@ def train_stage(
 
         if rank == 0 and step % 50 == 0:
             lr_now = scheduler.get_last_lr()[0]
+            footprint_log = (
+                f"ef={loss_parts.get('footprint', 0.0):.4f} "
+                f"ecsi={loss_parts.get('soft_csi', 0.0):.3f} "
+                f"area={loss_parts.get('pred_area', 0.0):.3f}/{loss_parts.get('obs_area', 0.0):.3f} "
+                f"dual={dual_state.area:.3f}/{dual_state.recall:.3f} "
+                if use_footprint
+                else ""
+            )
             print(
                 f"[{tag}] step={step}/{total_steps} loss={float(loss):.4f} "
                 f"cls={loss_parts['cls']:.4f} fp={loss_parts['fp']:.4f} "
@@ -1589,12 +2236,22 @@ def train_stage(
                 f"cf={loss_parts['clear_fog']:.4f} cm={loss_parts['clear_mist']:.4f} "
                 f"mg={loss_parts['mist_guard']:.4f} "
                 f"reg={loss_parts['reg']:.4f} "
+                f"{footprint_log}"
                 f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
                 flush=True,
             )
 
         if step % args.val_interval == 0 or step == total_steps:
-            score, th, metrics = evaluate(args, model, val_loader, device, rank, world_size, len(val_ds))
+            score, th, metrics = evaluate(
+                args,
+                model,
+                val_loader,
+                device,
+                rank,
+                world_size,
+                len(val_ds),
+                selection_metric=selection_metric,
+            )
             model.train()
             raw_for_meta = unwrap(model)
             ckpt_meta = {
@@ -1609,7 +2266,7 @@ def train_stage(
                 "score": score,
                 "thresholds": th,
                 "metrics": metrics,
-                "selection_metric": args.selection_metric,
+                "selection_metric": selection_metric,
                 "loss_mode": getattr(args, "loss_mode", "designed_focal"),
                 "decision_type": (
                     "regression_threshold"
@@ -1644,6 +2301,14 @@ def train_stage(
                     "aerosol_hard_weight": float(args.aerosol_hard_weight),
                     "ordinal_cost_weight": float(args.ordinal_cost_weight),
                     "aux_reg_weight": float(args.aux_reg_weight),
+                    "phase_c_prior_beta": prior_beta,
+                    "phase_c_focal_prior_weights": prior_weights_np.tolist(),
+                    "event_footprint_csi_weight": float(args.event_footprint_csi_weight),
+                    "event_footprint_area_ratio_cap": float(args.event_footprint_area_ratio_cap),
+                    "event_footprint_area_slack": float(args.event_footprint_area_slack),
+                    "event_footprint_min_recall": float(args.event_footprint_min_recall),
+                    "event_footprint_dual_area": float(dual_state.area),
+                    "event_footprint_dual_recall": float(dual_state.recall),
                 },
             }
             save_checkpoint(model, ckpt_latest, rank, ckpt_meta)
@@ -1656,7 +2321,10 @@ def train_stage(
                     f"[{tag}] val score={score:.4f} th={th} "
                     f"Fog CSI/R/P={metrics.get('Fog_CSI', -1):.3f}/{metrics.get('Fog_R', -1):.3f}/{metrics.get('Fog_P', -1):.3f} "
                     f"Mist CSI/R/P={metrics.get('Mist_CSI', -1):.3f}/{metrics.get('Mist_R', -1):.3f}/{metrics.get('Mist_P', -1):.3f} "
-                    f"LVPrec={metrics.get('low_vis_precision', -1):.3f} FPR={metrics.get('false_positive_rate', -1):.3f}",
+                    f"LVPrec={metrics.get('low_vis_precision', -1):.3f} FPR={metrics.get('false_positive_rate', -1):.3f} "
+                    f"EventCSI={metrics.get('event_low_vis_csi_mean', -1):.3f} "
+                    f"EventArea={metrics.get('event_low_vis_area_ratio_mean', -1):.3f} "
+                    f"feasible={bool(metrics.get('selection_feasible', 1.0))}",
                     flush=True,
                 )
                 if score > best_score:
@@ -1760,11 +2428,28 @@ def main() -> None:
             load_compatible_checkpoint(raw_model, phase_a_best, rank, device, args.pretrained_layout_policy)
         set_trainable(raw_model, "all")
         ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
-        train_stage(
+        phase_b_best = train_stage(
             args, "S2_PhaseB", ddp_model, tr, va, device, rank, world_size,
             args.s2_phase_b_steps, args.fog_ratio_s2, args.mist_ratio_s2,
             args.s2_lr_backbone_b, args.s2_lr_head_b, "all", l2_ref, args.l2sp_alpha_b,
         )
+        safe_barrier(world_size, device)
+
+        if args.s2_phase_c_steps > 0:
+            raw_model = unwrap(ddp_model)
+            if world_size > 1:
+                del ddp_model
+                torch.cuda.empty_cache()
+                safe_barrier(world_size, device)
+            if phase_b_best:
+                load_compatible_checkpoint(raw_model, phase_b_best, rank, device, args.pretrained_layout_policy)
+            set_trainable(raw_model, "head")
+            ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=True)
+            train_stage(
+                args, "S2_PhaseC", ddp_model, tr, va, device, rank, world_size,
+                args.s2_phase_c_steps, args.fog_ratio_s2, args.mist_ratio_s2,
+                args.s2_lr_head_c, None, "head", l2_ref, args.l2sp_alpha_a,
+            )
 
     safe_barrier(world_size, device)
     if dist.is_available() and dist.is_initialized():

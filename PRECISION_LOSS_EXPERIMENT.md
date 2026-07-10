@@ -65,6 +65,22 @@ sample. It penalizes Ultra/Moderate probability separately on unambiguously
 high-visibility Clear samples and explicitly protects Moderate-low recall.
 They use validation CSI checkpoint selection and remain candidate-only.
 
+P8–P10 must not be promoted when Clear→Ultra errors merely move to
+Clear→Moderate. For the fixed-argmax event-footprint objective, use the
+P3-derived Phase-C candidates instead:
+
+- P11: P3 loss plus Phase-C focal prior correction with `beta=0.50`;
+- P12: the same objective with stronger prior correction `beta=0.75`.
+
+P11/P12 keep the P3 conditional total Low-vis FP/FN loss and physical/aerosol
+hard-negative weights. They do not use the P8–P10 pair-specific penalties or
+the Moderate recall guard. Phase C freezes the GRU and static encoder, keeps a
+stratified batch for the prior-corrected focal term, and adds a second natural
+station batch drawn from one valid time for the event-footprint term. The
+footprint objective combines differentiable Low-vis CSI with augmented-
+Lagrangian constraints on predicted area and widespread-event recall. All
+reported decisions remain three-class `argmax`; this is not threshold tuning.
+
 The event-footprint screen should report argmax metrics and should prefer a
 candidate only when all of the following validation diagnostics improve over
 P0: global Clear FPR, Clear→Ultra count, event-mean predicted/observed area
@@ -169,3 +185,63 @@ bash submit_static_rnn_precision_loss_candidates_chain.sh
 
 Use a unique `exp_<timestamp>_precision_loss_*` prefix throughout. Do not edit
 the current mainline run id, `paper_eval_config.json`, or deployment settings.
+
+## P11/P12 calibration-only screen from P3
+
+The first P11/P12 screen should reuse the validated P3 S2 checkpoint and run
+only Phase C. This isolates footprint calibration from representation training
+and avoids repeating P3 Phase A/B:
+
+```bash
+export BASE=/public/home/putianshu/vis_mlp
+export P3_RUN_ID=exp_20260627_194302_precision_loss_screen_p3_seed42_2_proposed_rare_event_focal
+export P3_CKPT=${BASE}/checkpoints/${P3_RUN_ID}_S2_PhaseB_best_score.pt
+export FOOTPRINT_PREFIX=exp_$(date +%Y%m%d_%H%M%S)_p3_event_footprint_screen
+export FOOTPRINT_MANIFEST=${BASE}/train/logs/${FOOTPRINT_PREFIX}_precision_loss_manifest.tsv
+
+cd ${BASE}/train
+LOWVIS_RNN_PRECISION_RUN_PREFIX=${FOOTPRINT_PREFIX} \
+LOWVIS_RNN_PRECISION_STAGE=screen \
+LOWVIS_RNN_PRETRAINED_CKPT=${P3_CKPT} \
+LOWVIS_RNN_PRECISION_CANDIDATES=p11:p12 \
+LOWVIS_RNN_PRECISION_SEEDS=42 \
+LOWVIS_RNN_PRECISION_MANIFEST=${FOOTPRINT_MANIFEST} \
+LOWVIS_RNN_PRECISION_COMMON_ARGS="--threshold-mode argmax --s2-phase-a-steps 0 --s2-phase-b-steps 0" \
+bash submit_static_rnn_precision_loss_candidates_chain.sh
+```
+
+The manifest automatically points P11/P12 to
+`*_S2_PhaseC_best_score.pt`. After both jobs finish, run the normal validation
+candidate evaluator with `RUN_EVENT_EVAL=1`, then apply the footprint-aware
+selector:
+
+```bash
+export FOOTPRINT_VAL_DIR=${BASE}/static_rnn_precision_candidate_eval/${FOOTPRINT_PREFIX}_val
+cd ${BASE}/paper_eval
+sbatch --export=ALL,MANIFEST=${FOOTPRINT_MANIFEST},SPLIT=val,RUN_EVENT_EVAL=1,OUT_DIR=${FOOTPRINT_VAL_DIR},DEVICE=cpu \
+  sub_static_rnn_precision_candidate_eval.slurm
+
+cd ${BASE}/train
+python select_static_rnn_precision_candidates.py \
+  --validation-summary-csv ${FOOTPRINT_VAL_DIR}/precision_candidates_val_overall_metrics.csv \
+  --validation-event-csv ${FOOTPRINT_VAL_DIR}/precision_candidates_val_event_metrics.csv \
+  --max-fpr 0.030 \
+  --min-low-vis-csi 0.190 \
+  --min-low-vis-recall 0.55 \
+  --min-event-recall 0.40 \
+  --min-mean-event-recall 0.55 \
+  --min-mean-event-csi 0.24 \
+  --max-mean-event-area-ratio 1.80 \
+  --max-event-area-ratio 2.20 \
+  --min-ultra-recall 0.40 \
+  --min-moderate-recall 0.20 \
+  --min-moderate-csi 0.06 \
+  --top-k 1 \
+  --out-csv ${FOOTPRINT_VAL_DIR}/footprint_constraint_ranking.csv \
+  --out-json ${FOOTPRINT_VAL_DIR}/footprint_constraint_ranking.json
+```
+
+Do not submit frozen test evaluation when `n_feasible=0`. If one beta is
+feasible, submit only that candidate in `LOWVIS_RNN_PRECISION_STAGE=full` with
+seeds `42:314:2718`; full mode runs the normal S1 and S2 Phase A/B training and
+then appends Phase C.
