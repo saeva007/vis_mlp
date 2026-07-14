@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import subprocess
 import sys
 import types
 import unittest
@@ -13,6 +14,21 @@ import lowvis_trajectory_diffusion as common
 
 
 class TrajectoryContractTests(unittest.TestCase):
+    def test_torch_free_builder_contract(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import lowvis_trajectory_contract; "
+                "assert 'torch' not in sys.modules; print('ok')",
+            ],
+            cwd=str(Path(__file__).resolve().parent),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.stdout.strip(), "ok")
+
     def test_feature_and_lead_contract(self):
         self.assertEqual(len(common.DYNAMIC_FEATURE_ORDER), 27)
         self.assertEqual(common.CONDITION_LEADS, tuple(range(49)))

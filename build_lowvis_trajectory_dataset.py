@@ -18,7 +18,7 @@ import pandas as pd
 import xarray as xr
 from tqdm import tqdm
 
-from lowvis_trajectory_diffusion import (
+from lowvis_trajectory_contract import (
     CONDITION_LEADS,
     DYNAMIC_FEATURE_ORDER,
     MAX_VISIBILITY_M,

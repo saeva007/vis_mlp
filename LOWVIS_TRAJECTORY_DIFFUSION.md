@@ -32,16 +32,14 @@ is unavailable/stale, or if an output dataset already exists. It never silently
 falls back to zero PM. To intentionally rebuild, use a new output tag; use
 `--allow-overwrite` only after archiving the prior dataset.
 
-The CPU builder and DCU trainer use the same validated Jarvis torch runtime by
-default (`/public/home/jarvis226/miniconda3/envs/torch`). The activation helper
-also supplies the cluster OpenSSL 1.1 and compatible HIPNN libraries on CPU
-nodes. The effective loader order is Jarvis lib, OpenSSL 1.1, compatible HIPNN,
-then any DTK/inherited libraries. This prevents both `libssl.so.1.1` failures
-and the incompatible `libgalaxyhip.so.5` / `hipThreadExchangeStreamCaptureMode`
-symbol error. The runtime validates the HIPNN directory and the final Torch
-import rather than requiring one hard-coded library filename, because library
-version names differ across cluster runtime builds. An explicit
-`LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
+The CPU builder is deliberately Torch-free. It uses the established Putianshu
+data environment (`/public/home/putianshu/miniconda3/envs/torch`) only for
+NumPy/pandas/xarray/NetCDF dependencies, clears inherited accelerator/MKL
+libraries, and imports its constants from `lowvis_trajectory_contract.py`.
+This removes the entire HIP loader from data construction rather than trying
+to repair `libgalaxyhip.so.5` ordering on a CPU job. Override the data runtime,
+if needed, with `LOWVIS_TRAJ_DATA_ENV`. The five-node trainer continues to use
+the separate Jarvis/DCU runtime.
 
 ```bash
 cd /public/home/putianshu/vis_mlp/train
