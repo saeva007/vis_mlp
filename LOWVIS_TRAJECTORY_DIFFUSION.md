@@ -32,6 +32,11 @@ is unavailable/stale, or if an output dataset already exists. It never silently
 falls back to zero PM. To intentionally rebuild, use a new output tag; use
 `--allow-overwrite` only after archiving the prior dataset.
 
+The CPU builder and DCU trainer use the same validated Jarvis torch runtime by
+default (`/public/home/jarvis226/miniconda3/envs/torch`). The activation helper
+also supplies the cluster OpenSSL 1.1 compatibility library on CPU nodes. An
+explicit `LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
+
 ```bash
 cd /public/home/putianshu/vis_mlp/train
 sbatch sub_build_lowvis_trajectory_dataset.slurm

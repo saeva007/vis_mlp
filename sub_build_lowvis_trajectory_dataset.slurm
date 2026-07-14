@@ -16,10 +16,13 @@ BASE="${LOWVIS_TRAJ_BASE:-/public/home/putianshu/vis_mlp}"
 DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_0_48h_pm10_pm25_v1}"
 mkdir -p "${SCRIPT_DIR}/logs"
 cd "${SCRIPT_DIR}"
+export LOWVIS_DIFFUSION_USE_DCU=0
+export LOWVIS_DIFFUSION_TORCH_ENV="${LOWVIS_TRAJ_TORCH_ENV:-${LOWVIS_DIFFUSION_TORCH_ENV:-/public/home/jarvis226/miniconda3/envs/torch}}"
 source "${SCRIPT_DIR}/activate_lowvis_diffusion_runtime.sh"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_ON_NODE:-32}"
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
+python -c "import netCDF4, numpy, pandas, torch, xarray; print('[trajectory-build-env] imports=ok')"
 
 python "${SCRIPT_DIR}/build_lowvis_trajectory_dataset.py" \
     --base "${BASE}" \
@@ -30,4 +33,3 @@ python "${SCRIPT_DIR}/build_lowvis_trajectory_dataset.py" \
     --pmst-common-dir "${PMST_COMMON_DIR:-${BASE}/ifs_baseline}" \
     --out-dir "${DATA_DIR}" \
     ${LOWVIS_TRAJ_BUILD_EXTRA_ARGS:-}
-
