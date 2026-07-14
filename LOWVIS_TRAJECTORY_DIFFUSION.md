@@ -34,8 +34,11 @@ falls back to zero PM. To intentionally rebuild, use a new output tag; use
 
 The CPU builder and DCU trainer use the same validated Jarvis torch runtime by
 default (`/public/home/jarvis226/miniconda3/envs/torch`). The activation helper
-also supplies the cluster OpenSSL 1.1 compatibility library on CPU nodes. An
-explicit `LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
+also supplies the cluster OpenSSL 1.1 and compatible HIPNN libraries on CPU
+nodes. The effective loader order is Jarvis lib, OpenSSL 1.1, compatible HIPNN,
+then any DTK/inherited libraries. This prevents both `libssl.so.1.1` failures
+and the incompatible `libgalaxyhip.so.5` / `hipThreadExchangeStreamCaptureMode`
+symbol error. An explicit `LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
 
 ```bash
 cd /public/home/putianshu/vis_mlp/train

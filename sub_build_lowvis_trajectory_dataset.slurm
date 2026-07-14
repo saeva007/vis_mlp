@@ -18,6 +18,7 @@ mkdir -p "${SCRIPT_DIR}/logs"
 cd "${SCRIPT_DIR}"
 export LOWVIS_DIFFUSION_USE_DCU=0
 export LOWVIS_DIFFUSION_TORCH_ENV="${LOWVIS_TRAJ_TORCH_ENV:-${LOWVIS_DIFFUSION_TORCH_ENV:-/public/home/jarvis226/miniconda3/envs/torch}}"
+unset LD_PRELOAD
 source "${SCRIPT_DIR}/activate_lowvis_diffusion_runtime.sh"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_ON_NODE:-32}"
