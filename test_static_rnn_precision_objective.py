@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the optional P11/P12 precision objective."""
+"""Unit tests for the optional precision and sampling-calibration objectives."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import sys
 import types
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -36,6 +37,9 @@ from train_static_rnn_lowvis import (  # noqa: E402
     class_prior_correction_weights,
     event_footprint_loss,
     event_group_metrics,
+    parse_args,
+    sampling_calibration_mix,
+    sampling_constraint_shortfall,
 )
 
 
@@ -94,6 +98,24 @@ class EventGroupTest(unittest.TestCase):
             self.assertEqual(len(np.unique(groups[np.asarray(rows)])), 1)
             self.assertTrue(sampler.is_event_group(int(groups[rows[0]])))
 
+    def test_full_group_sampler_preserves_small_station_snapshot(self):
+        groups = np.array([10, 10, 20, 20, 20], dtype=np.int64)
+        labels = np.array([0, 2, 1, 2, 0], dtype=np.int64)
+        index = build_time_group_index(groups, labels)
+        sampler = EventTimeBatchSampler(
+            index,
+            batch_size=8,
+            min_fog_count=1,
+            event_batch_ratio=1.0,
+            seed=3,
+            epoch_length=3,
+            full_group=True,
+        )
+        for rows in sampler:
+            group = groups[rows[0]]
+            expected = set(np.flatnonzero(groups == group).tolist())
+            self.assertEqual(set(rows), expected)
+
     def test_event_metrics_report_area_and_recall(self):
         labels = np.array([0, 1, 2, 2, 0, 1, 2, 2], dtype=np.int64)
         pred = np.array([0, 2, 1, 2, 0, 1, 1, 2], dtype=np.int64)
@@ -134,6 +156,58 @@ class EventFootprintLossTest(unittest.TestCase):
             is_widespread_event=True,
         )
         self.assertGreater(float(parts["recall_violation"]), 0.0)
+
+
+class SamplingCalibrationTest(unittest.TestCase):
+    def test_phase_d_cli_accepts_sampling_configuration(self):
+        argv = [
+            "train_static_rnn_lowvis.py",
+            "--s2-phase-d-steps",
+            "3000",
+            "--phase-d-natural-mix",
+            "0.45",
+            "--phase-d-selection-metric",
+            "sampling_csi",
+            "--threshold-mode",
+            "argmax",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = parse_args()
+        self.assertEqual(args.s2_phase_d_steps, 3000)
+        self.assertAlmostEqual(args.phase_d_natural_mix, 0.45)
+        self.assertEqual(args.phase_d_selection_metric, "sampling_csi")
+
+    def test_cosine_mix_stays_zero_then_reaches_target(self):
+        self.assertEqual(sampling_calibration_mix(5, 11, 0.5, 0.6), 0.0)
+        self.assertAlmostEqual(sampling_calibration_mix(10, 11, 0.5, 0.6), 0.6)
+        middle = sampling_calibration_mix(8, 11, 0.5, 0.6)
+        self.assertGreater(middle, 0.0)
+        self.assertLess(middle, 0.6)
+
+    def test_sampling_constraints_reject_undercovered_event(self):
+        args = argparse.Namespace(
+            phase_d_min_low_vis_csi=0.195,
+            phase_d_max_fpr=0.025,
+            phase_d_min_event_mean_csi=0.235,
+            phase_d_min_event_mean_recall=0.45,
+            phase_d_min_event_recall=0.20,
+            phase_d_min_event_area_ratio_mean=0.80,
+            phase_d_max_event_area_ratio_mean=1.80,
+            phase_d_max_event_area_ratio=2.20,
+        )
+        metrics = {
+            "low_vis_csi": 0.24,
+            "false_positive_rate": 0.01,
+            "event_group_count": 3.0,
+            "event_low_vis_csi_mean": 0.24,
+            "event_low_vis_recall_mean": 0.46,
+            "event_low_vis_recall_min": 0.21,
+            "event_low_vis_area_ratio_mean": 0.60,
+            "event_low_vis_area_ratio_max": 1.10,
+        }
+        self.assertGreater(sampling_constraint_shortfall(args, metrics), 0.0)
+        metrics["event_low_vis_area_ratio_mean"] = 1.10
+        self.assertEqual(sampling_constraint_shortfall(args, metrics), 0.0)
 
 
 if __name__ == "__main__":

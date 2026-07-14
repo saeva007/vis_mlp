@@ -62,6 +62,9 @@ candidate_label() {
         p10) echo "clear_ultra_pair_strong" ;;
         p11) echo "p3_event_footprint_beta050" ;;
         p12) echo "p3_event_footprint_beta075" ;;
+        p13) echo "p3_sampling_calibration_eta030" ;;
+        p14) echo "p3_sampling_calibration_eta045" ;;
+        p15) echo "p3_sampling_calibration_eta060" ;;
         *) echo "ERROR: unknown precision-loss candidate: $1" >&2; exit 2 ;;
     esac
 }
@@ -107,6 +110,15 @@ candidate_args() {
         p12)
             echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-c-steps 5000 --s2-lr-head-c 2e-5 --phase-c-prior-beta 0.75 --event-footprint-csi-weight 0.50 --event-footprint-area-ratio-cap 1.50 --event-footprint-area-slack 0.005 --event-footprint-min-recall 0.50 --event-footprint-min-fog-count 40 --event-footprint-event-batch-ratio 0.50 --event-footprint-dual-init 1.0 --event-footprint-dual-rho 5.0 --event-footprint-dual-lr 0.05 --event-footprint-dual-max 20.0 --phase-c-selection-metric footprint_csi --phase-c-min-low-vis-recall 0.55 --phase-c-max-fpr 0.03 --phase-c-min-event-mean-recall 0.55 --phase-c-min-event-recall 0.40 --phase-c-max-event-area-ratio-mean 1.80 --phase-c-max-event-area-ratio 2.20"
             ;;
+        p13)
+            echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-d-steps 3000 --s2-lr-head-d 2e-5 --phase-d-natural-mix 0.30 --phase-d-ramp-start 0.50 --phase-d-event-batch-ratio 0.50 --phase-d-min-fog-count 40 --phase-d-selection-metric sampling_csi --phase-d-min-low-vis-csi 0.195 --phase-d-max-fpr 0.025 --phase-d-min-event-mean-csi 0.235 --phase-d-min-event-mean-recall 0.45 --phase-d-min-event-recall 0.20 --phase-d-min-event-area-ratio-mean 0.80 --phase-d-max-event-area-ratio-mean 1.80 --phase-d-max-event-area-ratio 2.20"
+            ;;
+        p14)
+            echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-d-steps 3000 --s2-lr-head-d 2e-5 --phase-d-natural-mix 0.45 --phase-d-ramp-start 0.50 --phase-d-event-batch-ratio 0.50 --phase-d-min-fog-count 40 --phase-d-selection-metric sampling_csi --phase-d-min-low-vis-csi 0.195 --phase-d-max-fpr 0.025 --phase-d-min-event-mean-csi 0.235 --phase-d-min-event-mean-recall 0.45 --phase-d-min-event-recall 0.20 --phase-d-min-event-area-ratio-mean 0.80 --phase-d-max-event-area-ratio-mean 1.80 --phase-d-max-event-area-ratio 2.20"
+            ;;
+        p15)
+            echo "--loss-mode designed_focal --focal-gamma-clear 1.0 --event-loss-normalization conditional --event-fp-weight 1.5 --event-fn-weight 0.10 --physical-hard-weight 0.5 --aerosol-hard-weight 0.25 --s2-phase-d-steps 3000 --s2-lr-head-d 2e-5 --phase-d-natural-mix 0.60 --phase-d-ramp-start 0.50 --phase-d-event-batch-ratio 0.50 --phase-d-min-fog-count 40 --phase-d-selection-metric sampling_csi --phase-d-min-low-vis-csi 0.195 --phase-d-max-fpr 0.025 --phase-d-min-event-mean-csi 0.235 --phase-d-min-event-mean-recall 0.45 --phase-d-min-event-recall 0.20 --phase-d-min-event-area-ratio-mean 0.80 --phase-d-max-event-area-ratio-mean 1.80 --phase-d-max-event-area-ratio 2.20"
+            ;;
     esac
 }
 
@@ -135,24 +147,30 @@ for seed in ${SEEDS}; do
         s2_tag="S2_PhaseB"
         if [[ "${candidate_id}" = "p11" || "${candidate_id}" = "p12" ]]; then
             s2_tag="S2_PhaseC"
+        elif [[ "${candidate_id}" = "p13" || "${candidate_id}" = "p14" || "${candidate_id}" = "p15" ]]; then
+            s2_tag="S2_PhaseD"
         fi
         s2_ckpt="${CKPT_DIR}/${run_id}_${s2_tag}_best_score.pt"
         extra_args="${COMMON_ARGS} --seed ${seed} $(candidate_args "${candidate_id}")"
         extra_args="$(echo "${extra_args}" | xargs)"
         s1_job=""
+        candidate_cache_id="${CACHE_ID}"
+        if [[ "${candidate_id}" = "p13" || "${candidate_id}" = "p14" || "${candidate_id}" = "p15" ]]; then
+            candidate_cache_id="${CACHE_ID}_${candidate_id}_seed${seed}"
+        fi
 
         if [[ "${STAGE}" == "full" ]]; then
             s1_job="$(
                 LOWVIS_RNN_EXTRA_ARGS="${extra_args}" \
                 sbatch --parsable \
-                    --export=ALL,LOWVIS_RNN_MODE=s1,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${CACHE_ID} \
+                    --export=ALL,LOWVIS_RNN_MODE=s1,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${candidate_cache_id} \
                     "${SBATCH_SCRIPT}"
             )"
             s2_job="$(
                 LOWVIS_RNN_EXTRA_ARGS="${extra_args}" \
                 sbatch --parsable \
                     --dependency=afterok:${s1_job} \
-                    --export=ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${CACHE_ID},LOWVIS_RNN_PRETRAINED_CKPT=${s1_ckpt} \
+                    --export=ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${candidate_cache_id},LOWVIS_RNN_PRETRAINED_CKPT=${s1_ckpt} \
                     "${SBATCH_SCRIPT}"
             )"
         else
@@ -160,7 +178,7 @@ for seed in ${SEEDS}; do
             s2_job="$(
                 LOWVIS_RNN_EXTRA_ARGS="${extra_args}" \
                 sbatch --parsable \
-                    --export=ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${CACHE_ID},LOWVIS_RNN_PRETRAINED_CKPT=${PRETRAINED_S1} \
+                    --export=ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_EXPERIMENTS=2,LOWVIS_RNN_RUN_PREFIX=${candidate_prefix},LOWVIS_RNN_LOCAL_CACHE_ID=${candidate_cache_id},LOWVIS_RNN_PRETRAINED_CKPT=${PRETRAINED_S1} \
                     "${SBATCH_SCRIPT}"
             )"
         fi

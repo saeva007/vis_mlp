@@ -167,6 +167,7 @@ class EventTimeBatchSampler(Sampler[List[int]]):
         world_size: int = 1,
         seed: int = 42,
         epoch_length: int = 2000,
+        full_group: bool = False,
     ) -> None:
         self.group_index = group_index
         self.batch_size = int(batch_size)
@@ -176,6 +177,7 @@ class EventTimeBatchSampler(Sampler[List[int]]):
         self.epoch_length = int(epoch_length)
         self.epoch = 0
         self.event_batch_ratio = float(event_batch_ratio)
+        self.full_group = bool(full_group)
 
         event = np.flatnonzero(group_index.fog_counts >= int(min_fog_count))
         background = np.flatnonzero(group_index.fog_counts < int(min_fog_count))
@@ -210,7 +212,10 @@ class EventTimeBatchSampler(Sampler[List[int]]):
             start = int(self.group_index.starts[group_pos])
             count = int(self.group_index.counts[group_pos])
             rows = self.group_index.order[start : start + count]
-            chosen = rng.choice(rows, size=self.batch_size, replace=count < self.batch_size)
+            if self.full_group and count <= self.batch_size:
+                chosen = rows
+            else:
+                chosen = rng.choice(rows, size=self.batch_size, replace=count < self.batch_size)
             yield np.asarray(chosen, dtype=np.int64).tolist()
 
     def __len__(self) -> int:
@@ -279,6 +284,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-phase-a-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_A_STEPS", "8000")))
     p.add_argument("--s2-phase-b-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_B_STEPS", "22000")))
     p.add_argument("--s2-phase-c-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_C_STEPS", "0")))
+    p.add_argument("--s2-phase-d-steps", type=int, default=int(os.environ.get("LOWVIS_RNN_S2_D_STEPS", "0")))
     p.add_argument("--val-interval", type=int, default=int(os.environ.get("LOWVIS_RNN_VAL_INTERVAL", "500")))
     p.add_argument("--batch-size", type=int, default=int(os.environ.get("LOWVIS_RNN_BATCH_SIZE", "512")))
     p.add_argument("--grad-accum", type=int, default=int(os.environ.get("LOWVIS_RNN_GRAD_ACCUM", "2")))
@@ -301,6 +307,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-lr-backbone-b", type=float, default=3e-6)
     p.add_argument("--s2-lr-head-b", type=float, default=1e-5)
     p.add_argument("--s2-lr-head-c", type=float, default=2e-5)
+    p.add_argument("--s2-lr-head-d", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--grad-clip", type=float, default=0.5)
@@ -428,7 +435,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phase-c-max-event-area-ratio-mean", type=float, default=1.80)
     p.add_argument("--phase-c-max-event-area-ratio", type=float, default=2.20)
 
-    p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall", "footprint_csi"], default="recall_csi")
+    p.add_argument(
+        "--phase-d-natural-mix",
+        type=float,
+        default=0.0,
+        help=(
+            "Final natural-snapshot loss fraction for Phase D. The complementary stream "
+            "keeps the configured stratified low-visibility sampler."
+        ),
+    )
+    p.add_argument(
+        "--phase-d-ramp-start",
+        type=float,
+        default=0.50,
+        help="Fraction of Phase D completed before cosine ramping the natural stream from zero.",
+    )
+    p.add_argument("--phase-d-event-batch-ratio", type=float, default=0.50)
+    p.add_argument("--phase-d-min-fog-count", type=int, default=40)
+    p.add_argument(
+        "--phase-d-selection-metric",
+        choices=["recall_csi", "csi", "recall", "sampling_csi"],
+        default="sampling_csi",
+    )
+    p.add_argument("--phase-d-min-low-vis-csi", type=float, default=0.195)
+    p.add_argument("--phase-d-max-fpr", type=float, default=0.025)
+    p.add_argument("--phase-d-min-event-mean-csi", type=float, default=0.235)
+    p.add_argument("--phase-d-min-event-mean-recall", type=float, default=0.45)
+    p.add_argument("--phase-d-min-event-recall", type=float, default=0.20)
+    p.add_argument("--phase-d-min-event-area-ratio-mean", type=float, default=0.80)
+    p.add_argument("--phase-d-max-event-area-ratio-mean", type=float, default=1.80)
+    p.add_argument("--phase-d-max-event-area-ratio", type=float, default=2.20)
+
+    p.add_argument("--selection-metric", choices=["recall_csi", "csi", "recall", "footprint_csi", "sampling_csi"], default="recall_csi")
     p.add_argument(
         "--threshold-mode",
         choices=["val_search", "argmax"],
@@ -462,6 +500,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--phase-c-prior-beta must be within [0, 1]")
     if args.s2_phase_c_steps < 0:
         p.error("--s2-phase-c-steps must be non-negative")
+    if args.s2_phase_d_steps < 0:
+        p.error("--s2-phase-d-steps must be non-negative")
     if args.event_footprint_csi_weight < 0:
         p.error("--event-footprint-csi-weight must be non-negative")
     if args.event_footprint_area_ratio_cap <= 0:
@@ -478,6 +518,22 @@ def parse_args() -> argparse.Namespace:
         p.error("event-footprint dual init/rho must be non-negative")
     if args.event_footprint_dual_lr < 0 or args.event_footprint_dual_max <= 0:
         p.error("event-footprint dual lr/max are invalid")
+    if not 0.0 <= args.phase_d_natural_mix <= 1.0:
+        p.error("--phase-d-natural-mix must be within [0, 1]")
+    if args.s2_phase_d_steps > 0 and args.phase_d_natural_mix <= 0:
+        p.error("Phase D requires --phase-d-natural-mix > 0")
+    if args.s2_phase_d_steps > 0 and args.sampler_mode != "stratified_balanced":
+        p.error("Phase D requires --sampler-mode stratified_balanced for its recall-preserving stream")
+    if not 0.0 <= args.phase_d_ramp_start < 1.0:
+        p.error("--phase-d-ramp-start must be within [0, 1)")
+    if not 0.0 <= args.phase_d_event_batch_ratio <= 1.0:
+        p.error("--phase-d-event-batch-ratio must be within [0, 1]")
+    if args.phase_d_min_fog_count < 1:
+        p.error("--phase-d-min-fog-count must be positive")
+    if args.phase_d_min_event_area_ratio_mean < 0:
+        p.error("--phase-d-min-event-area-ratio-mean must be non-negative")
+    if args.phase_d_max_event_area_ratio_mean <= args.phase_d_min_event_area_ratio_mean:
+        p.error("Phase-D maximum mean event area ratio must exceed its minimum")
     return args
 
 
@@ -702,6 +758,25 @@ def scaler_cache_path(args: argparse.Namespace, stage: str, layout: Layout, use_
 
 def event_footprint_enabled(args: argparse.Namespace) -> bool:
     return bool(args.s2_phase_c_steps > 0 and args.event_footprint_csi_weight > 0)
+
+
+def sampling_calibration_enabled(args: argparse.Namespace) -> bool:
+    return bool(args.s2_phase_d_steps > 0 and args.phase_d_natural_mix > 0)
+
+
+def sampling_calibration_mix(
+    step: int,
+    total_steps: int,
+    ramp_start: float,
+    final_mix: float,
+) -> float:
+    if total_steps <= 0 or final_mix <= 0:
+        return 0.0
+    progress = min(max(float(step) / float(max(total_steps - 1, 1)), 0.0), 1.0)
+    if progress <= float(ramp_start):
+        return 0.0
+    ramp = (progress - float(ramp_start)) / max(1.0 - float(ramp_start), 1e-6)
+    return float(final_mix) * 0.5 * (1.0 - math.cos(math.pi * ramp))
 
 
 def build_time_group_index(group_ids: np.ndarray, y_cls: np.ndarray) -> TimeGroupIndex:
@@ -984,7 +1059,7 @@ def load_data(
     train_groups = None
     val_groups = None
     train_group_index = None
-    if stage == "s2" and event_footprint_enabled(args):
+    if stage == "s2" and (event_footprint_enabled(args) or sampling_calibration_enabled(args)):
         train_groups = ensure_time_group_ids(
             args, data_dir, stage, "train", len(y_cls_tr), rank, world_size, device
         )
@@ -1547,6 +1622,52 @@ def footprint_constraint_shortfall(args: argparse.Namespace, metrics: Dict[str, 
     return float(np.sum(terms))
 
 
+def sampling_constraint_shortfall(args: argparse.Namespace, metrics: Dict[str, float]) -> float:
+    terms = [
+        max(0.0, float(args.phase_d_min_low_vis_csi) - metrics.get("low_vis_csi", 0.0))
+        / max(float(args.phase_d_min_low_vis_csi), 1e-6),
+        max(0.0, metrics.get("false_positive_rate", 1.0) - float(args.phase_d_max_fpr))
+        / max(float(args.phase_d_max_fpr), 1e-6),
+    ]
+    if metrics.get("event_group_count", 0.0) > 0:
+        mean_area = metrics.get("event_low_vis_area_ratio_mean", 0.0)
+        terms.extend(
+            [
+                max(
+                    0.0,
+                    float(args.phase_d_min_event_mean_csi)
+                    - metrics.get("event_low_vis_csi_mean", 0.0),
+                )
+                / max(float(args.phase_d_min_event_mean_csi), 1e-6),
+                max(
+                    0.0,
+                    float(args.phase_d_min_event_mean_recall)
+                    - metrics.get("event_low_vis_recall_mean", 0.0),
+                )
+                / max(float(args.phase_d_min_event_mean_recall), 1e-6),
+                max(
+                    0.0,
+                    float(args.phase_d_min_event_recall)
+                    - metrics.get("event_low_vis_recall_min", 0.0),
+                )
+                / max(float(args.phase_d_min_event_recall), 1e-6),
+                max(0.0, float(args.phase_d_min_event_area_ratio_mean) - mean_area)
+                / max(float(args.phase_d_min_event_area_ratio_mean), 1e-6),
+                max(0.0, mean_area - float(args.phase_d_max_event_area_ratio_mean))
+                / max(float(args.phase_d_max_event_area_ratio_mean), 1e-6),
+                max(
+                    0.0,
+                    metrics.get("event_low_vis_area_ratio_max", float("inf"))
+                    - float(args.phase_d_max_event_area_ratio),
+                )
+                / max(float(args.phase_d_max_event_area_ratio), 1e-6),
+            ]
+        )
+    else:
+        terms.append(4.0)
+    return float(np.sum(terms))
+
+
 def score_metrics(
     args: argparse.Namespace,
     metrics: Dict[str, float],
@@ -1562,6 +1683,16 @@ def score_metrics(
             - 0.25 * metrics["false_positive_rate"]
         )
         return float(base - 2.0 * footprint_constraint_shortfall(args, metrics))
+    if metric_name == "sampling_csi":
+        base = (
+            0.45 * metrics["low_vis_csi"]
+            + 0.20 * metrics.get("event_low_vis_csi_mean", 0.0)
+            + 0.20 * metrics["low_vis_precision"]
+            + 0.075 * metrics["Fog_CSI"]
+            + 0.075 * metrics["Mist_CSI"]
+            - 0.25 * metrics["false_positive_rate"]
+        )
+        return float(base - 2.0 * sampling_constraint_shortfall(args, metrics))
     if metric_name == "csi":
         return 0.45 * metrics["Fog_CSI"] + 0.45 * metrics["Mist_CSI"] + 0.10 * metrics["low_vis_precision"] - 0.05 * metrics["false_positive_rate"]
     if metric_name == "recall":
@@ -1688,18 +1819,28 @@ def evaluate(
         if args.threshold_mode == "argmax":
             pred = np.argmax(all_probs, axis=1)
             metrics = build_metrics(all_targets.astype(np.int64), pred)
+            metric_name = selection_metric or args.selection_metric
             if all_groups is not None:
+                min_fog_count = (
+                    args.phase_d_min_fog_count
+                    if metric_name == "sampling_csi"
+                    else args.event_footprint_min_fog_count
+                )
                 metrics.update(
                     event_group_metrics(
                         all_targets.astype(np.int64),
                         pred,
                         all_groups,
-                        args.event_footprint_min_fog_count,
+                        min_fog_count,
                     )
                 )
             score = score_metrics(args, metrics, selection_metric)
-            if (selection_metric or args.selection_metric) == "footprint_csi":
+            if metric_name == "footprint_csi":
                 shortfall = footprint_constraint_shortfall(args, metrics)
+                metrics["selection_constraint_shortfall"] = shortfall
+                metrics["selection_feasible"] = float(shortfall <= 1e-12)
+            elif metric_name == "sampling_csi":
+                shortfall = sampling_constraint_shortfall(args, metrics)
                 metrics["selection_constraint_shortfall"] = shortfall
                 metrics["selection_feasible"] = float(shortfall <= 1e-12)
             th = {"mode": "argmax"}
@@ -1984,6 +2125,46 @@ def make_event_footprint_loader(
     return DataLoader(train_ds, **loader_kwargs), sampler
 
 
+def make_sampling_calibration_loader(
+    args: argparse.Namespace,
+    train_ds: LowVisDataset,
+    rank: int,
+    world_size: int,
+) -> Tuple[DataLoader, EventTimeBatchSampler]:
+    if train_ds.time_group_index is None:
+        raise ValueError("Phase-D sampling calibration requires a train time-group index")
+
+    def worker_init_fn(worker_id: int) -> None:
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            info.dataset.X = None
+
+    sampler = EventTimeBatchSampler(
+        train_ds.time_group_index,
+        args.batch_size,
+        min_fog_count=args.phase_d_min_fog_count,
+        event_batch_ratio=args.phase_d_event_batch_ratio,
+        rank=rank,
+        world_size=world_size,
+        seed=args.seed + 9001,
+        epoch_length=args.epoch_length,
+        full_group=True,
+    )
+    if args.phase_d_event_batch_ratio > 0 and len(sampler.event_groups) == 0:
+        raise ValueError("Phase-D sampling calibration found no widespread-event time groups")
+    loader_kwargs = {
+        "batch_sampler": sampler,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "worker_init_fn": worker_init_fn,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 1
+        loader_kwargs["timeout"] = 900
+    return DataLoader(train_ds, **loader_kwargs), sampler
+
+
 def sampling_metadata(
     args: argparse.Namespace,
     train_ds: LowVisDataset,
@@ -2062,7 +2243,13 @@ def train_stage(
     train_loader, val_loader, batch_sampler = make_loaders(args, train_ds, val_ds, fog_ratio, mist_ratio, rank, world_size)
     sampling_meta = sampling_metadata(args, train_ds, fog_ratio, mist_ratio)
     is_phase_c = tag == "S2_PhaseC"
-    selection_metric = args.phase_c_selection_metric if is_phase_c else args.selection_metric
+    is_phase_d = tag == "S2_PhaseD"
+    if is_phase_c:
+        selection_metric = args.phase_c_selection_metric
+    elif is_phase_d:
+        selection_metric = args.phase_d_selection_metric
+    else:
+        selection_metric = args.selection_metric
     prior_beta = float(args.phase_c_prior_beta) if is_phase_c else 0.0
     if args.sampler_mode == "stratified_balanced":
         sampler_prior = np.asarray([fog_ratio, mist_ratio, 1.0 - fog_ratio - mist_ratio], dtype=np.float64)
@@ -2097,6 +2284,28 @@ def train_stage(
             "n_event_groups_rank": int(len(footprint_sampler.event_groups)),
             "n_background_groups_rank": int(len(footprint_sampler.background_groups)),
         }
+    use_sampling_calibration = bool(is_phase_d and sampling_calibration_enabled(args))
+    calibration_loader = None
+    calibration_sampler = None
+    calibration_iterator = None
+    calibration_epoch = 0
+    if use_sampling_calibration:
+        calibration_loader, calibration_sampler = make_sampling_calibration_loader(
+            args, train_ds, rank, world_size
+        )
+        calibration_iterator = iter(calibration_loader)
+        sampling_meta["sampling_calibration"] = {
+            "enabled": True,
+            "balanced_loss": "designed_focal",
+            "natural_snapshot_loss": "unweighted_cross_entropy",
+            "final_natural_mix": float(args.phase_d_natural_mix),
+            "ramp_start": float(args.phase_d_ramp_start),
+            "min_fog_count": int(args.phase_d_min_fog_count),
+            "event_batch_ratio": float(args.phase_d_event_batch_ratio),
+            "full_group": True,
+            "n_event_groups_rank": int(len(calibration_sampler.event_groups)),
+            "n_background_groups_rank": int(len(calibration_sampler.background_groups)),
+        }
     if world_size > 1:
         dist.all_reduce(torch.zeros(1, device=device), op=dist.ReduceOp.SUM)
         torch.cuda.synchronize(device)
@@ -2105,7 +2314,8 @@ def train_stage(
         f"[{tag}] start steps={total_steps} trainable={trainable} "
         f"loss_mode={getattr(args, 'loss_mode', 'designed_focal')} "
         f"sampler_mode={args.sampler_mode} fog_ratio={fog_ratio} mist_ratio={mist_ratio} "
-        f"prior_beta={prior_beta} footprint={use_footprint} selection={selection_metric}",
+        f"prior_beta={prior_beta} footprint={use_footprint} "
+        f"sampling_calibration={use_sampling_calibration} selection={selection_metric}",
     )
 
     ckpt_best = os.path.join(args.ckpt_dir, f"{args.run_id}_{tag}_best_score.pt")
@@ -2153,6 +2363,30 @@ def train_stage(
             fx = fx.to(device, non_blocking=True)
             fy = fy.to(device, non_blocking=True)
             footprint_is_event = footprint_sampler.is_event_group(int(fgroups[0]))
+        calibration_mix = (
+            sampling_calibration_mix(
+                step,
+                total_steps,
+                args.phase_d_ramp_start,
+                args.phase_d_natural_mix,
+            )
+            if use_sampling_calibration
+            else 0.0
+        )
+        cx = None
+        cy = None
+        if use_sampling_calibration and calibration_mix > 0:
+            assert calibration_loader is not None and calibration_sampler is not None
+            assert calibration_iterator is not None
+            try:
+                cx, cy, _, _, _, _ = next(calibration_iterator)
+            except StopIteration:
+                calibration_epoch += 1
+                calibration_sampler.set_epoch(calibration_epoch)
+                calibration_iterator = iter(calibration_loader)
+                cx, cy, _, _, _, _ = next(calibration_iterator)
+            cx = cx.to(device, non_blocking=True)
+            cy = cy.to(device, non_blocking=True)
         ctx = model.no_sync() if world_size > 1 and not is_sync else contextlib.nullcontext()
         with ctx:
             if use_footprint:
@@ -2161,9 +2395,17 @@ def train_stage(
                 logits = joined_logits[: len(bx)]
                 reg = joined_reg[: len(bx)]
                 footprint_logits = joined_logits[len(bx) :]
+                calibration_logits = None
+            elif use_sampling_calibration and cx is not None:
+                joined_logits, joined_reg = model(torch.cat([bx, cx], dim=0))
+                logits = joined_logits[: len(bx)]
+                reg = joined_reg[: len(bx)]
+                footprint_logits = None
+                calibration_logits = joined_logits[len(bx) :]
             else:
                 logits, reg = model(bx)
                 footprint_logits = None
+                calibration_logits = None
             loss, loss_parts = combined_loss(
                 args,
                 focal,
@@ -2195,6 +2437,17 @@ def train_stage(
                         "obs_area": float(footprint_parts["obs_area"].detach()),
                         "area_violation": float(footprint_parts["area_violation"].detach()),
                         "recall_violation": float(footprint_parts["recall_violation"].detach()),
+                    }
+                )
+            if use_sampling_calibration:
+                natural_ce = logits.sum() * 0.0
+                if calibration_logits is not None and cy is not None:
+                    natural_ce = F.cross_entropy(calibration_logits, cy)
+                    loss = (1.0 - calibration_mix) * loss + calibration_mix * natural_ce
+                loss_parts.update(
+                    {
+                        "calibration_mix": float(calibration_mix),
+                        "natural_ce": float(natural_ce.detach()),
                     }
                 )
             if l2sp_ref and l2sp_alpha > 0:
@@ -2229,6 +2482,12 @@ def train_stage(
                 if use_footprint
                 else ""
             )
+            calibration_log = (
+                f"mix={loss_parts.get('calibration_mix', 0.0):.3f} "
+                f"natural_ce={loss_parts.get('natural_ce', 0.0):.4f} "
+                if use_sampling_calibration
+                else ""
+            )
             print(
                 f"[{tag}] step={step}/{total_steps} loss={float(loss):.4f} "
                 f"cls={loss_parts['cls']:.4f} fp={loss_parts['fp']:.4f} "
@@ -2237,6 +2496,7 @@ def train_stage(
                 f"mg={loss_parts['mist_guard']:.4f} "
                 f"reg={loss_parts['reg']:.4f} "
                 f"{footprint_log}"
+                f"{calibration_log}"
                 f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
                 flush=True,
             )
@@ -2309,11 +2569,21 @@ def train_stage(
                     "event_footprint_min_recall": float(args.event_footprint_min_recall),
                     "event_footprint_dual_area": float(dual_state.area),
                     "event_footprint_dual_recall": float(dual_state.recall),
+                    "phase_d_natural_mix": float(args.phase_d_natural_mix),
+                    "phase_d_current_natural_mix": float(calibration_mix),
+                    "phase_d_ramp_start": float(args.phase_d_ramp_start),
+                    "phase_d_event_batch_ratio": float(args.phase_d_event_batch_ratio),
                 },
             }
             save_checkpoint(model, ckpt_latest, rank, ckpt_meta)
             if rank == 0:
-                row = {"step": step, "score": score, "thresholds": th, **metrics}
+                row = {
+                    "step": step,
+                    "score": score,
+                    "thresholds": th,
+                    "phase_d_natural_mix": float(calibration_mix),
+                    **metrics,
+                }
                 history.append(row)
                 with open(history_path, "w", encoding="utf-8") as f:
                     json.dump(history, f, indent=2, ensure_ascii=False)
@@ -2324,6 +2594,7 @@ def train_stage(
                     f"LVPrec={metrics.get('low_vis_precision', -1):.3f} FPR={metrics.get('false_positive_rate', -1):.3f} "
                     f"EventCSI={metrics.get('event_low_vis_csi_mean', -1):.3f} "
                     f"EventArea={metrics.get('event_low_vis_area_ratio_mean', -1):.3f} "
+                    f"mix={calibration_mix:.3f} "
                     f"feasible={bool(metrics.get('selection_feasible', 1.0))}",
                     flush=True,
                 )
@@ -2435,6 +2706,7 @@ def main() -> None:
         )
         safe_barrier(world_size, device)
 
+        phase_c_best = ""
         if args.s2_phase_c_steps > 0:
             raw_model = unwrap(ddp_model)
             if world_size > 1:
@@ -2445,10 +2717,29 @@ def main() -> None:
                 load_compatible_checkpoint(raw_model, phase_b_best, rank, device, args.pretrained_layout_policy)
             set_trainable(raw_model, "head")
             ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=True)
-            train_stage(
+            phase_c_best = train_stage(
                 args, "S2_PhaseC", ddp_model, tr, va, device, rank, world_size,
                 args.s2_phase_c_steps, args.fog_ratio_s2, args.mist_ratio_s2,
                 args.s2_lr_head_c, None, "head", l2_ref, args.l2sp_alpha_a,
+            )
+            safe_barrier(world_size, device)
+
+        if args.s2_phase_d_steps > 0:
+            raw_model = unwrap(ddp_model)
+            if world_size > 1:
+                del ddp_model
+                torch.cuda.empty_cache()
+                safe_barrier(world_size, device)
+            if phase_c_best:
+                load_compatible_checkpoint(raw_model, phase_c_best, rank, device, args.pretrained_layout_policy)
+            elif phase_b_best:
+                load_compatible_checkpoint(raw_model, phase_b_best, rank, device, args.pretrained_layout_policy)
+            set_trainable(raw_model, "head")
+            ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=True)
+            train_stage(
+                args, "S2_PhaseD", ddp_model, tr, va, device, rank, world_size,
+                args.s2_phase_d_steps, args.fog_ratio_s2, args.mist_ratio_s2,
+                args.s2_lr_head_d, None, "head", l2_ref, args.l2sp_alpha_a,
             )
 
     safe_barrier(world_size, device)

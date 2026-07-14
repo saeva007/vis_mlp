@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-event-recall", type=float, default=0.60)
     p.add_argument("--min-mean-event-recall", type=float, default=0.0)
     p.add_argument("--min-mean-event-csi", type=float, default=0.0)
+    p.add_argument("--min-mean-event-area-ratio", type=float, default=0.0)
     p.add_argument("--max-mean-event-area-ratio", type=float, default=0.0)
     p.add_argument("--max-event-area-ratio", type=float, default=0.0)
     p.add_argument("--min-low-vis-csi", type=float, default=0.0)
@@ -128,6 +129,11 @@ def main() -> None:
     if args.validation_event_csv:
         summary["passes_mean_event_recall"] = summary["mean_validation_event_recall"].ge(args.min_mean_event_recall)
         summary["passes_mean_event_csi"] = summary["mean_validation_event_csi"].ge(args.min_mean_event_csi)
+        summary["passes_min_mean_event_area"] = (
+            True
+            if args.min_mean_event_area_ratio <= 0
+            else summary["mean_validation_event_area_ratio"].ge(args.min_mean_event_area_ratio)
+        )
         summary["passes_mean_event_area"] = (
             True
             if args.max_mean_event_area_ratio <= 0
@@ -141,6 +147,7 @@ def main() -> None:
     else:
         summary["passes_mean_event_recall"] = True
         summary["passes_mean_event_csi"] = True
+        summary["passes_min_mean_event_area"] = True
         summary["passes_mean_event_area"] = True
         summary["passes_max_event_area"] = True
     summary["passes_fpr"] = summary["selection_fpr"].le(args.max_fpr)
@@ -153,6 +160,7 @@ def main() -> None:
         "passes_event_recall",
         "passes_mean_event_recall",
         "passes_mean_event_csi",
+        "passes_min_mean_event_area",
         "passes_mean_event_area",
         "passes_max_event_area",
         "passes_fpr",
@@ -186,14 +194,26 @@ def main() -> None:
             summary["constraint_shortfall"] += (
                 summary["mean_validation_event_area_ratio"] - args.max_mean_event_area_ratio
             ).clip(lower=0.0).fillna(1.0)
+        if args.min_mean_event_area_ratio > 0:
+            summary["constraint_shortfall"] += (
+                args.min_mean_event_area_ratio - summary["mean_validation_event_area_ratio"]
+            ).clip(lower=0.0).fillna(1.0)
         if args.max_event_area_ratio > 0:
             summary["constraint_shortfall"] += (
                 summary["max_validation_event_area_ratio"] - args.max_event_area_ratio
             ).clip(lower=0.0).fillna(1.0)
 
+    summary["selection_joint_csi"] = (
+        0.60 * summary["selection_low_vis_csi"]
+        + 0.40 * summary["mean_validation_event_csi"].fillna(0.0)
+    )
+    summary["selection_event_area_distance"] = (
+        summary["mean_validation_event_area_ratio"] - 1.0
+    ).abs().fillna(float("inf"))
+
     ranked = summary.sort_values(
-        ["feasible", "constraint_shortfall", "mean_validation_event_area_ratio", "selection_fpr", "selection_low_vis_csi", "selection_moderate_csi"],
-        ascending=[False, True, True, True, False, False],
+        ["feasible", "constraint_shortfall", "selection_joint_csi", "selection_event_area_distance", "selection_fpr", "selection_moderate_csi"],
+        ascending=[False, True, False, True, True, False],
         kind="stable",
     ).reset_index(drop=True)
     ranked.insert(0, "selection_rank", np.arange(1, len(ranked) + 1))
@@ -228,6 +248,7 @@ def main() -> None:
             "min_event_recall": args.min_event_recall,
             "min_mean_event_recall": args.min_mean_event_recall,
             "min_mean_event_csi": args.min_mean_event_csi,
+            "min_mean_event_area_ratio": args.min_mean_event_area_ratio,
             "max_mean_event_area_ratio": args.max_mean_event_area_ratio,
             "max_event_area_ratio": args.max_event_area_ratio,
             "min_low_vis_csi": args.min_low_vis_csi,

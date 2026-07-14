@@ -245,3 +245,97 @@ Do not submit frozen test evaluation when `n_feasible=0`. If one beta is
 feasible, submit only that candidate in `LOWVIS_RNN_PRECISION_STAGE=full` with
 seeds `42:314:2718`; full mode runs the normal S1 and S2 Phase A/B training and
 then appends Phase C.
+
+## P13-P15 dual-stream sampling calibration
+
+P13-P15 replace Phase-C prior correction and footprint penalties with a
+decoupled Phase D. The balanced stream keeps the P3 designed-focal objective;
+the natural stream uses unweighted cross entropy on complete valid-time station
+snapshots. Half of the natural snapshots come from widespread-event times and
+half from background times. A cosine schedule introduces the natural stream
+only after 50% of Phase D, with final natural-loss fractions 0.30, 0.45, and
+0.60 for P13, P14, and P15 respectively.
+
+The initial screen reuses the verified P3 Phase-B checkpoint and trains only
+Phase D:
+
+```bash
+export BASE=/public/home/putianshu/vis_mlp
+export P3_RUN_ID=exp_20260627_194302_precision_loss_screen_p3_seed42_2_proposed_rare_event_focal
+export P3_CKPT=${BASE}/checkpoints/${P3_RUN_ID}_S2_PhaseB_best_score.pt
+export SAMPLING_PREFIX=exp_$(date +%Y%m%d_%H%M%S)_p3_sampling_calibration_screen
+export SAMPLING_MANIFEST=${BASE}/train/logs/${SAMPLING_PREFIX}_precision_loss_manifest.tsv
+
+test -f "${P3_CKPT}" || { echo "Missing ${P3_CKPT}"; exit 1; }
+cd ${BASE}/train
+LOWVIS_RNN_PRECISION_RUN_PREFIX=${SAMPLING_PREFIX} \
+LOWVIS_RNN_PRECISION_STAGE=screen \
+LOWVIS_RNN_PRETRAINED_CKPT=${P3_CKPT} \
+LOWVIS_RNN_PRECISION_CANDIDATES=p13:p14:p15 \
+LOWVIS_RNN_PRECISION_SEEDS=42 \
+LOWVIS_RNN_PRECISION_MANIFEST=${SAMPLING_MANIFEST} \
+LOWVIS_RNN_LOCAL_CACHE_ID=${SAMPLING_PREFIX}_shared_data \
+LOWVIS_RNN_PRECISION_COMMON_ARGS="--threshold-mode argmax --s2-phase-a-steps 0 --s2-phase-b-steps 0 --s2-phase-c-steps 0" \
+bash submit_static_rnn_precision_loss_candidates_chain.sh
+```
+
+After all three Phase-D jobs complete, run fixed-argmax validation with event
+evaluation and select one eta:
+
+```bash
+export SAMPLING_VAL_DIR=${BASE}/static_rnn_precision_candidate_eval/${SAMPLING_PREFIX}_val
+cd ${BASE}/paper_eval
+sbatch --export=ALL,MANIFEST=${SAMPLING_MANIFEST},SPLIT=val,RUN_EVENT_EVAL=1,OUT_DIR=${SAMPLING_VAL_DIR},DEVICE=cpu \
+  sub_static_rnn_precision_candidate_eval.slurm
+
+cd ${BASE}/train
+python select_static_rnn_precision_candidates.py \
+  --validation-summary-csv ${SAMPLING_VAL_DIR}/precision_candidates_val_overall_metrics.csv \
+  --validation-event-csv ${SAMPLING_VAL_DIR}/precision_candidates_val_event_metrics.csv \
+  --max-fpr 0.025 \
+  --min-low-vis-csi 0.195 \
+  --min-low-vis-recall 0.0 \
+  --min-event-recall 0.20 \
+  --min-mean-event-recall 0.45 \
+  --min-mean-event-csi 0.235 \
+  --min-mean-event-area-ratio 0.80 \
+  --max-mean-event-area-ratio 1.80 \
+  --max-event-area-ratio 2.20 \
+  --min-ultra-recall 0.40 \
+  --min-moderate-recall 0.20 \
+  --min-moderate-csi 0.06 \
+  --top-k 1 \
+  --out-csv ${SAMPLING_VAL_DIR}/sampling_constraint_ranking.csv \
+  --out-json ${SAMPLING_VAL_DIR}/sampling_constraint_ranking.json
+```
+
+Do not use test data when `n_feasible=0`. When one eta is feasible, submit
+that candidate in `full` mode with seeds `42:314:2718`. Full mode trains S1,
+S2 Phase A/B, and then appends the same Phase D strategy. Evaluate the complete
+three-seed manifest first on validation and then once on frozen test:
+
+```bash
+export FULL_PREFIX=exp_$(date +%Y%m%d_%H%M%S)_sampling_calibration_full
+export FULL_MANIFEST=${BASE}/train/logs/${FULL_PREFIX}_precision_loss_manifest.tsv
+export SELECTED_CANDIDATE=p14  # replace with the validation-selected candidate id
+
+cd ${BASE}/train
+LOWVIS_RNN_PRECISION_RUN_PREFIX=${FULL_PREFIX} \
+LOWVIS_RNN_PRECISION_STAGE=full \
+LOWVIS_RNN_PRECISION_CANDIDATES=${SELECTED_CANDIDATE} \
+LOWVIS_RNN_PRECISION_SEEDS=42:314:2718 \
+LOWVIS_RNN_PRECISION_MANIFEST=${FULL_MANIFEST} \
+bash submit_static_rnn_precision_loss_candidates_chain.sh
+
+export FULL_TEST_DIR=${BASE}/static_rnn_precision_candidate_eval/${FULL_PREFIX}_test
+cd ${BASE}/paper_eval
+sbatch --export=ALL,MANIFEST=${FULL_MANIFEST},SPLIT=test,RUN_EVENT_EVAL=1,OUT_DIR=${FULL_TEST_DIR},DEVICE=cpu \
+  sub_static_rnn_precision_candidate_eval.slurm
+```
+
+The frozen test job writes overall metrics, per-class precision/recall/CSI,
+confusion counts, and event metrics to
+`precision_candidates_test_overall_metrics.csv`,
+`precision_candidates_test_per_class_metrics.csv`,
+`precision_candidates_test_confusion_counts.csv`, and
+`precision_candidates_test_event_metrics.csv`.
