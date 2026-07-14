@@ -308,18 +308,37 @@ class TrajectoryConditionEncoder(nn.Module):
         nhead: int = 8,
         layers: int = 4,
         dropout: float = 0.1,
+        condition_token_version: int = 2,
     ):
         super().__init__()
         self.d_model = int(d_model)
+        self.condition_token_version = int(condition_token_version)
+        if self.condition_token_version not in (1, 2):
+            raise ValueError("condition_token_version must be 1 or 2")
         self.dynamic_projection = nn.Linear(condition_dim, d_model)
         self.condition_lead_embedding = nn.Parameter(torch.randn(len(CONDITION_LEADS), d_model) * 0.02)
-        self.veg_embedding = nn.Embedding(32, 16)
-        self.global_encoder = nn.Sequential(
-            nn.Linear(static_dim + time_dim + 16, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
+        if self.condition_token_version == 1:
+            # Retained so checkpoints written before the five-node profile remain loadable.
+            self.veg_embedding = nn.Embedding(32, 16)
+            self.global_encoder = nn.Sequential(
+                nn.Linear(static_dim + time_dim + 16, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+        else:
+            # Give each non-meteorological condition its own token.  Cross-attention
+            # can then use station, vegetation and initialization time differently at
+            # every target lead instead of receiving one pre-mixed additive vector.
+            self.veg_embedding = nn.Embedding(32, d_model)
+            self.static_projection = nn.Sequential(
+                nn.Linear(static_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+            )
+            self.time_projection = nn.Sequential(
+                nn.Linear(time_dim, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+            )
+            self.cls_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+            self.condition_type_embedding = nn.Parameter(torch.randn(4, d_model) * 0.02)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -333,12 +352,27 @@ class TrajectoryConditionEncoder(nn.Module):
 
     def forward(self, condition: Tensor, static: Tensor, veg: Tensor, time_features: Tensor) -> Tuple[Tensor, Tensor]:
         veg = torch.clamp(veg, 0, self.veg_embedding.num_embeddings - 1)
-        global_context = self.global_encoder(
-            torch.cat([static, time_features, self.veg_embedding(veg)], dim=-1)
+        dynamic_memory = self.dynamic_projection(condition) + self.condition_lead_embedding.unsqueeze(0)
+        if self.condition_token_version == 1:
+            global_context = self.global_encoder(
+                torch.cat([static, time_features, self.veg_embedding(veg)], dim=-1)
+            )
+            memory = dynamic_memory + global_context.unsqueeze(1)
+            return self.encoder(memory), global_context
+
+        batch_size = int(condition.shape[0])
+        special = torch.stack(
+            [
+                self.cls_token.expand(batch_size, -1),
+                self.static_projection(static),
+                self.veg_embedding(veg),
+                self.time_projection(time_features),
+            ],
+            dim=1,
         )
-        memory = self.dynamic_projection(condition)
-        memory = memory + self.condition_lead_embedding.unsqueeze(0) + global_context.unsqueeze(1)
-        return self.encoder(memory), global_context
+        special = special + self.condition_type_embedding.unsqueeze(0)
+        encoded = self.encoder(torch.cat([special, dynamic_memory], dim=1))
+        return encoded, encoded[:, 0]
 
 
 class ConditionalTrajectoryDenoiser(nn.Module):
@@ -349,11 +383,16 @@ class ConditionalTrajectoryDenoiser(nn.Module):
         condition_layers: int = 4,
         denoiser_layers: int = 4,
         dropout: float = 0.1,
+        condition_token_version: int = 2,
     ):
         super().__init__()
         self.d_model = int(d_model)
         self.condition_encoder = TrajectoryConditionEncoder(
-            d_model=d_model, nhead=nhead, layers=condition_layers, dropout=dropout
+            d_model=d_model,
+            nhead=nhead,
+            layers=condition_layers,
+            dropout=dropout,
+            condition_token_version=condition_token_version,
         )
         self.noisy_projection = nn.Linear(1, d_model)
         self.target_lead_embedding = nn.Parameter(torch.randn(TARGET_LENGTH, d_model) * 0.02)
@@ -399,10 +438,15 @@ class GaussianTrajectoryModel(nn.Module):
         condition_layers: int = 4,
         decoder_layers: int = 4,
         dropout: float = 0.1,
+        condition_token_version: int = 2,
     ):
         super().__init__()
         self.condition_encoder = TrajectoryConditionEncoder(
-            d_model=d_model, nhead=nhead, layers=condition_layers, dropout=dropout
+            d_model=d_model,
+            nhead=nhead,
+            layers=condition_layers,
+            dropout=dropout,
+            condition_token_version=condition_token_version,
         )
         self.target_queries = nn.Parameter(torch.randn(TARGET_LENGTH, d_model) * 0.02)
         layer = nn.TransformerDecoderLayer(
@@ -437,12 +481,13 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> Tensor:
 
 
 class DiffusionSchedule(nn.Module):
-    def __init__(self, timesteps: int = 1000):
+    def __init__(self, timesteps: int = 1000, ddim_clip_x0: float = 0.0):
         super().__init__()
         betas = cosine_beta_schedule(timesteps)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
         self.timesteps = int(timesteps)
+        self.ddim_clip_x0 = float(ddim_clip_x0)
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bar", alpha_bar)
@@ -455,9 +500,26 @@ class DiffusionSchedule(nn.Module):
         return noisy, noise
 
 
-def masked_diffusion_loss(predicted_noise: Tensor, noise: Tensor, mask: Tensor) -> Tensor:
-    denom = torch.clamp(mask.sum(), min=1.0)
-    return (((predicted_noise - noise) ** 2) * mask).sum() / denom
+def min_snr_weights(schedule: DiffusionSchedule, step: Tensor, gamma: float = 5.0) -> Tensor:
+    """Min-SNR weights for epsilon prediction; zero/negative gamma disables it."""
+    if gamma <= 0:
+        return torch.ones_like(step, dtype=schedule.alpha_bar.dtype)
+    alpha_bar = schedule.alpha_bar[step]
+    snr = alpha_bar / torch.clamp(1.0 - alpha_bar, min=1.0e-8)
+    return torch.clamp(snr, max=float(gamma)) / torch.clamp(snr, min=1.0e-8)
+
+
+def masked_diffusion_loss(
+    predicted_noise: Tensor,
+    noise: Tensor,
+    mask: Tensor,
+    sample_weight: Optional[Tensor] = None,
+) -> Tensor:
+    weight = mask
+    if sample_weight is not None:
+        weight = weight * sample_weight.to(dtype=mask.dtype).unsqueeze(1)
+    denom = torch.clamp(weight.sum(), min=1.0)
+    return (((predicted_noise - noise) ** 2) * weight).sum() / denom
 
 
 def masked_gaussian_nll(mean: Tensor, log_scale: Tensor, target: Tensor, mask: Tensor) -> Tensor:
@@ -474,6 +536,8 @@ def ddim_sample(
     members: int = 50,
     steps: int = 50,
     member_chunk_size: int = 10,
+    generator: Optional[torch.Generator] = None,
+    clip_x0: Optional[float] = None,
 ) -> Tensor:
     device = batch["condition"].device
     bsz = int(batch["condition"].shape[0])
@@ -485,7 +549,7 @@ def ddim_sample(
             key: batch[key].repeat_interleave(chunk, dim=0)
             for key in ("condition", "static", "veg", "time_features")
         }
-        current = torch.randn(bsz * chunk, TARGET_LENGTH, device=device)
+        current = torch.randn(bsz * chunk, TARGET_LENGTH, device=device, generator=generator)
         for pos, step_value in enumerate(schedule_steps):
             step = torch.full((bsz * chunk,), int(step_value.item()), device=device, dtype=torch.long)
             eps = model(
@@ -498,6 +562,9 @@ def ddim_sample(
             )
             abar = schedule.alpha_bar[step_value]
             clean = (current - torch.sqrt(1.0 - abar) * eps) / torch.sqrt(abar)
+            effective_clip = schedule.ddim_clip_x0 if clip_x0 is None else float(clip_x0)
+            if effective_clip > 0:
+                clean = torch.clamp(clean, -effective_clip, effective_clip)
             if pos + 1 == len(schedule_steps):
                 current = clean
             else:
@@ -508,9 +575,16 @@ def ddim_sample(
 
 
 @torch.no_grad()
-def gaussian_sample(model: GaussianTrajectoryModel, batch: Mapping[str, Tensor], members: int = 50) -> Tensor:
+def gaussian_sample(
+    model: GaussianTrajectoryModel,
+    batch: Mapping[str, Tensor],
+    members: int = 50,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
     mean, log_scale = model(batch["condition"], batch["static"], batch["veg"], batch["time_features"])
-    noise = torch.randn(mean.shape[0], int(members), mean.shape[1], device=mean.device)
+    noise = torch.randn(
+        mean.shape[0], int(members), mean.shape[1], device=mean.device, generator=generator
+    )
     return mean.unsqueeze(1) + torch.exp(log_scale).unsqueeze(1) * noise
 
 
@@ -563,6 +637,7 @@ def model_from_config(config: Mapping[str, object]) -> nn.Module:
         nhead=int(config.get("nhead", 8)),
         condition_layers=int(config.get("condition_layers", 4)),
         dropout=float(config.get("dropout", 0.1)),
+        condition_token_version=int(config.get("condition_token_version", 1)),
     )
     if model_type == "diffusion":
         return ConditionalTrajectoryDenoiser(

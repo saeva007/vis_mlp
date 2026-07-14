@@ -68,6 +68,56 @@ class TrajectoryContractTests(unittest.TestCase):
         probs = common.visibility_class_probabilities(np.abs(samples.numpy()) * 1200.0)
         np.testing.assert_allclose(probs.sum(axis=-1), 1.0, atol=1e-6)
 
+    def test_condition_tokens_min_snr_and_fixed_sampling(self):
+        model = common.ConditionalTrajectoryDenoiser(
+            d_model=32,
+            nhead=4,
+            condition_layers=1,
+            denoiser_layers=1,
+            dropout=0.0,
+            condition_token_version=2,
+        ).eval()
+        batch = {
+            "condition": torch.randn(2, 49, 54),
+            "static": torch.randn(2, 5),
+            "veg": torch.tensor([1, 2]),
+            "time_features": torch.randn(2, 4),
+            "target": torch.randn(2, 37),
+            "target_mask": torch.ones(2, 37),
+        }
+        memory, context = model.condition_encoder(
+            batch["condition"], batch["static"], batch["veg"], batch["time_features"]
+        )
+        self.assertEqual(tuple(memory.shape), (2, 53, 32))
+        self.assertEqual(tuple(context.shape), (2, 32))
+
+        schedule = common.DiffusionSchedule(10, ddim_clip_x0=6.0)
+        weights = common.min_snr_weights(schedule, torch.tensor([0, 5, 9]), gamma=5.0)
+        self.assertTrue(torch.isfinite(weights).all())
+        self.assertTrue(bool(torch.all((weights > 0) & (weights <= 1))))
+
+        first_generator = torch.Generator().manual_seed(123)
+        second_generator = torch.Generator().manual_seed(123)
+        first = common.ddim_sample(
+            model, schedule, batch, members=2, steps=2, generator=first_generator
+        )
+        second = common.ddim_sample(
+            model, schedule, batch, members=2, steps=2, generator=second_generator
+        )
+        torch.testing.assert_close(first, second)
+
+        legacy = common.model_from_config(
+            {
+                "model_type": "diffusion",
+                "d_model": 32,
+                "nhead": 4,
+                "condition_layers": 1,
+                "decoder_layers": 1,
+                "dropout": 0.0,
+            }
+        )
+        self.assertEqual(legacy.condition_encoder.condition_token_version, 1)
+
     def test_gaussian_baseline_shape_and_loss(self):
         model = common.GaussianTrajectoryModel(
             d_model=32, nhead=4, condition_layers=1, decoder_layers=1, dropout=0.0
