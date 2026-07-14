@@ -47,6 +47,31 @@ export LOWVIS_TRAJ_TORCH_ENV="${LOWVIS_DIFFUSION_TORCH_ENV:-/public/home/jarvis2
 
 mkdir -p "${SCRIPT_DIR}/logs" "${LOWVIS_TRAJ_CHECKPOINT_DIR}"
 
+# Fail once on the batch host before spawning 20 workers.  A missing config is
+# the normal signal that the CPU trajectory-builder job has not finished.
+required_dataset_files=("${LOWVIS_TRAJ_DATA_DIR}/dataset_build_config.json")
+for split in train val test; do
+    for stem in dynamic static_cont veg_id time_features visibility target_mask; do
+        required_dataset_files+=("${LOWVIS_TRAJ_DATA_DIR}/${stem}_${split}.npy")
+    done
+    required_dataset_files+=("${LOWVIS_TRAJ_DATA_DIR}/meta_${split}.csv")
+done
+missing_dataset_files=()
+missing_dataset_count=0
+for path in "${required_dataset_files[@]}"; do
+    if [[ ! -s "${path}" ]]; then
+        missing_dataset_files+=("${path}")
+        missing_dataset_count=$((missing_dataset_count + 1))
+    fi
+done
+if (( missing_dataset_count > 0 )); then
+    echo "ERROR: trajectory dataset is missing or incomplete: ${LOWVIS_TRAJ_DATA_DIR}" >&2
+    printf '  missing: %s\n' "${missing_dataset_files[@]}" >&2
+    echo "Build it first with:" >&2
+    echo "  sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=${LOWVIS_TRAJ_DATA_DIR} ${SCRIPT_DIR}/sub_build_lowvis_trajectory_dataset.slurm" >&2
+    exit 2
+fi
+
 # Conservative RCCL settings already used by the stable S2 five-node jobs.
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=4
@@ -98,4 +123,3 @@ srun --nodes="${SLURM_NNODES}" \
      --gres=dcu:4 \
      --kill-on-bad-exit=1 \
      bash "${SCRIPT_DIR}/launch_lowvis_trajectory_distributed.sh"
-

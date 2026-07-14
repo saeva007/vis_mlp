@@ -51,6 +51,10 @@ versions are:
 - `pmst_canonical_units_v2_20260630`
 - `pm_explicit_legacy_scale_then_train_median_qc_v2_20260701`
 
+The five-node launcher also checks the config, all split arrays and metadata
+before starting `torchrun`; an incomplete build exits once with the exact
+missing-file list instead of producing the same traceback on all 20 ranks.
+
 ## 2. Train the Gaussian benchmark, then diffusion (five nodes, 20 DCUs)
 
 The Gaussian model is a separate distributional baseline, not a component of
