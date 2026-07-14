@@ -38,7 +38,10 @@ also supplies the cluster OpenSSL 1.1 and compatible HIPNN libraries on CPU
 nodes. The effective loader order is Jarvis lib, OpenSSL 1.1, compatible HIPNN,
 then any DTK/inherited libraries. This prevents both `libssl.so.1.1` failures
 and the incompatible `libgalaxyhip.so.5` / `hipThreadExchangeStreamCaptureMode`
-symbol error. An explicit `LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
+symbol error. The runtime validates the HIPNN directory and the final Torch
+import rather than requiring one hard-coded library filename, because library
+version names differ across cluster runtime builds. An explicit
+`LOWVIS_TRAJ_TORCH_ENV` still takes precedence.
 
 ```bash
 cd /public/home/putianshu/vis_mlp/train

@@ -31,8 +31,8 @@ else
     echo "ERROR: OpenSSL compatibility directory is missing: ${OPENSSL_COMPAT_LIB}" >&2
     return 2 2>/dev/null || exit 2
 fi
-if [[ ! -e "${HIPNN_COMPAT_LIB}/libgalaxyhip.so.5" ]]; then
-    echo "ERROR: compatible libgalaxyhip.so.5 is missing: ${HIPNN_COMPAT_LIB}" >&2
+if [[ ! -d "${HIPNN_COMPAT_LIB}" ]]; then
+    echo "ERROR: compatible HIPNN runtime directory is missing: ${HIPNN_COMPAT_LIB}" >&2
     return 2 2>/dev/null || exit 2
 fi
 
