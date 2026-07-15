@@ -19,6 +19,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
+from lowvis_trajectory_contract import COMPARISON_LEADS, COMPARISON_TARGET_POSITIONS
+
 from lowvis_trajectory_diffusion import (
     DYNAMIC_FEATURE_ORDER,
     DiffusionSchedule,
@@ -197,7 +199,11 @@ def make_model_config(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
-def monitor_indices(data_dir: Path, limit: int) -> Tuple[np.ndarray, np.ndarray]:
+def monitor_indices(
+    data_dir: Path,
+    limit: int,
+    lead_positions: Sequence[int] = COMPARISON_TARGET_POSITIONS,
+) -> Tuple[np.ndarray, np.ndarray]:
     vis = np.load(data_dir / "visibility_val.npy", mmap_mode="r")
     mask = np.load(data_dir / "target_mask_val.npy", mmap_mode="r")
     n = int(vis.shape[0])
@@ -206,8 +212,8 @@ def monitor_indices(data_dir: Path, limit: int) -> Tuple[np.ndarray, np.ndarray]
     chunk = 20_000
     for start in range(0, n, chunk):
         stop = min(n, start + chunk)
-        values = np.asarray(vis[start:stop], dtype=np.float32)
-        valid = np.asarray(mask[start:stop], dtype=bool) & np.isfinite(values)
+        values = np.asarray(vis[start:stop], dtype=np.float32)[:, lead_positions]
+        valid = np.asarray(mask[start:stop], dtype=bool)[:, lead_positions] & np.isfinite(values)
         minima = np.min(np.where(valid, values, np.inf), axis=1)
         low.extend((np.where(minima < 1000.0)[0] + start).tolist())
     if len(low) > limit:
@@ -241,6 +247,7 @@ def validation_crps(
     seed: int,
     rank: int,
     world: int,
+    lead_positions: Sequence[int] = COMPARISON_TARGET_POSITIONS,
 ) -> float:
     model.eval()
     local_indices = np.asarray(indices, dtype=np.int64)[rank::world]
@@ -265,6 +272,9 @@ def validation_crps(
         target = batch["target"].cpu().numpy().astype(np.float64)
         target = target * np.asarray(scaler.target_scale) + np.asarray(scaler.target_mean)
         mask = batch["target_mask"].cpu().numpy().astype(bool)
+        samples = samples[..., lead_positions]
+        target = target[..., lead_positions]
+        mask = mask[..., lead_positions]
         first = np.mean(np.abs(samples - target[:, None, :]), axis=1)
         pair = np.mean(
             np.abs(samples[:, :, None, :] - samples[:, None, :, :]), axis=(1, 2)
@@ -357,6 +367,7 @@ def main() -> None:
             "checkpoint_path": str(checkpoint_dir / f"{args.run_id}_best.pt"),
             "world_size": int(world),
             "global_batch_size": int(world * args.batch_size),
+            "checkpoint_selection_leads": list(COMPARISON_LEADS),
         }
         (checkpoint_dir / f"{args.run_id}_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
         print(json.dumps(run_config, indent=2), flush=True)
@@ -462,8 +473,8 @@ def main() -> None:
                         low_weight = min(max(float(args.lowvis_selection_weight), 0.0), 1.0)
                         score = (1.0 - low_weight) * overall_crps + low_weight * lowvis_crps
                         metrics = {
-                            "overall_log_crps": float(overall_crps),
-                            "lowvis_log_crps": float(lowvis_crps),
+                            "overall_log_crps_12_48": float(overall_crps),
+                            "lowvis_log_crps_12_48": float(lowvis_crps),
                             "lowvis_selection_weight": float(low_weight),
                             "selection_score": float(score),
                         }

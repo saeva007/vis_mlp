@@ -9,9 +9,12 @@ import numpy as np
 import pandas as pd
 
 
-CONDITION_LEADS = tuple(range(0, 49))
-TARGET_LEADS = tuple(range(12, 49))
+CONDITION_LEADS = tuple(range(1, 49))
+TARGET_LEADS = tuple(range(1, 49))
 TARGET_LENGTH = len(TARGET_LEADS)
+TARGET_CONDITION_POSITIONS = tuple(CONDITION_LEADS.index(lead) for lead in TARGET_LEADS)
+COMPARISON_LEADS = tuple(range(12, 49))
+COMPARISON_TARGET_POSITIONS = tuple(TARGET_LEADS.index(lead) for lead in COMPARISON_LEADS)
 DYNAMIC_FEATURE_ORDER = (
     "RH2M", "T2M", "PRECIP", "MSLP", "SW_RAD", "U10", "WSPD10",
     "V10", "WDIR10", "CAPE", "LCC", "T_925", "RH_925", "U_925",
@@ -42,11 +45,11 @@ def shifted_lead_indices(
     requested_shift_hours: Union[str, float] = "auto",
     auto_candidates: Sequence[float] = (0.0, -8.0, 8.0),
 ) -> Tuple[Optional[np.ndarray], Optional[float]]:
-    """Resolve the 0--48 h trajectory after an explicit or audited time shift.
+    """Resolve the available 1--48 h trajectory after an audited time shift.
 
     Some Tianji station products store valid times in Beijing time while the
-    run name is UTC.  In that case the raw lead coordinate is 8--56 h and the
-    established normalization is -8 h.  Auto mode only tests the small,
+    run name is UTC. In that case the raw lead coordinate is 9--56 h and the
+    established normalization is -8 h. Auto mode only tests the small,
     declared candidate set; it never invents a shift from the observations.
     """
 

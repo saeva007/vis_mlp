@@ -22,6 +22,8 @@ from torch import Tensor, nn
 from torch.utils.data import Dataset
 
 from lowvis_trajectory_contract import (
+    COMPARISON_LEADS,
+    COMPARISON_TARGET_POSITIONS,
     CONDITION_LEADS,
     DYNAMIC_FEATURE_ORDER,
     MAX_VISIBILITY_M,
@@ -552,9 +554,11 @@ def read_dataset_config(data_dir: str | Path) -> Dict[str, object]:
     if tuple(config.get("dynamic_feature_order", [])) != DYNAMIC_FEATURE_ORDER:
         raise ValueError("Dataset dynamic_feature_order does not match the trajectory model contract")
     if tuple(config.get("condition_leads", [])) != CONDITION_LEADS:
-        raise ValueError("Dataset condition leads do not match 0-48 h")
+        raise ValueError("Dataset condition leads do not match 1-48 h")
     if tuple(config.get("target_leads", [])) != TARGET_LEADS:
-        raise ValueError("Dataset target leads do not match 12-48 h")
+        raise ValueError("Dataset target leads do not match 1-48 h")
+    if tuple(config.get("comparison_leads", [])) != COMPARISON_LEADS:
+        raise ValueError("Dataset comparison leads do not match the fixed 12-48 h view")
     if config.get("canonical_unit_policy") != PM_UNIT_POLICY_VERSION:
         raise ValueError("Dataset canonical unit policy is missing or stale")
     if config.get("pm_qc_policy") != PM_QC_POLICY_VERSION:

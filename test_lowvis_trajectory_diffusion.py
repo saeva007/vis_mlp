@@ -13,7 +13,12 @@ import torch
 import xarray as xr
 
 import lowvis_trajectory_diffusion as common
-from lowvis_trajectory_contract import shifted_lead_indices, visibility_grid
+from lowvis_trajectory_contract import (
+    COMPARISON_TARGET_POSITIONS,
+    TARGET_CONDITION_POSITIONS,
+    shifted_lead_indices,
+    visibility_grid,
+)
 
 
 class TrajectoryContractTests(unittest.TestCase):
@@ -34,26 +39,31 @@ class TrajectoryContractTests(unittest.TestCase):
 
     def test_feature_and_lead_contract(self):
         self.assertEqual(len(common.DYNAMIC_FEATURE_ORDER), 27)
-        self.assertEqual(common.CONDITION_LEADS, tuple(range(49)))
-        self.assertEqual(common.TARGET_LEADS, tuple(range(12, 49)))
+        self.assertEqual(common.CONDITION_LEADS, tuple(range(1, 49)))
+        self.assertEqual(common.TARGET_LEADS, tuple(range(1, 49)))
+        self.assertEqual(TARGET_CONDITION_POSITIONS, tuple(range(48)))
+        self.assertEqual(COMPARISON_TARGET_POSITIONS, tuple(range(11, 48)))
 
     def test_exact_leads_reject_gap(self):
-        leads = np.arange(49, dtype=np.float32)
-        self.assertTrue(np.array_equal(common.exact_lead_indices(leads), np.arange(49)))
+        leads = np.arange(1, 49, dtype=np.float32)
+        self.assertTrue(np.array_equal(common.exact_lead_indices(leads), np.arange(48)))
         self.assertIsNone(common.exact_lead_indices(np.delete(leads, 17)))
 
     def test_lead_shift_auto_resolves_bjt_valid_times(self):
-        indices, shift = shifted_lead_indices(np.arange(8, 57, dtype=np.float32), "auto")
-        np.testing.assert_array_equal(indices, np.arange(49))
+        indices, shift = shifted_lead_indices(np.arange(9, 57, dtype=np.float32), "auto")
+        np.testing.assert_array_equal(indices, np.arange(48))
         self.assertEqual(shift, -8.0)
-        missing, missing_shift = shifted_lead_indices(np.arange(7, 56, dtype=np.float32), 0)
+        missing, missing_shift = shifted_lead_indices(np.arange(2, 50, dtype=np.float32), 0)
         self.assertIsNone(missing)
         self.assertIsNone(missing_shift)
 
     def test_visibility_grid_normalizes_dimension_order_and_station_type(self):
-        times = pd.date_range("2025-01-01T12:00", periods=37, freq="h")
+        times = pd.date_range("2025-01-01T01:00", periods=common.TARGET_LENGTH, freq="h")
         values = np.vstack(
-            [np.arange(37, dtype=np.float32), np.arange(37, dtype=np.float32) + 100.0]
+            [
+                np.arange(common.TARGET_LENGTH, dtype=np.float32),
+                np.arange(common.TARGET_LENGTH, dtype=np.float32) + 100.0,
+            ]
         )
         source = xr.DataArray(
             values,
@@ -66,25 +76,25 @@ class TrajectoryContractTests(unittest.TestCase):
             np.asarray([54527, "A001"], dtype=object),
             tolerance_minutes=31.0,
         )
-        self.assertEqual(aligned.shape, (2, 37))
+        self.assertEqual(aligned.shape, (2, common.TARGET_LENGTH))
         np.testing.assert_array_equal(aligned, values)
-        self.assertEqual(diagnostics["matched_target_times"], 37)
+        self.assertEqual(diagnostics["matched_target_times"], common.TARGET_LENGTH)
         self.assertEqual(diagnostics["matched_stations"], 2)
 
     def test_full_trajectory_split_containment(self):
         # January test is the final three days; this trajectory stays inside it.
-        inside = np.array("2025-01-29T00", dtype="datetime64[h]") + np.arange(12, 49).astype("timedelta64[h]")
+        inside = np.array("2025-01-29T00", dtype="datetime64[h]") + np.arange(1, 49).astype("timedelta64[h]")
         self.assertEqual(common.full_trajectory_split(inside), "test")
-        crossing = np.array("2025-01-27T00", dtype="datetime64[h]") + np.arange(12, 49).astype("timedelta64[h]")
+        crossing = np.array("2025-01-27T00", dtype="datetime64[h]") + np.arange(1, 49).astype("timedelta64[h]")
         self.assertIsNone(common.full_trajectory_split(crossing))
 
     def test_scaler_round_trip_and_train_only_fill(self):
         rng = np.random.default_rng(4)
-        dynamic = rng.normal(size=(8, 49, 27)).astype(np.float32)
+        dynamic = rng.normal(size=(8, len(common.CONDITION_LEADS), 27)).astype(np.float32)
         dynamic[0, 0, 0] = np.nan
         static = rng.normal(size=(8, 5)).astype(np.float32)
-        visibility = rng.uniform(100.0, 5000.0, size=(8, 37)).astype(np.float32)
-        mask = np.ones((8, 37), dtype=bool)
+        visibility = rng.uniform(100.0, 5000.0, size=(8, common.TARGET_LENGTH)).astype(np.float32)
+        mask = np.ones((8, common.TARGET_LENGTH), dtype=bool)
         scaler = common.TrajectoryScaler.fit_arrays(dynamic, static, visibility, mask, max_rows=8)
         encoded = scaler.transform_target(visibility, mask)
         decoded = scaler.inverse_target(encoded)
@@ -99,20 +109,20 @@ class TrajectoryContractTests(unittest.TestCase):
         ).eval()
         schedule = common.DiffusionSchedule(10)
         batch = {
-            "condition": torch.randn(2, 49, 54),
+            "condition": torch.randn(2, len(common.CONDITION_LEADS), 54),
             "static": torch.randn(2, 5),
             "veg": torch.tensor([1, 2]),
             "time_features": torch.randn(2, 4),
-            "target": torch.randn(2, 37),
-            "target_mask": torch.ones(2, 37),
+            "target": torch.randn(2, common.TARGET_LENGTH),
+            "target_mask": torch.ones(2, common.TARGET_LENGTH),
         }
         step = torch.tensor([2, 5])
         noisy, noise = schedule.q_sample(batch["target"], step)
         predicted = model(noisy, step, batch["condition"], batch["static"], batch["veg"], batch["time_features"])
-        self.assertEqual(tuple(predicted.shape), (2, 37))
+        self.assertEqual(tuple(predicted.shape), (2, common.TARGET_LENGTH))
         self.assertTrue(torch.isfinite(common.masked_diffusion_loss(predicted, noise, batch["target_mask"])))
         samples = common.ddim_sample(model, schedule, batch, members=2, steps=2)
-        self.assertEqual(tuple(samples.shape), (2, 2, 37))
+        self.assertEqual(tuple(samples.shape), (2, 2, common.TARGET_LENGTH))
         probs = common.visibility_class_probabilities(np.abs(samples.numpy()) * 1200.0)
         np.testing.assert_allclose(probs.sum(axis=-1), 1.0, atol=1e-6)
 
@@ -126,17 +136,17 @@ class TrajectoryContractTests(unittest.TestCase):
             condition_token_version=2,
         ).eval()
         batch = {
-            "condition": torch.randn(2, 49, 54),
+            "condition": torch.randn(2, len(common.CONDITION_LEADS), 54),
             "static": torch.randn(2, 5),
             "veg": torch.tensor([1, 2]),
             "time_features": torch.randn(2, 4),
-            "target": torch.randn(2, 37),
-            "target_mask": torch.ones(2, 37),
+            "target": torch.randn(2, common.TARGET_LENGTH),
+            "target_mask": torch.ones(2, common.TARGET_LENGTH),
         }
         memory, context = model.condition_encoder(
             batch["condition"], batch["static"], batch["veg"], batch["time_features"]
         )
-        self.assertEqual(tuple(memory.shape), (2, 53, 32))
+        self.assertEqual(tuple(memory.shape), (2, len(common.CONDITION_LEADS) + 4, 32))
         self.assertEqual(tuple(context.shape), (2, 32))
 
         schedule = common.DiffusionSchedule(10, ddim_clip_x0=6.0)
@@ -171,17 +181,20 @@ class TrajectoryContractTests(unittest.TestCase):
             d_model=32, nhead=4, condition_layers=1, decoder_layers=1, dropout=0.0
         ).eval()
         batch = {
-            "condition": torch.randn(2, 49, 54),
+            "condition": torch.randn(2, len(common.CONDITION_LEADS), 54),
             "static": torch.randn(2, 5),
             "veg": torch.tensor([1, 2]),
             "time_features": torch.randn(2, 4),
-            "target": torch.randn(2, 37),
-            "target_mask": torch.ones(2, 37),
+            "target": torch.randn(2, common.TARGET_LENGTH),
+            "target_mask": torch.ones(2, common.TARGET_LENGTH),
         }
         mean, log_scale = model(batch["condition"], batch["static"], batch["veg"], batch["time_features"])
-        self.assertEqual(tuple(mean.shape), (2, 37))
+        self.assertEqual(tuple(mean.shape), (2, common.TARGET_LENGTH))
         self.assertTrue(torch.isfinite(common.masked_gaussian_nll(mean, log_scale, batch["target"], batch["target_mask"])))
-        self.assertEqual(tuple(common.gaussian_sample(model, batch, members=3).shape), (2, 3, 37))
+        self.assertEqual(
+            tuple(common.gaussian_sample(model, batch, members=3).shape),
+            (2, 3, common.TARGET_LENGTH),
+        )
 
     def test_canonical_pm_policy(self):
         policy_dir = Path(__file__).resolve().parents[1] / "ifs_baseline"

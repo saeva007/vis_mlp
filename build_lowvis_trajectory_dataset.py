@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the candidate 0-48 h condition / 12-48 h visibility trajectory dataset."""
+"""Build the candidate 1-48 h condition / 1-48 h visibility trajectory dataset."""
 
 from __future__ import annotations
 
@@ -20,11 +20,13 @@ from tqdm import tqdm
 
 from lowvis_trajectory_contract import (
     CONDITION_LEADS,
+    COMPARISON_LEADS,
     DYNAMIC_FEATURE_ORDER,
     MAX_VISIBILITY_M,
     PM_QC_POLICY_VERSION,
     PM_UNIT_POLICY_VERSION,
     TARGET_LEADS,
+    TARGET_CONDITION_POSITIONS,
     canonical_station_key,
     full_trajectory_split,
     shifted_lead_indices,
@@ -65,16 +67,16 @@ def parse_args() -> argparse.Namespace:
         "--out-dir",
         default=os.environ.get(
             "LOWVIS_TRAJ_DATA_DIR",
-            os.path.join(BASE_PATH, "ml_dataset_s2_tianji_trajectory_0_48h_pm10_pm25_v1"),
+            os.path.join(BASE_PATH, "ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1"),
         ),
     )
     p.add_argument("--pmst-common-dir", default=os.environ.get("PMST_COMMON_DIR", ""))
-    p.add_argument("--min-valid-targets", type=int, default=30)
+    p.add_argument("--min-valid-targets", type=int, default=39)
     p.add_argument("--limit-runs", type=int, default=0)
     p.add_argument(
         "--forecast-time-shift-hours",
         default=os.environ.get("TIANJI_INPUT_TIME_SHIFT_HOURS", "auto"),
-        help="Shift raw forecast valid times before lead/target alignment; use auto, 0, -8, or 8.",
+        help="Shift raw forecast valid times before 1-48 h lead/target alignment; use auto, 0, -8, or 8.",
     )
     p.add_argument("--target-time-tolerance-minutes", type=float, default=31.0)
     p.add_argument(
@@ -219,7 +221,7 @@ def sha256_file_manifest(paths: Sequence[str]) -> str:
 def main() -> None:
     args = parse_args()
     if not (0 < args.min_valid_targets <= len(TARGET_LEADS)):
-        raise ValueError("--min-valid-targets must be in [1, 37]")
+        raise ValueError(f"--min-valid-targets must be in [1, {len(TARGET_LEADS)}]")
     if args.target_time_tolerance_minutes <= 0:
         raise ValueError("--target-time-tolerance-minutes must be positive")
     if args.empty_run_fail_fast < 0:
@@ -306,7 +308,7 @@ def main() -> None:
                     lead_values = np.asarray(ds_run["lead_time"].values, dtype=float)
                     if audit["runs_missing_leads"] == 1:
                         print(
-                            f"[ALIGN] run={run_str} cannot resolve 0-48 h leads: "
+                            f"[ALIGN] run={run_str} cannot resolve 1-48 h leads: "
                             f"raw_range=[{np.nanmin(lead_values):.3f}, {np.nanmax(lead_values):.3f}], "
                             f"requested_shift={args.forecast_time_shift_hours!r}",
                             flush=True,
@@ -319,7 +321,7 @@ def main() -> None:
                 times = pd.DatetimeIndex(pd.to_datetime(ds.time.values)) + pd.Timedelta(
                     hours=float(time_shift_hours)
                 )
-                target_times = times[np.asarray(TARGET_LEADS, dtype=int)]
+                target_times = times[np.asarray(TARGET_CONDITION_POSITIONS, dtype=int)]
                 split = trajectory_split(target_times)
                 if split is None:
                     audit["runs_crossing_split"] += 1
@@ -363,7 +365,7 @@ def main() -> None:
                 current_max = int(valid_counts.max()) if len(valid_counts) else 0
                 if audit["trajectories_seen"] == int(len(stations)):
                     print(
-                        "[ALIGN] first eligible run "
+                        "[ALIGN] first split-eligible run "
                         f"run={run_str} split={split} shift_hours={float(time_shift_hours):g} "
                         f"matched_times={vis_diagnostics['matched_target_times']}/{vis_diagnostics['target_times']} "
                         f"matched_stations={vis_diagnostics['matched_stations']}/{vis_diagnostics['forecast_stations']} "
@@ -395,6 +397,7 @@ def main() -> None:
                         "target_end": np.repeat(target_times[-1], int(keep.sum())),
                     }
                 )
+                first_retained_run = sum(writer.counts.values()) == 0
                 writer.write(
                     split,
                     {
@@ -409,6 +412,12 @@ def main() -> None:
                 )
                 audit["runs_processed"] += 1
                 audit["trajectories_kept"] += int(keep.sum())
+                if first_retained_run:
+                    print(
+                        f"[WRITE] first retained run={run_str} split={split} "
+                        f"trajectories={int(keep.sum())} valid_target_range=[{current_min}, {current_max}]",
+                        flush=True,
+                    )
             except Exception as exc:
                 audit["runs_failed"] += 1
                 print(f"[WARN] run {run_str} failed: {exc}", flush=True)
@@ -420,7 +429,7 @@ def main() -> None:
                     systemic = None
                     attempted = int(audit["runs_attempted"])
                     if int(audit["runs_missing_leads"]) == attempted:
-                        systemic = "all attempted runs are missing an aligned 0-48 h lead trajectory"
+                        systemic = "all attempted runs are missing an aligned 1-48 h lead trajectory"
                     elif int(audit["runs_no_visibility_station_match"]) >= fail_fast:
                         systemic = "no forecast station matches the visibility source"
                     elif int(audit["runs_no_visibility_time_match"]) >= fail_fast:
@@ -450,6 +459,7 @@ def main() -> None:
         "candidate_only": True,
         "condition_leads": list(CONDITION_LEADS),
         "target_leads": list(TARGET_LEADS),
+        "comparison_leads": list(COMPARISON_LEADS),
         "dynamic_feature_order": list(DYNAMIC_FEATURE_ORDER),
         "static_continuous_order": ["lat_norm", "lon_norm", "orography", "orography_anom", "orography_std"],
         "time_feature_order": ["init_hour_sin", "init_hour_cos", "init_doy_sin", "init_doy_cos"],

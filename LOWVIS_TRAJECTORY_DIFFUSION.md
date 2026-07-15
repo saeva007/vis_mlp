@@ -5,10 +5,14 @@ the paper-facing Static-MLP+GRU predictions.
 
 ## Scientific contract
 
-- Condition: one Tianji initialization, one station, hourly 0-48 h forecast
+- Condition: one Tianji initialization, one station, hourly 1-48 h forecast
   trajectory, 27 dynamic variables, five continuous station descriptors,
   vegetation category, and initialization-time encoding.
-- Response: absolute observed `log1p(visibility)` at leads 12-48 h.
+- The source files contain no genuine lead 0. Lead 1 is not duplicated or
+  relabeled as lead 0; the recorded condition tensor is therefore `48 x 27`.
+- Response: absolute observed `log1p(visibility)` at leads 1-48 h. Full-horizon
+  metrics are reported alongside a fixed 12-48 h comparison view for the
+  existing Static-RNN baseline.
 - No Static-RNN logits, residual target, auxiliary classifier, or 36-variable
   hand-engineered feature branch is used.
 - Fog is `<500 m`, Mist is `500-1000 m`, and Clear is `>=1000 m`.
@@ -54,8 +58,9 @@ tolerance and station identifiers are normalized before matching. If these
 checks still produce no samples, the builder stops after 24 systemic failures
 and writes a reasoned failure audit instead of scanning all runs blindly.
 
-If a previous failed build left partial arrays in the output directory, rerun
-the same output path explicitly with:
+The corrected 1-48 h contract uses a new default output directory, so the
+failed 0-48 h partial arrays are not reused. If an explicitly selected output
+path contains a failed build, rerun that same path only with:
 
 ```bash
 sbatch --export=ALL,LOWVIS_TRAJ_BUILD_EXTRA_ARGS=--allow-overwrite \
@@ -65,13 +70,13 @@ sbatch --export=ALL,LOWVIS_TRAJ_BUILD_EXTRA_ARGS=--allow-overwrite \
 Recommended explicit version tag:
 
 ```bash
-sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_0_48h_pm10_pm25_v1 \
+sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1 \
   sub_build_lowvis_trajectory_dataset.slurm
 ```
 
 Before training, verify that `dataset_build_config.json` reports non-zero
-train/val/test counts, `dynamic_feature_order` has 27 entries, and the policy
-versions are:
+train/val/test counts, `condition_leads` and `target_leads` are both 1-48,
+`dynamic_feature_order` has 27 entries, and the policy versions are:
 
 - `pmst_canonical_units_v2_20260630`
 - `pm_explicit_legacy_scale_then_train_median_qc_v2_20260701`
@@ -93,9 +98,11 @@ batch 128 to an overly large global batch.  It also enables:
 - EMA inference weights, 2,000-step warmup and cosine learning-rate decay;
 - Min-SNR (`gamma=5`) diffusion-timestep weighting and stratified timestep
   draws; these are not class or event weights;
-- checkpoint selection on fixed-noise validation ensembles, weighted 40% for
-  overall CRPS and 60% for low-visibility conditional CRPS; validation is
-  sharded across all 20 ranks rather than leaving 19 DCUs idle.
+- checkpoint selection on the fixed 12-48 h comparison window using
+  fixed-noise validation ensembles, weighted 40% for overall CRPS and 60% for
+  low-visibility conditional CRPS; the 1-11 h outputs are still trained and
+  reported but cannot make checkpoint selection look artificially easier;
+  validation is sharded across all 20 ranks rather than leaving 19 DCUs idle.
 
 The same architecture and checkpoint-selection profile is used for the
 Gaussian comparison where applicable. Test data are never used for training,

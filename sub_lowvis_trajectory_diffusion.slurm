@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 BASE="${LOWVIS_TRAJ_BASE:-/public/home/putianshu/vis_mlp}"
 export SCRIPT_DIR BASE
-export LOWVIS_TRAJ_DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_0_48h_pm10_pm25_v1}"
+export LOWVIS_TRAJ_DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1}"
 export LOWVIS_TRAJ_MODEL_TYPE="${LOWVIS_TRAJ_MODEL_TYPE:-diffusion}"
 export LOWVIS_TRAJ_RUN_ID="${LOWVIS_TRAJ_RUN_ID:-exp_${SLURM_JOB_ID}_lowvis_trajectory_${LOWVIS_TRAJ_MODEL_TYPE}_5n}"
 export LOWVIS_TRAJ_CHECKPOINT_DIR="${LOWVIS_TRAJ_CHECKPOINT_DIR:-${BASE}/checkpoints}"
