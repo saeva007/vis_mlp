@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,108 @@ def exact_lead_indices(lead_values: np.ndarray) -> Optional[np.ndarray]:
     if len(set(indices)) != len(indices):
         return None
     return np.asarray(indices, dtype=np.int64)
+
+
+def shifted_lead_indices(
+    lead_values: np.ndarray,
+    requested_shift_hours: Union[str, float] = "auto",
+    auto_candidates: Sequence[float] = (0.0, -8.0, 8.0),
+) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    """Resolve the 0--48 h trajectory after an explicit or audited time shift.
+
+    Some Tianji station products store valid times in Beijing time while the
+    run name is UTC.  In that case the raw lead coordinate is 8--56 h and the
+    established normalization is -8 h.  Auto mode only tests the small,
+    declared candidate set; it never invents a shift from the observations.
+    """
+
+    if isinstance(requested_shift_hours, str):
+        value = requested_shift_hours.strip().lower()
+        if value == "auto":
+            candidates = tuple(float(v) for v in auto_candidates)
+        else:
+            candidates = (float(value),)
+    else:
+        candidates = (float(requested_shift_hours),)
+    for shift in candidates:
+        indices = exact_lead_indices(np.asarray(lead_values, dtype=float) + shift)
+        if indices is not None:
+            return indices, shift
+    return None, None
+
+
+def canonical_station_key(value: object) -> str:
+    """Normalize numeric station-id representations without altering named ids."""
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and float(value).is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    if np.isfinite(numeric) and numeric.is_integer() and text.endswith(".0"):
+        return str(int(numeric))
+    return text
+
+
+def visibility_grid(
+    vis_da: Any,
+    target_times: pd.DatetimeIndex,
+    stations: np.ndarray,
+    tolerance_minutes: float,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Return visibility as [station, target_lead] with audited coordinate matching.
+
+    ``vis_da`` is intentionally duck-typed so this data contract stays free of
+    both Torch and an import-time xarray dependency.
+    """
+
+    required = {"time", "station_id"}
+    if not required.issubset(vis_da.dims):
+        raise ValueError(f"Visibility must have time/station_id dimensions; got {vis_da.dims}")
+    extra = [dim for dim in vis_da.dims if dim not in required]
+    if extra:
+        non_singleton = {dim: int(vis_da.sizes[dim]) for dim in extra if int(vis_da.sizes[dim]) != 1}
+        if non_singleton:
+            raise ValueError(f"Visibility has unsupported non-singleton dimensions: {non_singleton}")
+        vis_da = vis_da.isel({dim: 0 for dim in extra}, drop=True)
+    ordered = vis_da.transpose("time", "station_id").sortby("time")
+    source_times = pd.DatetimeIndex(pd.to_datetime(ordered.time.values))
+    if source_times.has_duplicates:
+        raise ValueError("Visibility time coordinate contains duplicates")
+    time_pos = source_times.get_indexer(target_times, method="nearest")
+    valid_t = time_pos >= 0
+    if valid_t.any():
+        valid_locations = np.flatnonzero(valid_t)
+        delta = np.abs(source_times.asi8[time_pos[valid_t]] - target_times.asi8[valid_t])
+        valid_t[valid_locations[delta > pd.Timedelta(minutes=tolerance_minutes).value]] = False
+
+    source_keys = pd.Index([canonical_station_key(v) for v in ordered.station_id.values])
+    if source_keys.has_duplicates:
+        duplicates = source_keys[source_keys.duplicated()].unique().tolist()[:5]
+        raise ValueError(f"Visibility station ids are duplicated after normalization: {duplicates}")
+    station_pos = source_keys.get_indexer([canonical_station_key(v) for v in stations])
+    valid_s = station_pos >= 0
+
+    out = np.full((len(target_times), len(stations)), np.nan, dtype=np.float32)
+    if valid_t.any() and valid_s.any():
+        raw = ordered.isel(
+            time=np.flatnonzero(valid_t).tolist(),
+            station_id=station_pos[valid_s].tolist(),
+        ).values
+        out[np.ix_(np.flatnonzero(valid_t), np.flatnonzero(valid_s))] = np.asarray(raw, dtype=np.float32)
+    diagnostics = {
+        "matched_target_times": int(valid_t.sum()),
+        "target_times": int(len(target_times)),
+        "matched_stations": int(valid_s.sum()),
+        "forecast_stations": int(len(stations)),
+    }
+    return out.T, diagnostics
 
 
 def monthly_tail_masks(

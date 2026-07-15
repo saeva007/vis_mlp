@@ -46,6 +46,22 @@ cd /public/home/putianshu/vis_mlp/train
 sbatch sub_build_lowvis_trajectory_dataset.slurm
 ```
 
+The builder audits the forecast timestamp convention before matching targets.
+`TIANJI_INPUT_TIME_SHIFT_HOURS=auto` (the default) accepts only the declared
+0/-8/+8 hour conventions and records the applied shift in
+`dataset_build_config.json`. Visibility time matching uses a 31-minute
+tolerance and station identifiers are normalized before matching. If these
+checks still produce no samples, the builder stops after 24 systemic failures
+and writes a reasoned failure audit instead of scanning all runs blindly.
+
+If a previous failed build left partial arrays in the output directory, rerun
+the same output path explicitly with:
+
+```bash
+sbatch --export=ALL,LOWVIS_TRAJ_BUILD_EXTRA_ARGS=--allow-overwrite \
+  sub_build_lowvis_trajectory_dataset.slurm
+```
+
 Recommended explicit version tag:
 
 ```bash

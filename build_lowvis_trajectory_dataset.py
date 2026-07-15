@@ -25,9 +25,11 @@ from lowvis_trajectory_contract import (
     PM_QC_POLICY_VERSION,
     PM_UNIT_POLICY_VERSION,
     TARGET_LEADS,
-    exact_lead_indices,
+    canonical_station_key,
     full_trajectory_split,
+    shifted_lead_indices,
     time_features_from_init,
+    visibility_grid,
 )
 from PMST_s2_data_48h_pm10 import (
     AppendableNpyWriter,
@@ -69,6 +71,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pmst-common-dir", default=os.environ.get("PMST_COMMON_DIR", ""))
     p.add_argument("--min-valid-targets", type=int, default=30)
     p.add_argument("--limit-runs", type=int, default=0)
+    p.add_argument(
+        "--forecast-time-shift-hours",
+        default=os.environ.get("TIANJI_INPUT_TIME_SHIFT_HOURS", "auto"),
+        help="Shift raw forecast valid times before lead/target alignment; use auto, 0, -8, or 8.",
+    )
+    p.add_argument("--target-time-tolerance-minutes", type=float, default=31.0)
+    p.add_argument(
+        "--empty-run-fail-fast",
+        type=int,
+        default=24,
+        help="Stop after this many attempted runs when a systemic alignment error still yields zero samples; 0 disables.",
+    )
     p.add_argument("--allow-overwrite", action="store_true")
     return p.parse_args()
 
@@ -102,9 +116,12 @@ def station_pm_raw_grid(pm_da: xr.DataArray, times: pd.DatetimeIndex, stations: 
     if pm_da is None:
         raise RuntimeError("PM source is required for the 27-variable trajectory contract")
     time_index = pd.DatetimeIndex(pd.to_datetime(pm_da.time.values))
-    sid_index = pd.Index(pm_da.station_id.values)
+    sid_index = pd.Index([canonical_station_key(v) for v in pm_da.station_id.values])
+    if sid_index.has_duplicates:
+        duplicates = sid_index[sid_index.duplicated()].unique().tolist()[:5]
+        raise ValueError(f"PM station ids are duplicated after normalization: {duplicates}")
     time_pos = time_index.get_indexer(times, method="nearest")
-    sid_pos = sid_index.get_indexer(stations)
+    sid_pos = sid_index.get_indexer([canonical_station_key(v) for v in stations])
     nt, ns = len(times), len(stations)
     out = np.full((nt, ns), np.nan, dtype=np.float32)
     if np.any(time_pos < 0) or np.any(sid_pos < 0):
@@ -203,6 +220,12 @@ def main() -> None:
     args = parse_args()
     if not (0 < args.min_valid_targets <= len(TARGET_LEADS)):
         raise ValueError("--min-valid-targets must be in [1, 37]")
+    if args.target_time_tolerance_minutes <= 0:
+        raise ValueError("--target-time-tolerance-minutes must be positive")
+    if args.empty_run_fail_fast < 0:
+        raise ValueError("--empty-run-fail-fast must be non-negative")
+    if str(args.forecast_time_shift_hours).strip().lower() != "auto":
+        float(args.forecast_time_shift_hours)
     out_dir = Path(args.out_dir)
     ensure_fresh_output(out_dir, args.allow_overwrite)
     policy, policy_dir = load_pm_policy(args)
@@ -225,7 +248,20 @@ def main() -> None:
     ds_vis = xr.open_dataset(args.visibility_nc, engine="h5netcdf")
     if "vis" in ds_vis and "visibility" not in ds_vis:
         ds_vis = ds_vis.rename({"vis": "visibility"})
+    if "station_id" not in ds_vis.dims and "station_id" not in ds_vis.coords:
+        station_alias = next(
+            (name for name in ("num_station", "station", "id") if name in ds_vis.dims or name in ds_vis.coords),
+            None,
+        )
+        if station_alias is not None:
+            ds_vis = ds_vis.rename({station_alias: "station_id"})
     vis_da = ds_vis["visibility"]
+    print(
+        "[SOURCE] visibility "
+        f"dims={dict(vis_da.sizes)} "
+        f"time=[{pd.Timestamp(vis_da.time.values[0])}, {pd.Timestamp(vis_da.time.values[-1])}]",
+        flush=True,
+    )
     pm10_da = load_station_pm_dataarray(args.pm10_file, args.pm10_dir, ("pm10", "PM10"), "PM10")
     pm25_da = load_station_pm_dataarray(args.pm25_file, args.pm25_dir, ("pm2p5", "pm25", "pm2_5", "PM2_5"), "PM2.5")
     if pm10_da is None or pm25_da is None:
@@ -237,25 +273,52 @@ def main() -> None:
     writer = TrajectoryWriter(out_dir)
     audit = {
         "runs_found": len(runs),
+        "runs_attempted": 0,
         "runs_processed": 0,
         "runs_missing_leads": 0,
         "runs_crossing_split": 0,
         "runs_failed": 0,
+        "runs_no_visibility_time_match": 0,
+        "runs_no_visibility_station_match": 0,
+        "runs_no_trajectory_kept": 0,
+        "trajectories_seen": 0,
+        "trajectories_kept": 0,
         "trajectories_low_coverage": 0,
+        "visibility_valid_targets_min": None,
+        "visibility_valid_targets_max": None,
+        "forecast_time_shift_counts": {},
+        "early_stop_reason": None,
     }
     try:
         for run_str in tqdm(runs, desc="trajectory runs"):
+            audit["runs_attempted"] += 1
             ds_run, init_time = load_merged_run_ds(run_str, data_veg, data_oro)
             if ds_run is None:
                 audit["runs_failed"] += 1
                 continue
             try:
-                indices = exact_lead_indices(ds_run["lead_time"].values)
+                indices, time_shift_hours = shifted_lead_indices(
+                    ds_run["lead_time"].values,
+                    args.forecast_time_shift_hours,
+                )
                 if indices is None:
                     audit["runs_missing_leads"] += 1
+                    lead_values = np.asarray(ds_run["lead_time"].values, dtype=float)
+                    if audit["runs_missing_leads"] == 1:
+                        print(
+                            f"[ALIGN] run={run_str} cannot resolve 0-48 h leads: "
+                            f"raw_range=[{np.nanmin(lead_values):.3f}, {np.nanmax(lead_values):.3f}], "
+                            f"requested_shift={args.forecast_time_shift_hours!r}",
+                            flush=True,
+                        )
                     continue
+                shift_key = f"{float(time_shift_hours):g}"
+                shift_counts = audit["forecast_time_shift_counts"]
+                shift_counts[shift_key] = int(shift_counts.get(shift_key, 0)) + 1
                 ds = ds_run.isel(time=indices)
-                times = pd.DatetimeIndex(pd.to_datetime(ds.time.values))
+                times = pd.DatetimeIndex(pd.to_datetime(ds.time.values)) + pd.Timedelta(
+                    hours=float(time_shift_hours)
+                )
                 target_times = times[np.asarray(TARGET_LEADS, dtype=int)]
                 split = trajectory_split(target_times)
                 if split is None:
@@ -282,13 +345,45 @@ def main() -> None:
                 static = np.concatenate([lats[:, None] / 90.0, lons[:, None] / 180.0, terrain], axis=1).astype(np.float32)
                 init_features = np.repeat(time_features_from_init([init_time]), len(stations), axis=0)
 
-                vis = vis_da.sel(time=target_times, method="nearest").reindex(station_id=stations)
-                visibility = np.asarray(vis.values, dtype=np.float32).T
+                visibility, vis_diagnostics = visibility_grid(
+                    vis_da,
+                    target_times,
+                    stations,
+                    args.target_time_tolerance_minutes,
+                )
+                if vis_diagnostics["matched_target_times"] == 0:
+                    audit["runs_no_visibility_time_match"] += 1
+                if vis_diagnostics["matched_stations"] == 0:
+                    audit["runs_no_visibility_station_match"] += 1
+                audit["trajectories_seen"] += int(len(stations))
                 valid = np.isfinite(visibility) & (visibility >= 0.0) & (visibility <= MAX_VISIBILITY_M)
                 visibility = np.where(valid, visibility, np.nan).astype(np.float32)
-                keep = valid.sum(axis=1) >= int(args.min_valid_targets)
+                valid_counts = valid.sum(axis=1)
+                current_min = int(valid_counts.min()) if len(valid_counts) else 0
+                current_max = int(valid_counts.max()) if len(valid_counts) else 0
+                if audit["trajectories_seen"] == int(len(stations)):
+                    print(
+                        "[ALIGN] first eligible run "
+                        f"run={run_str} split={split} shift_hours={float(time_shift_hours):g} "
+                        f"matched_times={vis_diagnostics['matched_target_times']}/{vis_diagnostics['target_times']} "
+                        f"matched_stations={vis_diagnostics['matched_stations']}/{vis_diagnostics['forecast_stations']} "
+                        f"valid_targets_per_station=[{current_min}, {current_max}]",
+                        flush=True,
+                    )
+                audit["visibility_valid_targets_min"] = (
+                    current_min
+                    if audit["visibility_valid_targets_min"] is None
+                    else min(int(audit["visibility_valid_targets_min"]), current_min)
+                )
+                audit["visibility_valid_targets_max"] = (
+                    current_max
+                    if audit["visibility_valid_targets_max"] is None
+                    else max(int(audit["visibility_valid_targets_max"]), current_max)
+                )
+                keep = valid_counts >= int(args.min_valid_targets)
                 audit["trajectories_low_coverage"] += int((~keep).sum())
                 if not keep.any():
+                    audit["runs_no_trajectory_kept"] += 1
                     continue
                 meta = pd.DataFrame(
                     {
@@ -313,20 +408,36 @@ def main() -> None:
                     meta,
                 )
                 audit["runs_processed"] += 1
+                audit["trajectories_kept"] += int(keep.sum())
             except Exception as exc:
                 audit["runs_failed"] += 1
                 print(f"[WARN] run {run_str} failed: {exc}", flush=True)
             finally:
                 ds_run.close()
                 gc.collect()
+                fail_fast = int(args.empty_run_fail_fast)
+                if fail_fast > 0 and audit["runs_attempted"] >= fail_fast and sum(writer.counts.values()) == 0:
+                    systemic = None
+                    attempted = int(audit["runs_attempted"])
+                    if int(audit["runs_missing_leads"]) == attempted:
+                        systemic = "all attempted runs are missing an aligned 0-48 h lead trajectory"
+                    elif int(audit["runs_no_visibility_station_match"]) >= fail_fast:
+                        systemic = "no forecast station matches the visibility source"
+                    elif int(audit["runs_no_visibility_time_match"]) >= fail_fast:
+                        systemic = "no target time matches the visibility source within tolerance"
+                    elif int(audit["runs_no_trajectory_kept"]) >= fail_fast:
+                        systemic = "all aligned stations fail the minimum target-coverage rule"
+                    if systemic is not None:
+                        audit["early_stop_reason"] = systemic
+                        print(f"[ALIGN][FAIL-FAST] {systemic}; audit={json.dumps(audit, sort_keys=True)}", flush=True)
+                        break
     finally:
         writer.close()
         data_veg.close()
         data_oro.close()
         ds_vis.close()
 
-    if writer.counts["train"] == 0 or writer.counts["val"] == 0 or writer.counts["test"] == 0:
-        raise RuntimeError(f"Every split must be non-empty; counts={writer.counts}")
+    complete = all(writer.counts[tag] > 0 for tag in ("train", "val", "test"))
     forecast_files = [
         str(Path(args.current_48h_dir) / f"{variable}_{run}_0-48h_IDW.nc")
         for run in runs
@@ -335,6 +446,7 @@ def main() -> None:
     config = {
         "builder": Path(__file__).name,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "complete" if complete else "failed_empty_split",
         "candidate_only": True,
         "condition_leads": list(CONDITION_LEADS),
         "target_leads": list(TARGET_LEADS),
@@ -343,6 +455,9 @@ def main() -> None:
         "time_feature_order": ["init_hour_sin", "init_hour_cos", "init_doy_sin", "init_doy_cos"],
         "visibility_valid_range_m": [0.0, MAX_VISIBILITY_M],
         "min_valid_targets": int(args.min_valid_targets),
+        "forecast_time_shift_hours_requested": str(args.forecast_time_shift_hours),
+        "forecast_time_shift_counts": audit["forecast_time_shift_counts"],
+        "target_time_tolerance_minutes": float(args.target_time_tolerance_minutes),
         "split": {
             "type": "monthly_tail_full_trajectory_containment",
             "val_last_days": VAL_LAST_DAYS,
@@ -363,12 +478,21 @@ def main() -> None:
             "veg_file": args.veg_file,
             "orography_file": args.oro_file,
         },
-        "source_manifest_sha256": sha256_file_manifest(
-            forecast_files + [args.visibility_nc, args.pm10_file, args.pm25_file, args.veg_file, args.oro_file]
+        "source_manifest_sha256": (
+            sha256_file_manifest(
+                forecast_files + [args.visibility_nc, args.pm10_file, args.pm25_file, args.veg_file, args.oro_file]
+            )
+            if complete
+            else None
         ),
     }
     (out_dir / "dataset_build_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     print(json.dumps({"out_dir": str(out_dir), "sample_counts": writer.counts, "audit": audit}, indent=2), flush=True)
+    if not complete:
+        raise RuntimeError(
+            "Every split must be non-empty; "
+            f"counts={writer.counts}; audit saved to {out_dir / 'dataset_build_config.json'}; audit={audit}"
+        )
 
 
 if __name__ == "__main__":

@@ -8,9 +8,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
+import xarray as xr
 
 import lowvis_trajectory_diffusion as common
+from lowvis_trajectory_contract import shifted_lead_indices, visibility_grid
 
 
 class TrajectoryContractTests(unittest.TestCase):
@@ -38,6 +41,35 @@ class TrajectoryContractTests(unittest.TestCase):
         leads = np.arange(49, dtype=np.float32)
         self.assertTrue(np.array_equal(common.exact_lead_indices(leads), np.arange(49)))
         self.assertIsNone(common.exact_lead_indices(np.delete(leads, 17)))
+
+    def test_lead_shift_auto_resolves_bjt_valid_times(self):
+        indices, shift = shifted_lead_indices(np.arange(8, 57, dtype=np.float32), "auto")
+        np.testing.assert_array_equal(indices, np.arange(49))
+        self.assertEqual(shift, -8.0)
+        missing, missing_shift = shifted_lead_indices(np.arange(7, 56, dtype=np.float32), 0)
+        self.assertIsNone(missing)
+        self.assertIsNone(missing_shift)
+
+    def test_visibility_grid_normalizes_dimension_order_and_station_type(self):
+        times = pd.date_range("2025-01-01T12:00", periods=37, freq="h")
+        values = np.vstack(
+            [np.arange(37, dtype=np.float32), np.arange(37, dtype=np.float32) + 100.0]
+        )
+        source = xr.DataArray(
+            values,
+            dims=("station_id", "time"),
+            coords={"station_id": ["54527.0", "A001"], "time": times},
+        )
+        aligned, diagnostics = visibility_grid(
+            source,
+            times,
+            np.asarray([54527, "A001"], dtype=object),
+            tolerance_minutes=31.0,
+        )
+        self.assertEqual(aligned.shape, (2, 37))
+        np.testing.assert_array_equal(aligned, values)
+        self.assertEqual(diagnostics["matched_target_times"], 37)
+        self.assertEqual(diagnostics["matched_stations"], 2)
 
     def test_full_trajectory_split_containment(self):
         # January test is the final three days; this trajectory stays inside it.
