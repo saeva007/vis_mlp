@@ -369,6 +369,12 @@ reported scores.
 Run from the remote repository root. The launcher submits three S1 jobs and
 three corresponding S2 jobs, with each S2 depending on its own S1.
 
+For the July 17 chain replacement, use the guarded cancel/restart command in
+`STATIC_RNN_LOSS_WATCHDOG.md` (implemented by
+`restart_p13_three_seed_with_watchdog.sh`). It submits this same recipe and
+starts the CPU watchdog automatically. The generic block below is for a new
+run when there is no old chain to cancel.
+
 ```bash
 set -euo pipefail
 

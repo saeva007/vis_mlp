@@ -1572,11 +1572,11 @@ def collect_manifests(cli_values: list[str]) -> list[Path]:
 
 def build_settings(args: argparse.Namespace) -> Settings:
     return Settings(
-        poll_seconds=env_int("WATCH_POLL_SECONDS", 300),
-        startup_stale_minutes=env_int("WATCH_STARTUP_STALE_MINUTES", 120),
-        data_stale_minutes=env_int("WATCH_DATA_STALE_MINUTES", 180),
-        train_stale_minutes=env_int("WATCH_TRAIN_STALE_MINUTES", 180),
-        validation_stale_minutes=env_int("WATCH_VALIDATION_STALE_MINUTES", 360),
+        poll_seconds=env_int("WATCH_POLL_SECONDS", 120),
+        startup_stale_minutes=env_int("WATCH_STARTUP_STALE_MINUTES", 30),
+        data_stale_minutes=env_int("WATCH_DATA_STALE_MINUTES", 45),
+        train_stale_minutes=env_int("WATCH_TRAIN_STALE_MINUTES", 30),
+        validation_stale_minutes=env_int("WATCH_VALIDATION_STALE_MINUTES", 60),
         confirmations=env_int("WATCH_CONFIRMATIONS", 2),
         max_retries=env_int("WATCH_MAX_RETRIES", 2),
         auto_retry=env_bool("WATCH_AUTO_RETRY", False),

@@ -32,9 +32,9 @@ growth. Trusted markers include the RCCL data-copy barrier, individual copy
 completion, dataset/scaler/model initialization, the latest training step,
 explicit validation start and score, and latest/best checkpoint updates.
 
-Only `RUNNING` jobs are subject to silence timeouts. The conservative defaults
-are 120 min for startup, 180 min for data work, 180 min for training, and 360
-min for validation, with two consecutive stale checks five minutes apart.
+Only `RUNNING` jobs are subject to silence timeouts. The defaults are 30 min
+for startup, 45 min for data work, 30 min for training, and 60 min for
+validation, with two consecutive stale checks two minutes apart.
 `PENDING`, `CONFIGURING`, `COMPLETING`, query errors, and accounting lag never
 trigger cancellation.
 
@@ -62,7 +62,38 @@ A completed stage is accepted only after its expected checkpoint exists, is
 non-empty, and passes a 30-minute filesystem grace period. Automatic retry is
 capped at two attempts.
 
-## Repair and monitor the current P13 jobs
+## Cancel the current P13 chains and restart all three seeds
+
+`restart_p13_three_seed_with_watchdog.sh` is the guarded launcher for the
+current July 17 P13 rerun. It reads the old JobIDs only from matching
+precision-loss manifests, intersects them with the user's live `squeue`, and
+refuses cancellation if more than one active run prefix matches the same seed.
+It then submits fresh full-training chains for seeds 42, 314, and 2718 and one
+small CPU watchdog job.
+
+First inspect the exact rows and active JobIDs; this command makes no changes:
+
+```bash
+cd /public/home/putianshu/vis_mlp/train
+bash restart_p13_three_seed_with_watchdog.sh
+```
+
+If the printed run prefixes and JobIDs are the intended old chain, perform the
+exact cancellation and fresh submission:
+
+```bash
+cd /public/home/putianshu/vis_mlp/train
+CONFIRM_CANCEL=YES bash restart_p13_three_seed_with_watchdog.sh
+```
+
+The launcher prints and records `FULL_MANIFEST`, `RESOLVED_MANIFEST`, and
+`WATCH_JOB` in `logs/<new-prefix>_watchdog_run.env`. Its watchdog allowances
+are 30 min for startup, 45 min for data work, 30 min for training, and 60 min
+for validation. After an automatic retry, all downstream validation,
+three-seed aggregation, and plotting must read `RESOLVED_MANIFEST`, because the
+original manifest remains an immutable record of the first submission.
+
+## Repair and monitor selected existing P13 jobs without a full restart
 
 Run this from the remote repository root after syncing the updated watcher and
 training scripts. Do not manually cancel the stalled jobs first; the watchdog needs
@@ -114,7 +145,7 @@ export WATCH_COMBINED_RESOLVED_MANIFEST=${REPO}/logs/p13_three_seed_watchdog_res
 export WATCH_RETRY_EXPORTS='LOWVIS_RNN_S1_STEPS=15000;LOWVIS_RNN_S2_A_STEPS=8000;LOWVIS_RNN_S2_B_STEPS=22000;LOWVIS_RNN_VAL_INTERVAL=500;LOWVIS_RNN_BATCH_SIZE=512;LOWVIS_RNN_GRAD_ACCUM=2;LOWVIS_RNN_NUM_WORKERS=0;LOWVIS_RNN_PATIENCE=10'
 
 WATCH_JOB=$(sbatch --parsable \
-  --export=ALL,WATCH_MANIFESTS=${WATCH_MANIFESTS},WATCH_ONLY_ROWS=${WATCH_ONLY_ROWS},WATCH_RETRY_EXPORTS=${WATCH_RETRY_EXPORTS},WATCH_COMBINED_RESOLVED_MANIFEST=${WATCH_COMBINED_RESOLVED_MANIFEST},WATCH_AUTO_RETRY=1,WATCH_POLL_SECONDS=300,WATCH_STARTUP_STALE_MINUTES=120,WATCH_DATA_STALE_MINUTES=180,WATCH_TRAIN_STALE_MINUTES=180,WATCH_VALIDATION_STALE_MINUTES=360,WATCH_CONFIRMATIONS=2,WATCH_MAX_RETRIES=2,WATCH_EXCLUDE_FAILED_NODES=1 \
+  --export=ALL,WATCH_MANIFESTS=${WATCH_MANIFESTS},WATCH_ONLY_ROWS=${WATCH_ONLY_ROWS},WATCH_RETRY_EXPORTS=${WATCH_RETRY_EXPORTS},WATCH_COMBINED_RESOLVED_MANIFEST=${WATCH_COMBINED_RESOLVED_MANIFEST},WATCH_AUTO_RETRY=1,WATCH_POLL_SECONDS=120,WATCH_STARTUP_STALE_MINUTES=30,WATCH_DATA_STALE_MINUTES=45,WATCH_TRAIN_STALE_MINUTES=30,WATCH_VALIDATION_STALE_MINUTES=60,WATCH_CONFIRMATIONS=2,WATCH_MAX_RETRIES=2,WATCH_EXCLUDE_FAILED_NODES=1 \
   sub_static_rnn_loss_watchdog.slurm)
 
 echo "WATCH_JOB=${WATCH_JOB}"
