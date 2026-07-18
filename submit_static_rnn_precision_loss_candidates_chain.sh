@@ -25,6 +25,7 @@ CANDIDATES_RAW="${LOWVIS_RNN_PRECISION_CANDIDATES:-${DEFAULT_CANDIDATES}}"
 ENABLE_NARROW_SOFT="${LOWVIS_RNN_ENABLE_NARROW_SOFT:-0}"
 MANIFEST="${LOWVIS_RNN_PRECISION_MANIFEST:-logs/${BASE_PREFIX}_precision_loss_manifest.tsv}"
 COMMON_ARGS="${LOWVIS_RNN_PRECISION_COMMON_ARGS:---threshold-mode argmax}"
+RETRY_EXPORTS="LOWVIS_RNN_S1_STEPS=${LOWVIS_RNN_S1_STEPS:-15000};LOWVIS_RNN_S2_A_STEPS=${LOWVIS_RNN_S2_A_STEPS:-8000};LOWVIS_RNN_S2_B_STEPS=${LOWVIS_RNN_S2_B_STEPS:-22000};LOWVIS_RNN_VAL_INTERVAL=${LOWVIS_RNN_VAL_INTERVAL:-500};LOWVIS_RNN_BATCH_SIZE=${LOWVIS_RNN_BATCH_SIZE:-512};LOWVIS_RNN_GRAD_ACCUM=${LOWVIS_RNN_GRAD_ACCUM:-2};LOWVIS_RNN_NUM_WORKERS=${LOWVIS_RNN_NUM_WORKERS:-0};LOWVIS_RNN_PATIENCE=${LOWVIS_RNN_PATIENCE:-10}"
 
 if [[ "${STAGE}" != "screen" && "${STAGE}" != "full" ]]; then
     echo "ERROR: LOWVIS_RNN_PRECISION_STAGE must be screen or full." >&2
@@ -132,7 +133,7 @@ if [[ " ${CANDIDATES} " =~ " p4 " && "${ENABLE_NARROW_SOFT}" != "1" ]]; then
     exit 2
 fi
 
-printf "candidate_id\tcandidate_label\texperiment_status\treplaces_mainline\tseed\tstage\trun_prefix\trun_id\textra_args\ts1_job\ts2_job\ts1_checkpoint\ts2_checkpoint\n" > "${MANIFEST}"
+printf "candidate_id\tcandidate_label\texperiment_status\treplaces_mainline\tseed\tstage\trun_prefix\trun_id\textra_args\ts1_job\ts2_job\ts1_checkpoint\ts2_checkpoint\tretry_exports\n" > "${MANIFEST}"
 
 echo "Submitting precision-loss candidates"
 echo "STAGE=${STAGE} CANDIDATES=${CANDIDATES} SEEDS=${SEEDS}"
@@ -183,9 +184,9 @@ for seed in ${SEEDS}; do
             )"
         fi
 
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
             "${candidate_id}" "${label}" "candidate_only" "false" "${seed}" "${STAGE}" "${candidate_prefix}" "${run_id}" \
-            "${extra_args}" "${s1_job}" "${s2_job}" "${s1_ckpt}" "${s2_ckpt}" >> "${MANIFEST}"
+            "${extra_args}" "${s1_job}" "${s2_job}" "${s1_ckpt}" "${s2_ckpt}" "${RETRY_EXPORTS}" >> "${MANIFEST}"
         echo "${candidate_id} seed=${seed}: ${s1_job:-shared-S1} -> ${s2_job}"
     done
 done

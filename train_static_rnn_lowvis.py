@@ -2474,6 +2474,7 @@ def train_stage(
 
         if rank == 0 and step % 50 == 0:
             lr_now = scheduler.get_last_lr()[0]
+            progress_time = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
             footprint_log = (
                 f"ef={loss_parts.get('footprint', 0.0):.4f} "
                 f"ecsi={loss_parts.get('soft_csi', 0.0):.3f} "
@@ -2497,11 +2498,17 @@ def train_stage(
                 f"reg={loss_parts['reg']:.4f} "
                 f"{footprint_log}"
                 f"{calibration_log}"
-                f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience}",
+                f"lr={lr_now:.2e} no_improve={no_improve}/{args.patience} "
+                f"at={progress_time}",
                 flush=True,
             )
 
         if step % args.val_interval == 0 or step == total_steps:
+            rank0(
+                rank,
+                f"[{tag}] validation start step={step}/{total_steps} "
+                f"at={datetime.datetime.now().astimezone().isoformat(timespec='seconds')}",
+            )
             score, th, metrics = evaluate(
                 args,
                 model,

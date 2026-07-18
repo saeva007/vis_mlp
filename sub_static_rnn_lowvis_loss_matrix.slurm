@@ -127,6 +127,10 @@ EXPERIMENT_LIST="${LOWVIS_RNN_EXPERIMENTS//,/ }"
 EXPERIMENT_LIST="${EXPERIMENT_LIST//:/ }"
 export LOWVIS_RNN_RUN_PREFIX="${LOWVIS_RNN_RUN_PREFIX:-${LOWVIS_RNN_RUN_ID:-exp_${SLURM_JOB_ID}_static_rnn_loss_matrix}}"
 export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-${LOWVIS_RNN_RUN_PREFIX}_shared_data}"
+export LOWVIS_RNN_LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+export LOWVIS_RNN_CACHE_BASE_DIR="${LOWVIS_RNN_CACHE_BASE_DIR:-${LOWVIS_RNN_LOCAL_CACHE_DIR}}"
+export LOWVIS_RNN_CLEAN_LOCAL_CACHE="${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-0}"
+export LOWVIS_RNN_CLEAN_LEGACY_CACHE="${LOWVIS_RNN_CLEAN_LEGACY_CACHE:-0}"
 export LOWVIS_RNN_SLEEP_BETWEEN="${LOWVIS_RNN_SLEEP_BETWEEN:-15}"
 
 echo "Head Node       : ${head_node}"
@@ -136,12 +140,136 @@ echo "MODE            : ${LOWVIS_RNN_MODE}"
 echo "PRETRAINED_CKPT : ${LOWVIS_RNN_PRETRAINED_CKPT}"
 echo "RUN_PREFIX      : ${LOWVIS_RNN_RUN_PREFIX}"
 echo "LOCAL_CACHE_ID  : ${LOWVIS_RNN_LOCAL_CACHE_ID}"
+echo "LOCAL_CACHE_DIR : ${LOWVIS_RNN_LOCAL_CACHE_DIR}"
+echo "CACHE_BASE_DIR  : ${LOWVIS_RNN_CACHE_BASE_DIR}"
+echo "CLEAN_LOCAL_CACHE: ${LOWVIS_RNN_CLEAN_LOCAL_CACHE}"
+echo "CLEAN_LEGACY_CACHE: ${LOWVIS_RNN_CLEAN_LEGACY_CACHE}"
 echo "EXPERIMENTS     : ${EXPERIMENT_LIST}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
 
 if [ "${LOWVIS_RNN_MODE}" = "s2" ] && [ -z "${LOWVIS_RNN_PRETRAINED_CKPT}" ]; then
     echo "[WARN] LOWVIS_RNN_MODE=s2 but LOWVIS_RNN_PRETRAINED_CKPT is empty; S2 experiments will train without S1 initialization."
 fi
+
+cleanup_scoped_cache_on_nodes() {
+    if [ "${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-0}" != "1" ]; then
+        return 0
+    fi
+    local cache_dir="${LOWVIS_RNN_LOCAL_CACHE_DIR:-}"
+    local cache_base="${LOWVIS_RNN_CACHE_BASE_DIR:-}"
+    local cache_name
+    cache_name="$(basename "${cache_dir}")"
+    if [ -z "${cache_dir}" ] || [ -z "${cache_base}" ] || [ "${cache_dir}" = "${cache_base}" ]; then
+        echo "[Cache-Cleanup] refusing unscoped cache cleanup: base=${cache_base:-<empty>} target=${cache_dir:-<empty>}"
+        return 0
+    fi
+    case "${cache_name}" in
+        *_wd_r[0-9]*_????????T??????_cache) ;;
+        *)
+            echo "[Cache-Cleanup] refusing unexpected retry cache name: ${cache_name}"
+            return 0
+            ;;
+    esac
+    echo "[Cache-Cleanup] removing scoped retry cache on allocated nodes: ${cache_dir}"
+    srun --nodes=${SLURM_NNODES} \
+         --ntasks=${SLURM_NNODES} \
+         --ntasks-per-node=1 \
+         /bin/bash -c '
+             set -euo pipefail
+             base="$(realpath -m "$1")"
+             target="$(realpath -m "$2")"
+             if [ "$(dirname "${target}")" != "${base}" ]; then
+                 echo "[$(hostname)] refusing cache cleanup outside base: ${target} vs ${base}" >&2
+                 exit 2
+             fi
+             if [ ! -e "${target}" ]; then
+                 echo "[$(hostname)] scoped cache already absent: ${target}"
+                 exit 0
+             fi
+             if [ -L "${target}" ] || [ ! -d "${target}" ]; then
+                 echo "[$(hostname)] refusing non-directory/symlink cache target: ${target}" >&2
+                 exit 2
+             fi
+             owner="$(stat -c %U "${target}")"
+             if [ "${owner}" != "${USER}" ]; then
+                 echo "[$(hostname)] refusing cache owned by ${owner}: ${target}" >&2
+                 exit 2
+             fi
+             rm -rf -- "${target}"
+             echo "[$(hostname)] removed scoped retry cache: ${target}"
+         ' _ "${cache_base}" "${cache_dir}" || true
+}
+
+on_loss_job_exit() {
+    local status=$?
+    trap - EXIT
+    cleanup_scoped_cache_on_nodes
+    exit "${status}"
+}
+
+trap on_loss_job_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+echo "Checking node-local cache capacity on all allocated nodes..."
+srun --nodes=${SLURM_NNODES} \
+     --ntasks=${SLURM_NNODES} \
+     --ntasks-per-node=1 \
+     /bin/bash -c '
+         set -euo pipefail
+         cache_dir="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+         cache_base="${LOWVIS_RNN_CACHE_BASE_DIR:-${cache_dir}}"
+         if [ -z "${cache_dir}" ] || [ "${cache_dir}" = "/" ]; then
+             echo "[$(hostname)] unsafe LOWVIS_RNN_LOCAL_CACHE_DIR=${cache_dir:-<empty>}" >&2
+             exit 2
+         fi
+         if ! mkdir -p "${cache_dir}" 2>/dev/null; then
+             echo "[$(hostname)] cannot create ${cache_dir}; training will fall back to /tmp"
+             cache_dir=/tmp
+         fi
+         resolved_cache="$(realpath -m "${cache_dir}")"
+         resolved_base="$(realpath -m "${cache_base}")"
+         cache_name="$(basename "${resolved_cache}")"
+         if [ "${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-0}" = "1" ] \
+            && [ "${resolved_base}" = "/tmp" ] \
+            && [ "$(dirname "${resolved_cache}")" = "/tmp" ]; then
+             case "${cache_name}" in
+                 *_wd_r[0-9]*_????????T??????_cache)
+                     echo "[$(hostname)] removing older user-owned watchdog retry cache directories"
+                     find /tmp -mindepth 1 -maxdepth 1 -user "${USER}" -type d \
+                         -name "*_wd_r[0-9]*_????????T??????_cache" \
+                         ! -path "${resolved_cache}" -print -exec rm -rf -- {} + 2>/dev/null || true
+                     ;;
+             esac
+         fi
+         echo "[$(hostname)] local cache dir: ${cache_dir}"
+         df -h "${cache_dir}" | tail -1 || true
+         df -i "${cache_dir}" | tail -1 || true
+         if [ "${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-0}" = "1" ]; then
+             echo "[$(hostname)] removing stale user-owned Static-RNN cache files"
+             find "${cache_dir}" -maxdepth 1 -user "${USER}" -type f \
+                 \( -name "X_train_*.npy" -o -name "X_val_*.npy" \
+                    -o -name "y_train_*.npy" -o -name "y_val_*.npy" \
+                    -o -name "X_train_*.npy.tmp" -o -name "X_val_*.npy.tmp" \
+                    -o -name "y_train_*.npy.tmp" -o -name "y_val_*.npy.tmp" \
+                    -o -name "*.nfs_fallback" \) \
+                 -print -delete 2>/dev/null || true
+             df -h "${cache_dir}" | tail -1 || true
+             df -i "${cache_dir}" | tail -1 || true
+         fi
+         if [ "${LOWVIS_RNN_CLEAN_LEGACY_CACHE:-0}" = "1" ] && [ "${cache_dir}" != "/tmp" ]; then
+             echo "[$(hostname)] removing user-owned legacy Static-RNN cache files from /tmp"
+             find /tmp -maxdepth 1 -user "${USER}" -type f \
+                 \( -name "X_train_*.npy" -o -name "X_val_*.npy" \
+                    -o -name "y_train_*.npy" -o -name "y_val_*.npy" \
+                    -o -name "X_train_*.npy.tmp" -o -name "X_val_*.npy.tmp" \
+                    -o -name "y_train_*.npy.tmp" -o -name "y_val_*.npy.tmp" \
+                    -o -name "*.nfs_fallback" \) \
+                 -print -delete 2>/dev/null || true
+             df -h /tmp | tail -1 || true
+             df -i /tmp | tail -1 || true
+         fi
+     '
 
 run_one_experiment() {
     local exp_id="$1"
@@ -177,6 +305,7 @@ run_one_experiment() {
          --ntasks=${SLURM_NNODES} \
          --ntasks-per-node=1 \
          --cpus-per-task=${CPUS_PER_TASK} \
+         --kill-on-bad-exit=1 \
          bash -c "
              set -euo pipefail
              cd \"${SCRIPT_DIR}\"

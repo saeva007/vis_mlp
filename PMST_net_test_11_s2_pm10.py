@@ -341,7 +341,19 @@ def copy_to_local(src_path: str, global_rank: int, local_rank: int,
 
     device = torch.device(f"cuda:{local_rank}")
 
+    if global_rank == 0:
+        print(
+            f"[Data-Copy] Entering RCCL barrier before {basename} at "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+            flush=True,
+        )
     safe_barrier(world_size, device)
+    if global_rank == 0:
+        print(
+            f"[Data-Copy] RCCL barrier passed before {basename} at "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+            flush=True,
+        )
 
     if local_rank == 0:
         if world_size > 8:

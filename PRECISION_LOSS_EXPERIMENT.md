@@ -342,6 +342,11 @@ confusion counts, and event metrics to
 
 ## Formal P13 three-seed probability ensemble
 
+For long-running Slurm monitoring and candidate-specific recovery from RCCL,
+node, or silent-progress stalls, use `STATIC_RNN_LOSS_WATCHDOG.md`.  The CPU
+watchdog preserves the original submission manifest and writes a resolved
+manifest that must be used after any retry.
+
 P13 was the only feasible eta in the fixed-argmax validation screen. Its formal
 run is therefore a new full S1 -> S2 Phase A/B -> Phase D training for each of
 the pre-registered seeds `42`, `314`, and `2718`. Do not reuse the screen
