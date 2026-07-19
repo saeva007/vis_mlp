@@ -85,7 +85,27 @@ The five-node launcher also checks the config, all split arrays and metadata
 before starting `torchrun`; an incomplete build exits once with the exact
 missing-file list instead of producing the same traceback on all 20 ranks.
 
-## 2. Train the Gaussian benchmark, then diffusion (five nodes, 20 DCUs)
+## 2. Audit the data contract (CPU, read-only)
+
+Before a formal Gaussian or diffusion run, execute the unified audit. It checks
+the flat mainline datasets, raw visibility and PM files, the trajectory lead
+coverage, and every trajectory raw/stored mask cell. The PM report uses the
+canonical policies listed above and explicitly repairs historical ``*1e12``
+storage before reporting physical ``ug m-3`` statistics.
+
+```bash
+RUN_TAG=lowvis_qc_$(date +%Y%m%d_%H%M%S)
+AUDIT_DIR=/public/home/putianshu/vis_mlp/data_audits/${RUN_TAG}
+sbatch --export=ALL,LOWVIS_AUDIT_OUT_DIR=${AUDIT_DIR} \
+  sub_audit_lowvis_data_quality.slurm
+```
+
+Do not start the five-node formal run when ``issues.csv`` reports zero target
+coverage, raw/stored mask disagreement, split-key overlap, or a PM policy
+mismatch. Full options and packaging commands are in
+``LOWVIS_DATA_QUALITY_AUDIT.md``.
+
+## 3. Train the Gaussian benchmark, then diffusion (five nodes, 20 DCUs)
 
 The Gaussian model is a separate distributional baseline, not a component of
 the diffusion model.  The five-node profile uses 20 ranks with a per-rank
@@ -131,7 +151,7 @@ sbatch -N 1 --export=ALL,LOWVIS_TRAJ_MODEL_TYPE=diffusion,LOWVIS_TRAJ_RUN_ID=smo
 
 Do not reuse a smoke checkpoint for paper evaluation.
 
-## 3. Evaluate with frozen validation thresholds
+## 4. Evaluate with frozen validation thresholds
 
 Evaluate Gaussian first, then diffusion and point the latter to the Gaussian
 result directory for the comparison table.
