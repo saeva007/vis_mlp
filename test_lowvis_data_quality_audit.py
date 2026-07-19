@@ -144,6 +144,15 @@ class LowVisDataQualityAuditTests(unittest.TestCase):
             self.assertTrue(all(row["mask_mismatch"] == 0 for row in state.rows["trajectory_raw_consistency"]))
             self.assertTrue(all(row["value_mismatch"] == 0 for row in state.rows["trajectory_raw_consistency"]))
 
+    def test_slurm_launcher_avoids_empty_array_expansion_under_nounset(self):
+        launcher = (Path(__file__).resolve().parent / "sub_audit_lowvis_data_quality.slurm").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("command=(", launcher)
+        self.assertIn('"${command[@]}"', launcher)
+        self.assertNotIn("extra_args=()", launcher)
+        self.assertNotIn('"${extra_args[@]}"', launcher)
+
 
 if __name__ == "__main__":
     unittest.main()

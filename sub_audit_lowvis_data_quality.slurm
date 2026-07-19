@@ -29,36 +29,40 @@ export OMP_NUM_THREADS="${SLURM_CPUS_ON_NODE:-32}"
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}"
 export NUMEXPR_NUM_THREADS="${OMP_NUM_THREADS}"
 
-extra_args=()
-if [[ "${LOWVIS_AUDIT_REQUIRE_ALL:-0}" == "1" ]]; then
-    extra_args+=(--require-all)
-fi
-if [[ "${LOWVIS_AUDIT_STRICT:-0}" == "1" ]]; then
-    extra_args+=(--strict)
-fi
-if [[ -n "${LOWVIS_AUDIT_EXTRA_ARGS:-}" ]]; then
-    # shellcheck disable=SC2206
-    user_extra=( ${LOWVIS_AUDIT_EXTRA_ARGS} )
-    extra_args+=("${user_extra[@]}")
-fi
-
 echo "[audit] output=${OUT_DIR}"
 echo "[audit] datasets=${DATASET_SPECS}"
 echo "[audit] raw_visibility=${RAW_VISIBILITY_SPECS}"
 echo "[audit] raw_pm=${RAW_PM_SPECS}"
 
-python "${SCRIPT_DIR}/audit_lowvis_data_quality.py" \
-    --dataset-specs "${DATASET_SPECS}" \
-    --raw-visibility-specs "${RAW_VISIBILITY_SPECS}" \
-    --raw-pm-specs "${RAW_PM_SPECS}" \
-    --trajectory-raw-tag "${LOWVIS_AUDIT_TRAJECTORY_RAW_TAG:-tianji_s2}" \
-    --pmst-common-dir "${PMST_COMMON_DIR:-${BASE}/ifs_baseline}" \
-    --out-dir "${OUT_DIR}" \
-    --chunk-rows "${LOWVIS_AUDIT_CHUNK_ROWS:-4096}" \
-    --quantile-rows "${LOWVIS_AUDIT_QUANTILE_ROWS:-5000}" \
-    --metadata-chunksize "${LOWVIS_AUDIT_METADATA_CHUNK:-20000}" \
-    --netcdf-time-chunk "${LOWVIS_AUDIT_NETCDF_TIME_CHUNK:-168}" \
-    --max-trajectory-raw-rows "${LOWVIS_AUDIT_MAX_TRAJECTORY_RAW_ROWS:-0}" \
-    "${extra_args[@]}"
+command=(
+    python "${SCRIPT_DIR}/audit_lowvis_data_quality.py"
+    --dataset-specs "${DATASET_SPECS}"
+    --raw-visibility-specs "${RAW_VISIBILITY_SPECS}"
+    --raw-pm-specs "${RAW_PM_SPECS}"
+    --trajectory-raw-tag "${LOWVIS_AUDIT_TRAJECTORY_RAW_TAG:-tianji_s2}"
+    --pmst-common-dir "${PMST_COMMON_DIR:-${BASE}/ifs_baseline}"
+    --out-dir "${OUT_DIR}"
+    --chunk-rows "${LOWVIS_AUDIT_CHUNK_ROWS:-4096}"
+    --quantile-rows "${LOWVIS_AUDIT_QUANTILE_ROWS:-5000}"
+    --metadata-chunksize "${LOWVIS_AUDIT_METADATA_CHUNK:-20000}"
+    --netcdf-time-chunk "${LOWVIS_AUDIT_NETCDF_TIME_CHUNK:-168}"
+    --max-trajectory-raw-rows "${LOWVIS_AUDIT_MAX_TRAJECTORY_RAW_ROWS:-0}"
+)
+
+# Bash 4.2 on the cluster treats an empty-array expansion as an unbound
+# variable under `set -u`. The command array is always non-empty; optional
+# arguments are appended only when they really exist.
+if [[ "${LOWVIS_AUDIT_REQUIRE_ALL:-0}" == "1" ]]; then
+    command+=(--require-all)
+fi
+if [[ "${LOWVIS_AUDIT_STRICT:-0}" == "1" ]]; then
+    command+=(--strict)
+fi
+if [[ "${LOWVIS_AUDIT_EXTRA_ARGS:-}" =~ [^[:space:]] ]]; then
+    read -r -a user_extra <<< "${LOWVIS_AUDIT_EXTRA_ARGS}"
+    command+=("${user_extra[@]}")
+fi
+
+"${command[@]}"
 
 echo "[audit] finished=$(date --iso-8601=seconds) output=${OUT_DIR}"
