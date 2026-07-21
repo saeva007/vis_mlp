@@ -16,7 +16,7 @@ SCRIPT_DIR="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 BASE="${LOWVIS_AUDIT_BASE:-/public/home/putianshu/vis_mlp}"
 OUT_DIR="${LOWVIS_AUDIT_OUT_DIR:-${BASE}/data_audits/lowvis_data_quality_${SLURM_JOB_ID}}"
 
-DATASET_SPECS="${LOWVIS_AUDIT_DATASETS:-main_s1=${BASE}/ml_dataset_pmst_v5_aligned_12h_pm10_pm25;main_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2;monthgroup_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthgroup_train13579_val11_test24681012;vera_s1=${BASE}/ml_dataset_pmst_v5_aligned_12h_pm10_pm25_vera;vera_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2_vera;eval_48h=${BASE}/ml_dataset_fe_12h_48h_pm10_pm25_testonly_leadtime;trajectory=${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1}"
+DATASET_SPECS="${LOWVIS_AUDIT_DATASETS:-main_s1=${BASE}/ml_dataset_pmst_v5_aligned_12h_pm10_pm25;main_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2;monthgroup_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthgroup_train13579_val11_test24681012;vera_s1=${BASE}/ml_dataset_pmst_v5_aligned_12h_pm10_pm25_vera;vera_s2=${BASE}/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2_vera;eval_48h=${BASE}/ml_dataset_fe_12h_48h_pm10_pm25_testonly_leadtime;trajectory=${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2}"
 RAW_VISIBILITY_SPECS="${LOWVIS_AUDIT_RAW_VISIBILITY:-cma_s1=${BASE}/CMA_visibility_2021_2023_GeoCoords_1.nc;tianji_s2=${BASE}/tianji_auto_station/merged_final_all_vars.nc}"
 RAW_PM_SPECS="${LOWVIS_AUDIT_RAW_PM:-pm10_s2=${BASE}/pm10_station/pm10_station_s2_2025.nc;pm25_s2=${BASE}/pm2.5_station/pm2p5_station_s2_2025.nc}"
 

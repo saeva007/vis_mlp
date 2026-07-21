@@ -25,14 +25,21 @@ from typing import Dict, Iterable, Iterator, List, Mapping, MutableMapping, Opti
 import numpy as np
 import pandas as pd
 
+from lowvis_trajectory_contract import DYNAMIC_FEATURE_ORDER
+
 
 EXPECTED_PM_UNIT_POLICY = "pmst_canonical_units_v2_20260630"
 EXPECTED_PM_QC_POLICY = "pm_explicit_legacy_scale_then_train_median_qc_v2_20260701"
+EXPECTED_TRAJECTORY_CONTRACT = "lowvis_trajectory_1_48h_v2_20260721"
 VISIBILITY_MAX_M = 30000.0
 COMPARISON_LEADS = tuple(range(12, 49))
 SPLITS = ("train", "val", "test")
 
 PM_NAMES = {"PM10", "PM10UGM3", "PM25", "PM25UGM3", "PM2P5"}
+SAFE_PM_AVAILABILITY_POLICIES = {
+    "valid_time_not_after_init_snapshot_repeat_v1",
+    "forecast_reference_not_after_init_v1",
+}
 
 # Only ranges whose units are already established by the canonical PMST policy
 # are enforced here.  PRECIP/SW_RAD/CAPE remain distribution-audit variables
@@ -165,6 +172,8 @@ def load_pm_policy(common_dir: Path):
 
 
 def load_dataset_config(path: Path) -> Tuple[Dict[str, object], Optional[Path]]:
+    merged: Dict[str, object] = {}
+    first_path: Optional[Path] = None
     for name in ("dataset_build_config.json", "dataset_split_config.json", "dataset_metadata.json"):
         candidate = path / name
         if candidate.is_file():
@@ -172,8 +181,12 @@ def load_dataset_config(path: Path) -> Tuple[Dict[str, object], Optional[Path]]:
                 value = json.load(handle)
             if not isinstance(value, dict):
                 raise TypeError(f"Dataset config must be a JSON object: {candidate}")
-            return value, candidate
-    return {}, None
+            if first_path is None:
+                first_path = candidate
+            for key, item in value.items():
+                if key not in merged or merged[key] in (None, "", [], {}):
+                    merged[key] = item
+    return merged, first_path
 
 
 def available_splits(path: Path, trajectory: bool) -> List[str]:
@@ -183,7 +196,14 @@ def available_splits(path: Path, trajectory: bool) -> List[str]:
 
 def resolve_flat_layout(config: Mapping[str, object], x_path: Path) -> Tuple[int, List[str], int]:
     window = int(config.get("window_size", config.get("window", 12)))
-    order_raw = config.get("dynamic_feature_order", config.get("dynamic_order"))
+    nested_layout = config.get("feature_layout") if isinstance(config.get("feature_layout"), Mapping) else {}
+    order_raw = config.get(
+        "dynamic_feature_order",
+        config.get(
+            "dynamic_order",
+            config.get("dynamic_features", nested_layout.get("dynamic_feature_order")),
+        ),
+    )
     order = [str(value) for value in order_raw] if isinstance(order_raw, list) else []
     dyn_vars = int(
         config.get(
@@ -193,11 +213,28 @@ def resolve_flat_layout(config: Mapping[str, object], x_path: Path) -> Tuple[int
     )
     if order and dyn_vars != len(order):
         raise ValueError(f"dynamic_feature_order length={len(order)} != dyn_vars={dyn_vars}")
-    if not order or dyn_vars <= 0:
-        raise ValueError("dataset config must declare dynamic_feature_order and dyn_vars")
     width = int(np.load(x_path, mmap_mode="r").shape[1])
+    if not order or dyn_vars <= 0:
+        # Historical mainline configs sometimes omitted the feature order even
+        # though the established row layout is 12*dyn + 5 static + 1 veg + 36 FE.
+        remainder = width - 42
+        inferred = remainder // window if remainder > 0 and remainder % window == 0 else 0
+        if inferred == len(DYNAMIC_FEATURE_ORDER):
+            order = list(DYNAMIC_FEATURE_ORDER)
+            dyn_vars = inferred
+        elif inferred == len(DYNAMIC_FEATURE_ORDER) - 1:
+            order = list(DYNAMIC_FEATURE_ORDER[:-1])
+            dyn_vars = inferred
+        elif inferred == len(DYNAMIC_FEATURE_ORDER) - 2:
+            order = list(DYNAMIC_FEATURE_ORDER[:-2])
+            dyn_vars = inferred
     if width < window * dyn_vars:
         raise ValueError(f"row width={width} is smaller than window*dyn_vars={window * dyn_vars}")
+    if not order or dyn_vars <= 0:
+        raise ValueError(
+            "dataset config must declare dynamic feature order, or use the established "
+            "12*dyn + 42 flat layout"
+        )
     return window, order, width
 
 
@@ -302,13 +339,13 @@ def scan_dynamic(
     feature_states = {name: empty_feature_state() for name in order}
     pm_states = {name: empty_feature_state() for name, norm in zip(order, names) if norm in PM_NAMES}
     declared_units, pm_lineage = pm_declared_units(config, policy)
+    canonicalization_failures = set()
 
     for slc in iter_row_slices(len(array), chunk_rows):
         block = np.asarray(array[slc], dtype=np.float32)
         dyn = block if trajectory else block[:, : window * len(order)].reshape(-1, window, len(order))
         for idx, (name, norm) in enumerate(zip(order, names)):
             values = dyn[..., idx]
-            update_feature_state(feature_states[name], values, PHYSICAL_BOUNDS.get(norm))
             if norm in PM_NAMES:
                 canonical = policy.canonicalize_pm_concentration(values, declared_units)
                 valid = np.isfinite(canonical) & (canonical >= 0.0) & (
@@ -316,10 +353,24 @@ def scan_dynamic(
                 )
                 canonical_for_state = np.where(valid, canonical, np.nan)
                 update_feature_state(
+                    feature_states[name],
+                    canonical_for_state,
+                    (0.0, float(policy.PM_CONCENTRATION_MAX_UGM3)),
+                )
+                update_feature_state(
                     pm_states[name], canonical_for_state, (0.0, float(policy.PM_CONCENTRATION_MAX_UGM3))
                 )
                 invalid = int((~valid).sum())
                 pm_states[name]["canonical_invalid"] = int(pm_states[name].get("canonical_invalid", 0)) + invalid
+            else:
+                try:
+                    canonical = policy.canonicalize_pmst_field(name, values)
+                except ValueError as exc:
+                    canonical = values
+                    if name not in canonicalization_failures:
+                        state.issue("ERROR", "feature_unit_unresolved", f"{name}: {exc}", dataset, split)
+                        canonicalization_failures.add(name)
+                update_feature_state(feature_states[name], canonical, PHYSICAL_BOUNDS.get(norm))
 
     idx = sampled_indices(len(array), quantile_rows)
     sample = np.asarray(array[idx], dtype=np.float32) if len(idx) else np.empty((0,), dtype=np.float32)
@@ -336,7 +387,22 @@ def scan_dynamic(
             **feature_state_row(feature_states[name]),
         }
         if len(idx):
-            row.update(quantiles(sample_dyn[..., feature_idx]))
+            sample_values = sample_dyn[..., feature_idx]
+            if norm in PM_NAMES:
+                sample_values = policy.canonicalize_pm_concentration(sample_values, declared_units)
+                sample_values = np.where(
+                    np.isfinite(sample_values)
+                    & (sample_values >= 0.0)
+                    & (sample_values <= float(policy.PM_CONCENTRATION_MAX_UGM3)),
+                    sample_values,
+                    np.nan,
+                )
+            else:
+                try:
+                    sample_values = policy.canonicalize_pmst_field(name, sample_values)
+                except ValueError:
+                    pass
+            row.update(quantiles(sample_values))
         state.rows["dynamic_feature_quality"].append(row)
         nonfinite_fraction = 1.0 - float(row["finite_fraction"])
         outside_fraction = float(row["outside_plausible_fraction"])
@@ -584,6 +650,75 @@ def audit_metadata(
                 state.issue("ERROR", "split_key_overlap", f"{left}/{right} overlap={overlap}", dataset)
 
 
+def audit_pm_provenance(state: AuditState, dataset: str, path: Path, config: Mapping[str, object]) -> None:
+    provenance_name = str(config.get("pm_provenance_file", "pm_provenance.csv"))
+    provenance_path = path / provenance_name
+    if not provenance_path.is_file():
+        state.issue("ERROR", "pm_provenance_missing", str(provenance_path), dataset)
+        return
+    try:
+        frame = pd.read_csv(provenance_path)
+    except pd.errors.EmptyDataError:
+        state.issue("ERROR", "pm_provenance_empty", str(provenance_path), dataset)
+        return
+    required = {
+        "init_time",
+        "pm_query_valid_time",
+        "pm_alignment_mode",
+        "pm_future_valid_time_used",
+        "pm10_finite_fraction",
+        "pm25_finite_fraction",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        state.issue("ERROR", "pm_provenance_columns_missing", str(missing), dataset)
+        return
+    init = mixed_datetime(frame["init_time"])
+    query = mixed_datetime(frame["pm_query_valid_time"])
+    invalid_times = int((init.isna() | query.isna()).sum())
+    future_times = int((query > init).sum())
+    future_flags = frame["pm_future_valid_time_used"].astype(str).str.lower().isin({"1", "true", "yes"})
+    future_flags_count = int(future_flags.sum())
+    pm10_fraction = pd.to_numeric(frame["pm10_finite_fraction"], errors="coerce")
+    pm25_fraction = pd.to_numeric(frame["pm25_finite_fraction"], errors="coerce")
+    min_pm10 = float(pm10_fraction.min()) if len(pm10_fraction) else math.nan
+    min_pm25 = float(pm25_fraction.min()) if len(pm25_fraction) else math.nan
+    state.rows["pm_provenance_quality"].append(
+        {
+            "dataset": dataset,
+            "path": str(provenance_path),
+            "runs": int(len(frame)),
+            "invalid_times": invalid_times,
+            "future_query_times": future_times,
+            "future_flags": future_flags_count,
+            "pm10_min_finite_fraction": min_pm10,
+            "pm25_min_finite_fraction": min_pm25,
+            "alignment_modes": ";".join(sorted(frame["pm_alignment_mode"].astype(str).unique())),
+        }
+    )
+    if not len(frame):
+        state.issue("ERROR", "pm_provenance_empty", str(provenance_path), dataset)
+    if invalid_times:
+        state.issue("ERROR", "pm_provenance_invalid_time", f"invalid={invalid_times}", dataset)
+    if future_times or future_flags_count:
+        state.issue(
+            "ERROR",
+            "pm_future_availability_violation",
+            f"future_query_times={future_times}, future_flags={future_flags_count}",
+            dataset,
+        )
+    required_fraction = float(config.get("pm_min_finite_fraction", 0.95))
+    if (math.isfinite(min_pm10) and min_pm10 < required_fraction) or (
+        math.isfinite(min_pm25) and min_pm25 < required_fraction
+    ):
+        state.issue(
+            "ERROR",
+            "pm_provenance_coverage_low",
+            f"PM10={min_pm10:.3%}, PM2.5={min_pm25:.3%}, required={required_fraction:.3%}",
+            dataset,
+        )
+
+
 def audit_flat_dataset(
     state: AuditState,
     tag: str,
@@ -613,6 +748,15 @@ def audit_flat_dataset(
             "PM is audited through explicit historical/magnitude canonicalization; dataset itself predates the policy",
             tag,
         )
+    if any(normalize_name(name) in PM_NAMES for name in order):
+        availability_policy = str(config.get("pm_availability_policy", ""))
+        if availability_policy not in SAFE_PM_AVAILABILITY_POLICIES:
+            state.issue(
+                "WARN",
+                "pm_forecast_availability_unproven",
+                "PM valid times are present but forecast_reference_time<=sample initialization is not documented",
+                tag,
+            )
     state.rows["dataset_inventory"].append(
         {
             "dataset": tag,
@@ -626,6 +770,7 @@ def audit_flat_dataset(
             "config_sha256": config_digest(config),
             "canonical_unit_policy": unit_policy or "legacy_or_missing",
             "pm_qc_policy": str(config.get("pm_qc_policy", "legacy_or_missing")),
+            "pm_availability_policy": str(config.get("pm_availability_policy", "unproven")),
         }
     )
     for split in splits:
@@ -670,18 +815,60 @@ def audit_trajectory_dataset(
     if not order:
         state.issue("ERROR", "trajectory_order_missing", "dynamic_feature_order is required", tag)
         return
+    if tuple(order) != tuple(DYNAMIC_FEATURE_ORDER):
+        state.issue(
+            "ERROR",
+            "trajectory_feature_order_mismatch",
+            f"expected={list(DYNAMIC_FEATURE_ORDER)}, got={order}",
+            tag,
+        )
     unit_policy = str(config.get("canonical_unit_policy", ""))
     qc_policy = str(config.get("pm_qc_policy", ""))
+    contract_version = str(config.get("data_contract_version", ""))
+    if contract_version != EXPECTED_TRAJECTORY_CONTRACT:
+        state.issue(
+            "ERROR",
+            "trajectory_contract_version_mismatch",
+            contract_version or "missing",
+            tag,
+        )
     if unit_policy != EXPECTED_PM_UNIT_POLICY:
         state.issue("ERROR", "pm_unit_policy_mismatch", unit_policy or "missing", tag)
     if qc_policy != EXPECTED_PM_QC_POLICY:
         state.issue("ERROR", "pm_qc_policy_mismatch", qc_policy or "missing", tag)
+    dynamic_units = config.get("dynamic_units") if isinstance(config.get("dynamic_units"), Mapping) else {}
+    for feature in order:
+        expected_unit = policy.CANONICAL_DYNAMIC_UNITS.get(feature)
+        if expected_unit and str(dynamic_units.get(feature, "")) != str(expected_unit):
+            state.issue(
+                "ERROR",
+                "dynamic_unit_contract_mismatch",
+                f"{feature}: {dynamic_units.get(feature, 'missing')!r} != {expected_unit!r}",
+                tag,
+            )
+    availability_policy = str(config.get("pm_availability_policy", ""))
+    if any(normalize_name(name) in PM_NAMES for name in order):
+        if availability_policy not in SAFE_PM_AVAILABILITY_POLICIES:
+            state.issue(
+                "ERROR",
+                "pm_forecast_availability_unproven",
+                availability_policy or "missing PM availability policy",
+                tag,
+            )
+        if bool(config.get("pm_future_valid_time_used", True)):
+            state.issue(
+                "ERROR",
+                "pm_future_valid_time_used",
+                "trajectory config permits PM valid times after initialization",
+                tag,
+            )
     target_leads = [int(value) for value in config.get("target_leads", list(range(1, 49)))]
     state.rows["dataset_inventory"].append(
         {
             "dataset": tag,
             "path": str(path),
             "contract": "trajectory",
+            "contract_version": contract_version or "missing",
             "splits": ",".join(splits),
             "window": int(config.get("condition_length", len(target_leads))),
             "dyn_vars": len(order),
@@ -690,8 +877,11 @@ def audit_trajectory_dataset(
             "config_sha256": config_digest(config),
             "canonical_unit_policy": unit_policy or "missing",
             "pm_qc_policy": qc_policy or "missing",
+            "pm_availability_policy": availability_policy or "missing",
         }
     )
+    if any(normalize_name(name) in PM_NAMES for name in order):
+        audit_pm_provenance(state, tag, path, config)
     comparison_positions = [i for i, lead in enumerate(target_leads) if lead in COMPARISON_LEADS]
     for split in splits:
         dynamic = np.load(path / f"dynamic_{split}.npy", mmap_mode="r")

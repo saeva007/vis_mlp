@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 BASE="${LOWVIS_TRAJ_BASE:-/public/home/putianshu/vis_mlp}"
 export SCRIPT_DIR BASE
-export LOWVIS_TRAJ_DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1}"
+export LOWVIS_TRAJ_DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2}"
 export LOWVIS_TRAJ_MODEL_TYPE="${LOWVIS_TRAJ_MODEL_TYPE:-diffusion}"
 export LOWVIS_TRAJ_RUN_ID="${LOWVIS_TRAJ_RUN_ID:-exp_${SLURM_JOB_ID}_lowvis_trajectory_${LOWVIS_TRAJ_MODEL_TYPE}_5n}"
 export LOWVIS_TRAJ_CHECKPOINT_DIR="${LOWVIS_TRAJ_CHECKPOINT_DIR:-${BASE}/checkpoints}"
@@ -49,7 +49,10 @@ mkdir -p "${SCRIPT_DIR}/logs" "${LOWVIS_TRAJ_CHECKPOINT_DIR}"
 
 # Fail once on the batch host before spawning 20 workers.  A missing config is
 # the normal signal that the CPU trajectory-builder job has not finished.
-required_dataset_files=("${LOWVIS_TRAJ_DATA_DIR}/dataset_build_config.json")
+required_dataset_files=(
+    "${LOWVIS_TRAJ_DATA_DIR}/dataset_build_config.json"
+    "${LOWVIS_TRAJ_DATA_DIR}/pm_provenance.csv"
+)
 for split in train val test; do
     for stem in dynamic static_cont veg_id time_features visibility target_mask; do
         required_dataset_files+=("${LOWVIS_TRAJ_DATA_DIR}/${stem}_${split}.npy")
@@ -69,6 +72,15 @@ if (( missing_dataset_count > 0 )); then
     printf '  missing: %s\n' "${missing_dataset_files[@]}" >&2
     echo "Build it first with:" >&2
     echo "  sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=${LOWVIS_TRAJ_DATA_DIR} ${SCRIPT_DIR}/sub_build_lowvis_trajectory_dataset.slurm" >&2
+    exit 2
+fi
+
+config_path="${LOWVIS_TRAJ_DATA_DIR}/dataset_build_config.json"
+if ! grep -Fq '"data_contract_version": "lowvis_trajectory_1_48h_v2_20260721"' "${config_path}" \
+    || ! grep -Fq '"pm_availability_policy": "valid_time_not_after_init_snapshot_repeat_v1"' "${config_path}" \
+    || ! grep -Fq '"pm_future_valid_time_used": false' "${config_path}"; then
+    echo "ERROR: refusing a legacy or PM-availability-unsafe trajectory dataset: ${config_path}" >&2
+    echo "Rebuild the v2 dataset and pass the strict data audit before training." >&2
     exit 2
 fi
 

@@ -8,6 +8,12 @@ the paper-facing Static-MLP+GRU predictions.
 - Condition: one Tianji initialization, one station, hourly 1-48 h forecast
   trajectory, 27 dynamic variables, five continuous station descriptors,
   vegetation category, and initialization-time encoding.
+- The historical station PM products retain valid time but not CAMS
+  `forecast_reference_time`. To prevent future-valid-time leakage, v2 uses the
+  PM10/PM2.5 snapshot valid at the Tianji initialization and repeats that
+  initialization state over 1-48 h. A future init-aware CAMS cube may replace
+  this only when every selected CAMS reference time is no later than the
+  Tianji initialization.
 - The source files contain no genuine lead 0. Lead 1 is not duplicated or
   relabeled as lead 0; the recorded condition tensor is therefore `48 x 27`.
 - Response: absolute observed `log1p(visibility)` at leads 1-48 h. Full-horizon
@@ -31,10 +37,12 @@ the paper-facing Static-MLP+GRU predictions.
 
 ## 1. Build the trajectory dataset (CPU)
 
-The builder fails if PM10/PM2.5 sources are missing, if the canonical PM policy
-is unavailable/stale, or if an output dataset already exists. It never silently
-falls back to zero PM. To intentionally rebuild, use a new output tag; use
-`--allow-overwrite` only after archiving the prior dataset.
+The builder fails if PM10/PM2.5 sources are missing, if initialization-time PM
+coverage is below 95%, if the canonical PM policy is unavailable/stale, or if
+an output dataset already exists. It never silently falls back to zero PM. To
+intentionally rebuild, use a new output tag; use `--allow-overwrite` only after
+archiving the prior dataset. Every meteorological channel passes through the
+shared canonical-unit policy, including conversion of MSLP from hPa to Pa.
 
 The CPU builder is deliberately Torch-free. It uses the established Putianshu
 data environment (`/public/home/putianshu/miniconda3/envs/torch`) only for
@@ -53,10 +61,14 @@ sbatch sub_build_lowvis_trajectory_dataset.slurm
 The builder audits the forecast timestamp convention before matching targets.
 `TIANJI_INPUT_TIME_SHIFT_HOURS=auto` (the default) accepts only the declared
 0/-8/+8 hour conventions and records the applied shift in
-`dataset_build_config.json`. Visibility time matching uses a 31-minute
-tolerance and station identifiers are normalized before matching. If these
-checks still produce no samples, the builder stops after 24 systemic failures
-and writes a reasoned failure audit instead of scanning all runs blindly.
+`dataset_build_config.json`. After selecting forecast fields, the target clock
+is defined independently as `init_time + lead_hour`; the builder asserts that
+the selected forecast times agree. Visibility uses the matched source
+`time_pos` rather than the trajectory-relative 0-47 indices. PM numeric Unix
+second coordinates are decoded explicitly. Visibility/PM time matching uses a
+31-minute tolerance and station identifiers are normalized before matching.
+If these checks still produce no samples, the builder stops after 24 systemic
+failures and writes a reasoned failure audit instead of scanning all runs.
 
 The corrected 1-48 h contract uses a new default output directory, so the
 failed 0-48 h partial arrays are not reused. If an explicitly selected output
@@ -67,19 +79,34 @@ sbatch --export=ALL,LOWVIS_TRAJ_BUILD_EXTRA_ARGS=--allow-overwrite \
   sub_build_lowvis_trajectory_dataset.slurm
 ```
 
-Recommended explicit version tag:
+Recommended explicit v2 tag (do not reuse the invalid v1 trajectory arrays):
 
 ```bash
-sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1 \
+sbatch --export=ALL,LOWVIS_TRAJ_DATA_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2 \
+  sub_build_lowvis_trajectory_dataset.slurm
+```
+
+Before the full-year build, a first-80-run smoke build spans enough of January
+to exercise the monthly train/validation/test containment rules:
+
+```bash
+SMOKE_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2_smoke
+sbatch --export="ALL,LOWVIS_TRAJ_DATA_DIR=${SMOKE_DIR},LOWVIS_TRAJ_BUILD_EXTRA_ARGS=--limit-runs 80 --min-valid-targets 39 --min-valid-comparison-targets 30" \
   sub_build_lowvis_trajectory_dataset.slurm
 ```
 
 Before training, verify that `dataset_build_config.json` reports non-zero
 train/val/test counts, `condition_leads` and `target_leads` are both 1-48,
-`dynamic_feature_order` has 27 entries, and the policy versions are:
+`dynamic_feature_order` has 27 entries, `data_contract_version` is
+`lowvis_trajectory_1_48h_v2_20260721`, `pm_future_valid_time_used` is false,
+and the policy versions are:
 
 - `pmst_canonical_units_v2_20260630`
 - `pm_explicit_legacy_scale_then_train_median_qc_v2_20260701`
+
+`pm_provenance.csv` must also report zero future-valid-time flags and at least
+95% canonical PM coverage for every retained run. Formal training is blocked
+by the five-node launcher when the v2 contract or PM provenance file is absent.
 
 The five-node launcher also checks the config, all split arrays and metadata
 before starting `torchrun`; an incomplete build exits once with the exact
@@ -104,6 +131,20 @@ Do not start the five-node formal run when ``issues.csv`` reports zero target
 coverage, raw/stored mask disagreement, split-key overlap, or a PM policy
 mismatch. Full options and packaging commands are in
 ``LOWVIS_DATA_QUALITY_AUDIT.md``.
+
+For the formal v2 trajectory alone, use a strict targeted audit:
+
+```bash
+DATA_DIR=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2
+RUN_TAG=diffusion_v2_qc_$(date +%Y%m%d_%H%M%S)
+AUDIT_DIR=/public/home/putianshu/vis_mlp/data_audits/${RUN_TAG}
+sbatch --export="ALL,LOWVIS_AUDIT_DATASETS=trajectory=${DATA_DIR},LOWVIS_AUDIT_OUT_DIR=${AUDIT_DIR},LOWVIS_AUDIT_REQUIRE_ALL=1,LOWVIS_AUDIT_STRICT=1" \
+  sub_audit_lowvis_data_quality.slurm
+```
+
+Acceptance requires zero raw/stored mask and value mismatches, no zero-coverage
+lead, at least one complete 12-48 h trajectory, zero PM future-time violations,
+PM coverage at or above 95%, and zero split-key overlap.
 
 ## 3. Train the Gaussian benchmark, then diffusion (five nodes, 20 DCUs)
 

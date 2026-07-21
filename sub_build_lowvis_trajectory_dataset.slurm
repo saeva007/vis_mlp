@@ -13,7 +13,7 @@
 set -euo pipefail
 SCRIPT_DIR="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 BASE="${LOWVIS_TRAJ_BASE:-/public/home/putianshu/vis_mlp}"
-DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_pm10_pm25_v1}"
+DATA_DIR="${LOWVIS_TRAJ_DATA_DIR:-${BASE}/ml_dataset_s2_tianji_trajectory_1_48h_dyn27_initpm_v2}"
 mkdir -p "${SCRIPT_DIR}/logs"
 cd "${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/activate_lowvis_data_runtime.sh"

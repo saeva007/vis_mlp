@@ -27,6 +27,32 @@ PM_QC_POLICY_VERSION = "pm_explicit_legacy_scale_then_train_median_qc_v2_2026070
 MAX_VISIBILITY_M = 30000.0
 
 
+def datetime_index_from_values(values: Sequence[object]) -> pd.DatetimeIndex:
+    """Decode datetime-like or Unix numeric coordinates without unit guessing by pandas.
+
+    The historical station PM files store CAMS ``valid_time`` as numeric Unix
+    seconds.  Passing those values directly to ``pd.to_datetime`` interprets
+    them as nanoseconds and silently moves 2025 data to 1970.
+    """
+
+    raw = np.asarray(values)
+    if np.issubdtype(raw.dtype, np.datetime64):
+        return pd.DatetimeIndex(pd.to_datetime(raw))
+    if np.issubdtype(raw.dtype, np.number):
+        finite = np.abs(raw[np.isfinite(raw)].astype(np.float64, copy=False))
+        magnitude = float(np.median(finite)) if finite.size else 0.0
+        if magnitude < 1.0e11:
+            unit = "s"
+        elif magnitude < 1.0e14:
+            unit = "ms"
+        elif magnitude < 1.0e17:
+            unit = "us"
+        else:
+            unit = "ns"
+        return pd.DatetimeIndex(pd.to_datetime(raw, unit=unit, origin="unix"))
+    return pd.DatetimeIndex(pd.to_datetime(raw))
+
+
 def exact_lead_indices(lead_values: np.ndarray) -> Optional[np.ndarray]:
     lead_values = np.asarray(lead_values, dtype=float)
     indices = []
@@ -109,7 +135,7 @@ def visibility_grid(
             raise ValueError(f"Visibility has unsupported non-singleton dimensions: {non_singleton}")
         vis_da = vis_da.isel({dim: 0 for dim in extra}, drop=True)
     ordered = vis_da.transpose("time", "station_id").sortby("time")
-    source_times = pd.DatetimeIndex(pd.to_datetime(ordered.time.values))
+    source_times = datetime_index_from_values(ordered.time.values)
     if source_times.has_duplicates:
         raise ValueError("Visibility time coordinate contains duplicates")
     time_pos = source_times.get_indexer(target_times, method="nearest")
@@ -129,7 +155,7 @@ def visibility_grid(
     out = np.full((len(target_times), len(stations)), np.nan, dtype=np.float32)
     if valid_t.any() and valid_s.any():
         raw = ordered.isel(
-            time=np.flatnonzero(valid_t).tolist(),
+            time=time_pos[valid_t].tolist(),
             station_id=station_pos[valid_s].tolist(),
         ).values
         out[np.ix_(np.flatnonzero(valid_t), np.flatnonzero(valid_s))] = np.asarray(raw, dtype=np.float32)

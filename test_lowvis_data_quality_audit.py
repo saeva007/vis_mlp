@@ -60,7 +60,7 @@ class LowVisDataQualityAuditTests(unittest.TestCase):
             (root / "dataset_build_config.json").write_text(json.dumps(config), encoding="utf-8")
             dyn = np.zeros((4, 2, len(order)), dtype=np.float32)
             dyn[..., 0] = 280.0
-            dyn[..., 1] = 101000.0
+            dyn[..., 1] = 1010.0
             dyn[..., 2] = 80.0
             dyn[..., 3] = 50000.0
             dyn[..., 4] = 30000.0
@@ -80,22 +80,42 @@ class LowVisDataQualityAuditTests(unittest.TestCase):
             self.assertEqual(len(pm_rows), 2)
             self.assertEqual(pm_rows[0]["pm_lineage"], "explicit_historical_builder_lineage")
             self.assertAlmostEqual(pm_rows[0]["canonical_p50"], 50.0, places=5)
+            mslp_row = next(row for row in state.rows["dynamic_feature_quality"] if row["feature"] == "MSLP")
+            self.assertAlmostEqual(float(mslp_row["p50"]), 101000.0, places=3)
+            self.assertEqual(int(mslp_row["outside_plausible_values"]), 0)
 
     def test_trajectory_audit_detects_zero_coverage_lead(self):
         with workspace_tempdir() as root:
-            order = ["T2M", "PM10_ugm3", "PM25_ugm3"]
+            order = list(audit.DYNAMIC_FEATURE_ORDER)
             config = {
+                "data_contract_version": audit.EXPECTED_TRAJECTORY_CONTRACT,
                 "dynamic_feature_order": order,
+                "dynamic_units": {
+                    name: self.policy.CANONICAL_DYNAMIC_UNITS.get(name, "source_native")
+                    for name in order
+                },
                 "condition_length": 48,
                 "target_leads": list(range(1, 49)),
                 "canonical_unit_policy": audit.EXPECTED_PM_UNIT_POLICY,
                 "pm_qc_policy": audit.EXPECTED_PM_QC_POLICY,
+                "pm_availability_policy": "valid_time_not_after_init_snapshot_repeat_v1",
+                "pm_future_valid_time_used": False,
+                "pm_min_finite_fraction": 0.95,
+                "pm_provenance_file": "pm_provenance.csv",
             }
             (root / "dataset_build_config.json").write_text(json.dumps(config), encoding="utf-8")
             dynamic = np.zeros((3, 48, len(order)), dtype=np.float32)
-            dynamic[..., 0] = 280.0
-            dynamic[..., 1] = 50.0
-            dynamic[..., 2] = 25.0
+            dynamic[..., order.index("T2M")] = 280.0
+            dynamic[..., order.index("T_925")] = 285.0
+            dynamic[..., order.index("MSLP")] = 101000.0
+            dynamic[..., order.index("DP_1000")] = 275.0
+            dynamic[..., order.index("DP_925")] = 274.0
+            dynamic[..., order.index("RH2M")] = 80.0
+            dynamic[..., order.index("RH_925")] = 70.0
+            dynamic[..., order.index("Q_1000")] = 0.005
+            dynamic[..., order.index("Q_925")] = 0.004
+            dynamic[..., order.index("PM10_ugm3")] = 50.0
+            dynamic[..., order.index("PM25_ugm3")] = 25.0
             visibility = np.full((3, 48), 5000.0, dtype=np.float32)
             mask = np.ones((3, 48), dtype=bool)
             mask[:, 20] = False
@@ -109,11 +129,46 @@ class LowVisDataQualityAuditTests(unittest.TestCase):
                     "station_id": ["A", "B", "C"],
                 }
             ).to_csv(root / "meta_train.csv", index=False)
+            pd.DataFrame(
+                {
+                    "init_time": ["2025-01-01 00:00:00"],
+                    "pm_query_valid_time": ["2025-01-01 00:00:00"],
+                    "pm_alignment_mode": ["init_snapshot_repeat"],
+                    "pm_future_valid_time_used": [False],
+                    "pm10_finite_fraction": [1.0],
+                    "pm25_finite_fraction": [1.0],
+                }
+            ).to_csv(root / "pm_provenance.csv", index=False)
             state = audit.AuditState()
             audit.audit_trajectory_dataset(state, "trajectory", root, self.policy, 2, 3, 2)
             lead21 = [row for row in state.rows["trajectory_coverage_by_lead"] if row["lead_hour"] == 21][0]
             self.assertEqual(lead21["stored_valid"], 0)
             self.assertTrue(any(item["code"] == "trajectory_lead_zero_coverage" for item in state.issues))
+
+    def test_flat_layout_infers_established_dyn27_width(self):
+        with workspace_tempdir() as root:
+            x_path = root / "X_train.npy"
+            np.save(x_path, np.zeros((2, 12 * 27 + 42), dtype=np.float32))
+            window, order, width = audit.resolve_flat_layout({}, x_path)
+            self.assertEqual(window, 12)
+            self.assertEqual(order, list(audit.DYNAMIC_FEATURE_ORDER))
+            self.assertEqual(width, 366)
+
+    def test_pm_provenance_rejects_future_valid_time(self):
+        with workspace_tempdir() as root:
+            pd.DataFrame(
+                {
+                    "init_time": ["2025-01-01 00:00:00"],
+                    "pm_query_valid_time": ["2025-01-01 01:00:00"],
+                    "pm_alignment_mode": ["unsafe"],
+                    "pm_future_valid_time_used": [True],
+                    "pm10_finite_fraction": [1.0],
+                    "pm25_finite_fraction": [1.0],
+                }
+            ).to_csv(root / "pm_provenance.csv", index=False)
+            state = audit.AuditState()
+            audit.audit_pm_provenance(state, "trajectory", root, {"pm_min_finite_fraction": 0.95})
+            self.assertTrue(any(item["code"] == "pm_future_availability_violation" for item in state.issues))
 
     def test_raw_stored_consistency_accepts_mixed_init_time_strings(self):
         with workspace_tempdir() as root:

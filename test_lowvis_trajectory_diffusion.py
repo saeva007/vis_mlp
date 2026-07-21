@@ -16,6 +16,7 @@ import lowvis_trajectory_diffusion as common
 from lowvis_trajectory_contract import (
     COMPARISON_TARGET_POSITIONS,
     TARGET_CONDITION_POSITIONS,
+    datetime_index_from_values,
     shifted_lead_indices,
     visibility_grid,
 )
@@ -58,17 +59,18 @@ class TrajectoryContractTests(unittest.TestCase):
         self.assertIsNone(missing_shift)
 
     def test_visibility_grid_normalizes_dimension_order_and_station_type(self):
-        times = pd.date_range("2025-01-01T01:00", periods=common.TARGET_LENGTH, freq="h")
+        source_times = pd.date_range("2025-01-01T00:00", periods=72, freq="h")
+        times = source_times[12:60]
         values = np.vstack(
             [
-                np.arange(common.TARGET_LENGTH, dtype=np.float32),
-                np.arange(common.TARGET_LENGTH, dtype=np.float32) + 100.0,
+                np.arange(len(source_times), dtype=np.float32),
+                np.arange(len(source_times), dtype=np.float32) + 100.0,
             ]
         )
         source = xr.DataArray(
             values,
             dims=("station_id", "time"),
-            coords={"station_id": ["54527.0", "A001"], "time": times},
+            coords={"station_id": ["54527.0", "A001"], "time": source_times},
         )
         aligned, diagnostics = visibility_grid(
             source,
@@ -77,9 +79,62 @@ class TrajectoryContractTests(unittest.TestCase):
             tolerance_minutes=31.0,
         )
         self.assertEqual(aligned.shape, (2, common.TARGET_LENGTH))
-        np.testing.assert_array_equal(aligned, values)
+        np.testing.assert_array_equal(aligned, values[:, 12:60])
         self.assertEqual(diagnostics["matched_target_times"], common.TARGET_LENGTH)
         self.assertEqual(diagnostics["matched_stations"], 2)
+
+    def test_numeric_unix_seconds_decode_to_2025(self):
+        expected = pd.date_range("2025-01-01", periods=3, freq="h")
+        seconds = expected.astype("int64").to_numpy() // 1_000_000_000
+        decoded = datetime_index_from_values(seconds)
+        np.testing.assert_array_equal(decoded.values, expected.values)
+
+    def test_builder_pm_snapshot_alignment_repeat_and_mslp_canonicalization(self):
+        sys.modules.setdefault("pvlib", types.ModuleType("pvlib"))
+        import build_lowvis_trajectory_dataset as builder
+
+        policy_dir = Path(__file__).resolve().parents[1] / "ifs_baseline"
+        if str(policy_dir) not in sys.path:
+            sys.path.insert(0, str(policy_dir))
+        import pmst_overlap_common as policy
+
+        source_times = pd.date_range("2025-01-01", periods=3, freq="h")
+        numeric_seconds = source_times.astype("int64").to_numpy() // 1_000_000_000
+        pm = xr.DataArray(
+            np.full((3, 2), 5.0e-8, dtype=np.float32),
+            dims=("time", "station_id"),
+            coords={"time": numeric_seconds, "station_id": ["54527.0", "A001"]},
+            attrs={"units": "ug m-3"},
+        )
+        snapshot, diagnostics = builder.canonical_pm_grid(
+            policy,
+            pm,
+            pd.DatetimeIndex([source_times[1]]),
+            np.asarray([54527, "A001"], dtype=object),
+        )
+        np.testing.assert_allclose(snapshot, 50.0, rtol=0.0, atol=1.0e-5)
+        self.assertEqual(diagnostics["matched_times"], 1)
+        self.assertEqual(diagnostics["matched_stations"], 2)
+        repeated = builder.repeat_pm_snapshot(snapshot)
+        self.assertEqual(repeated.shape, (2, 48, 1))
+        np.testing.assert_allclose(repeated, 50.0, rtol=0.0, atol=1.0e-5)
+
+        met = np.zeros((1, 1, len(builder.FINAL_FEATURE_ORDER)), dtype=np.float32)
+        met[..., builder.FINAL_FEATURE_ORDER.index("MSLP")] = 1010.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("T2M")] = 280.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("T_925")] = 285.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("DP_1000")] = 275.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("DP_925")] = 274.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("RH2M")] = 80.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("RH_925")] = 70.0
+        met[..., builder.FINAL_FEATURE_ORDER.index("Q_1000")] = 0.005
+        met[..., builder.FINAL_FEATURE_ORDER.index("Q_925")] = 0.004
+        canonical = builder.canonicalize_meteorology(policy, met)
+        self.assertAlmostEqual(
+            float(canonical[..., builder.FINAL_FEATURE_ORDER.index("MSLP")].item()),
+            101000.0,
+            places=2,
+        )
 
     def test_full_trajectory_split_containment(self):
         # January test is the final three days; this trajectory stays inside it.

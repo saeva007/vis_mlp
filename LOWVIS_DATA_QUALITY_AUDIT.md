@@ -17,6 +17,15 @@ values, then audits the common ``0..10000 ug m-3`` range. Historical arrays are
 reported in both stored and canonical scales; they are never silently treated
 as physical ``ug m-3`` values.
 
+Unit validity is not the same as forecast availability. Historical flat
+datasets that contain PM but do not prove
+``forecast_reference_time <= sample initialization`` are reported as
+``pm_forecast_availability_unproven``. This is a provenance warning for the
+existing mainline, not a claim that every PM value is future data. The v2
+trajectory contract is stricter: it uses only the PM valid at initialization,
+records every run in ``pm_provenance.csv``, and fails if any PM query time is
+later than initialization.
+
 ## Submit the complete audit
 
 ```bash
@@ -50,6 +59,7 @@ The most important files are:
 - ``audit_summary.json`` and ``issues.csv``
 - ``visibility_quality.csv``
 - ``dynamic_feature_quality.csv`` and ``pm_quality.csv``
+- ``pm_provenance_quality.csv``
 - ``trajectory_coverage_by_lead.csv``
 - ``trajectory_raw_consistency.csv`` and mismatch examples
 - ``raw_visibility_by_hour.csv`` and worst timestamps
