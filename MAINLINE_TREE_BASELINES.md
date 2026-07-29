@@ -30,6 +30,28 @@ entrypoints for this experiment: they point to obsolete data, drop the wrong
 feature column, omit Random Forest, and do not perform independent test
 evaluation.
 
+## Interpretation boundary
+
+All three tree families are trained on S2 only. This is intentional: Random
+Forest has no operation symmetric to neural S1 pretraining and S2 fine-tuning,
+while continuing XGBoost or LightGBM trees from S1 would create an asymmetric
+comparison. Therefore:
+
+1. use an S2-from-scratch Static-MLP+GRU as the architecture-isolated neural
+   control;
+2. report the established S1-to-S2 neural mainline separately as the complete
+   operational-system reference.
+
+The matching S2-from-scratch control can reuse the current launcher:
+
+```bash
+S2_DATA=/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2
+S2_SCRATCH_ID=exp_static_gru_s2_scratch_$(date +%Y%m%d_%H%M%S)
+
+sbatch --export="ALL,LOWVIS_RNN_MODE=s2,LOWVIS_RNN_S2_DATA_DIR=${S2_DATA},LOWVIS_RNN_RUN_ID=${S2_SCRATCH_ID},LOWVIS_RNN_PRETRAINED_CKPT=,LOWVIS_RNN_S2_A_STEPS=0,LOWVIS_RNN_S2_B_STEPS=30000" \
+  sub_static_rnn_lowvis_main.slurm
+```
+
 ## Why these fixed parameters
 
 Recent visibility work continues to use RF, XGBoost, and LightGBM as strong

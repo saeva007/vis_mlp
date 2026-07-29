@@ -820,6 +820,12 @@ def train_model(args: argparse.Namespace) -> Dict[str, object]:
         "cache_contract_version": cache_config.get("contract_version"),
         "cache_source_signature": cache_config.get("source_signature"),
         "data_dir": cache_config.get("data_dir"),
+        "training_scope": "S2-only architecture replacement",
+        "comparison_boundary": (
+            "Compare causally against an S2-from-scratch Static-MLP+GRU control; "
+            "the operational S1-to-S2 mainline is a full-system reference because "
+            "RF has no symmetric pretrain/fine-tune operation."
+        ),
         "source_meta_test": str(Path(str(cache_config.get("data_dir"))) / "meta_test.csv"),
         "probability_file": "probs.npy",
         "probability_variant": "training_weight_prior_corrected",
