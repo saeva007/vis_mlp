@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit an SSH-resilient S2-only Low-vis sampling curve (0% to 50%, step 10%).
+# Submit an SSH-resilient S2-only Low-vis sampling curve (0% to 50%, step 5%).
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ SBATCH_SCRIPT="${SBATCH_SCRIPT:-${SCRIPT_DIR}/sub_static_rnn_lowvis_sampling_mat
 EVAL_SBATCH_SCRIPT="${EVAL_SBATCH_SCRIPT:-${BASE}/paper_eval/sub_static_rnn_lowvis_sampling_eval.slurm}"
 PRETRAINED_CKPT="${LOWVIS_RNN_PRETRAINED_CKPT:-${BASE}/checkpoints/exp_114287869_static_mlp_gru_main_S1_best_score.pt}"
 SEED="${LOWVIS_RNN_SEED:-42}"
-EXPERIMENTS="10 11 12 13 14 15"
+EXPERIMENTS="10 11 12 13 14 15 16 17 18 19 20"
 
 if [[ "${1:-}" != "--worker" ]]; then
     test -f "${SBATCH_SCRIPT}" || { echo "ERROR: missing ${SBATCH_SCRIPT}" >&2; exit 2; }
@@ -26,7 +26,7 @@ if [[ "${1:-}" != "--worker" ]]; then
     echo "checkpoint=OK ${PRETRAINED_CKPT}"
     echo "training_script=OK ${SBATCH_SCRIPT}"
     echo "evaluation_script=OK ${EVAL_SBATCH_SCRIPT}"
-    echo "curve=0,10,20,30,40,50 percent; S1 checkpoint fixed; S2 sampling only"
+    echo "curve=0,5,10,15,20,25,30,35,40,45,50 percent; S1 checkpoint fixed; S2 sampling only"
 
     nohup env \
         BASE="${BASE}" \

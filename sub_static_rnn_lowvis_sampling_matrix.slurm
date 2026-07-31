@@ -52,22 +52,42 @@ get_experiment() {
             MODEL_ARGS="$(base_model_args) --sampler-mode natural_shuffle"
             ;;
         11)
+            EXP_NAME="lowvis_share_05"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.0225 --mist-ratio-s2 0.0275"
+            ;;
+        12)
             EXP_NAME="lowvis_share_10"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.045 --mist-ratio-s2 0.055"
             ;;
-        12)
+        13)
+            EXP_NAME="lowvis_share_15"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.0675 --mist-ratio-s2 0.0825"
+            ;;
+        14)
             EXP_NAME="lowvis_share_20"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.09 --mist-ratio-s2 0.11"
             ;;
-        13)
+        15)
+            EXP_NAME="lowvis_share_25"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.1125 --mist-ratio-s2 0.1375"
+            ;;
+        16)
             EXP_NAME="lowvis_share_30"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.135 --mist-ratio-s2 0.165"
             ;;
-        14)
+        17)
+            EXP_NAME="lowvis_share_35"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.1575 --mist-ratio-s2 0.1925"
+            ;;
+        18)
             EXP_NAME="lowvis_share_40"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.18 --mist-ratio-s2 0.22"
             ;;
-        15)
+        19)
+            EXP_NAME="lowvis_share_45"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.2025 --mist-ratio-s2 0.2475"
+            ;;
+        20)
             EXP_NAME="lowvis_share_50"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.225 --mist-ratio-s2 0.275"
             ;;
