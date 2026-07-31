@@ -47,6 +47,30 @@ get_experiment() {
             EXP_NAME="mild_lowvis_oversample"
             MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.15 --mist-ratio-s1 0.15 --fog-ratio-s2 0.14 --mist-ratio-s2 0.16"
             ;;
+        10)
+            EXP_NAME="lowvis_share_00"
+            MODEL_ARGS="$(base_model_args) --sampler-mode natural_shuffle"
+            ;;
+        11)
+            EXP_NAME="lowvis_share_10"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.045 --mist-ratio-s2 0.055"
+            ;;
+        12)
+            EXP_NAME="lowvis_share_20"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.09 --mist-ratio-s2 0.11"
+            ;;
+        13)
+            EXP_NAME="lowvis_share_30"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.135 --mist-ratio-s2 0.165"
+            ;;
+        14)
+            EXP_NAME="lowvis_share_40"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.18 --mist-ratio-s2 0.22"
+            ;;
+        15)
+            EXP_NAME="lowvis_share_50"
+            MODEL_ARGS="$(base_model_args) --sampler-mode stratified_balanced --fog-ratio-s1 0.20 --mist-ratio-s1 0.20 --fog-ratio-s2 0.225 --mist-ratio-s2 0.275"
+            ;;
         *)
             echo "Unknown sampling experiment id: $1" >&2
             exit 2
