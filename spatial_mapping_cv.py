@@ -33,7 +33,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.cluster import KMeans
 from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import average_precision_score
 from sklearn.preprocessing import RobustScaler
@@ -134,10 +133,57 @@ def _spherical_coordinates(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
 def _assign_spatial_folds(stations: pd.DataFrame, n_folds: int, seed: int) -> pd.DataFrame:
     if len(stations) < n_folds * 2:
         raise ValueError(f"Too few stations ({len(stations)}) for {n_folds} spatial folds")
+
     xyz = _spherical_coordinates(stations["lat"].to_numpy(), stations["lon"].to_numpy())
-    raw = KMeans(n_clusters=n_folds, n_init=50, random_state=seed).fit_predict(xyz)
+    station_count = len(stations)
+    base, remainder = divmod(station_count, n_folds)
+    capacities = np.full(n_folds, base, dtype=np.int64)
+    capacities[:remainder] += 1
+    labels = np.full(station_count, -1, dtype=np.int64)
+
+    # Recursively bisect each region along its leading spherical-coordinate
+    # principal axis.  The exact split positions come from fixed fold
+    # capacities, so held-out station counts differ by at most one while every
+    # split remains coordinate-only and spatially compact.  The seed affects
+    # only exact projection ties; visibility labels are never accessed.
+    tie_rank = np.empty(station_count, dtype=np.int64)
+    tie_rank[np.random.default_rng(seed).permutation(station_count)] = np.arange(station_count)
+
+    def assign_region(indices: np.ndarray, fold_ids: Sequence[int]) -> None:
+        if len(fold_ids) == 1:
+            fold = int(fold_ids[0])
+            if len(indices) != int(capacities[fold]):
+                raise AssertionError(
+                    f"Balanced spatial split size mismatch for fold {fold}: "
+                    f"got {len(indices)}, expected {capacities[fold]}"
+                )
+            labels[indices] = fold
+            return
+
+        left_fold_count = len(fold_ids) // 2
+        left_folds = list(fold_ids[:left_fold_count])
+        right_folds = list(fold_ids[left_fold_count:])
+        left_size = int(capacities[left_folds].sum())
+
+        local = xyz[indices]
+        centered = local - local.mean(axis=0, keepdims=True)
+        covariance = centered.T @ centered
+        _, eigenvectors = np.linalg.eigh(covariance)
+        axis = eigenvectors[:, -1]
+        orient = int(np.argmax(np.abs(axis)))
+        if axis[orient] < 0:
+            axis = -axis
+        projection = centered @ axis
+        order = np.lexsort((tie_rank[indices], projection))
+        assign_region(indices[order[:left_size]], left_folds)
+        assign_region(indices[order[left_size:]], right_folds)
+
+    assign_region(np.arange(station_count, dtype=np.int64), list(range(n_folds)))
+    if np.any(labels < 0):
+        raise AssertionError("Balanced spatial partition left stations unassigned")
+
     assigned = stations.copy()
-    assigned["raw_cluster"] = raw.astype(int)
+    assigned["raw_cluster"] = labels
     centroids = (
         assigned.groupby("raw_cluster", as_index=False)[["lat", "lon"]]
         .mean()
@@ -226,7 +272,9 @@ def prepare_folds(args: argparse.Namespace) -> None:
 
     counts = stations.groupby("fold").size().reindex(range(args.n_folds), fill_value=0)
     if int(counts.min()) < int(args.min_fold_stations):
-        raise ValueError(f"Spatial KMeans produced an undersized fold: {counts.to_dict()}")
+        raise ValueError(f"Balanced spatial partition produced an undersized fold: {counts.to_dict()}")
+    if int(counts.max() - counts.min()) > 1:
+        raise AssertionError(f"Balanced spatial fold sizes diverged: {counts.to_dict()}")
     stations.to_csv(output_dir / "station_folds.csv", index=False)
 
     summary_rows: List[Dict[str, object]] = []
@@ -261,14 +309,14 @@ def prepare_folds(args: argparse.Namespace) -> None:
     summary = pd.DataFrame(summary_rows)
     summary.to_csv(output_dir / "fold_row_summary.csv", index=False)
     fold_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": pd.Timestamp.utcnow().isoformat(),
         "data_dir": str(data_dir),
         "data_shapes": shapes,
         "n_folds": int(args.n_folds),
         "seed": int(args.seed),
-        "algorithm": "spherical_xyz_kmeans_coordinates_only",
-        "kmeans_n_init": 50,
+        "algorithm": "balanced_recursive_spherical_pca_coordinates_only_v1",
+        "balance_policy": "held-out station counts differ by at most one",
         "buffer_km": float(args.buffer_km),
         "station_count": int(len(stations)),
         "fold_station_counts": {str(int(k)): int(v) for k, v in counts.items()},

@@ -12,6 +12,31 @@ import train_static_rnn_lowvis as trainer
 
 
 class SpatialFoldContractTests(unittest.TestCase):
+    def test_spatial_assignment_is_balanced_and_deterministic(self):
+        rng = np.random.default_rng(23)
+        station_count = 53
+        stations = pd.DataFrame(
+            {
+                "station_id": [f"S{i:03d}" for i in range(station_count)],
+                "lat": np.concatenate(
+                    [rng.normal(30.0, 0.3, 41), rng.normal(46.0, 0.3, 12)]
+                ),
+                "lon": np.concatenate(
+                    [rng.normal(115.0, 0.3, 41), rng.normal(83.0, 0.3, 12)]
+                ),
+            }
+        )
+        first = spcv._assign_spatial_folds(stations, n_folds=5, seed=20260815)
+        second = spcv._assign_spatial_folds(stations, n_folds=5, seed=20260815)
+        counts = first.groupby("fold").size().sort_index().to_numpy()
+        self.assertLessEqual(int(counts.max() - counts.min()), 1)
+        self.assertEqual(int(counts.sum()), station_count)
+        self.assertTrue(
+            first[["station_id", "fold"]].reset_index(drop=True).equals(
+                second[["station_id", "fold"]].reset_index(drop=True)
+            )
+        )
+
     def test_prepare_has_no_station_overlap_and_partitions_test_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -48,6 +73,10 @@ class SpatialFoldContractTests(unittest.TestCase):
                     chunksize=17,
                     overwrite=False,
                 )
+            )
+            station_fold_counts = pd.read_csv(fold_dir / "station_folds.csv").groupby("fold").size()
+            self.assertLessEqual(
+                int(station_fold_counts.max() - station_fold_counts.min()), 1
             )
             all_test = []
             meta_test = pd.read_csv(data_dir / "meta_test.csv", dtype={"station_id": "string"})

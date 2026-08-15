@@ -11,8 +11,10 @@ from nonlinear instantaneous mapping versus 12-hour temporal context?
 - Dataset: the existing nationwide Tianji S2 train/validation/test arrays.
 - Temporal boundary: the existing train, validation, and frozen test files are
   preserved unchanged.
-- Spatial boundary: station coordinates alone define five spherical KMeans
-  blocks (`seed=20260815`); visibility labels never enter fold construction.
+- Spatial boundary: station coordinates alone define five balanced recursive
+  spherical-coordinate blocks (`seed=20260815` is used only to break exact
+  projection ties); visibility labels never enter fold construction. Held-out
+  station counts differ by at most one across folds.
 - Buffer: training and validation stations within 50 km of a held-out station
   are excluded for that fold.
 - Training rows: existing training times at non-held-out, non-buffer stations.
