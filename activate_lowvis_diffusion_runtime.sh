@@ -1,15 +1,23 @@
 #!/bin/bash
 # Directly activate the tracked low-vis trajectory runtime without invoking the
-# cluster Conda plugin loader.  Set LOWVIS_DIFFUSION_USE_DCU=1 for training.
+# cluster Conda plugin loader.  Jarvis PyTorch is HIP-linked, so CPU jobs that
+# import torch must load the same DTK/HyHAL shared-library stack as DCU jobs.
 
 set -euo pipefail
 
-if [[ "${LOWVIS_DIFFUSION_USE_DCU:-0}" == "1" ]]; then
+USE_DCU="${LOWVIS_DIFFUSION_USE_DCU:-0}"
+LOAD_HIP_RUNTIME="${LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME:-${USE_DCU}}"
+
+if [[ "${LOAD_HIP_RUNTIME}" == "1" ]]; then
     module purge
     module load compiler/devtoolset/7.3.1
     module load mpi/hpcx/2.11.0/gcc-7.3.1
     source /public/home/xichen/ncydata/dtk/dtk-24.04.1/env.sh
     export LD_LIBRARY_PATH="/public/home/xichen/ncydata/dtk/dtk-24.04.1/.hyhal/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+if [[ "${USE_DCU}" != "1" ]]; then
+    unset LD_PRELOAD
 fi
 
 # The Jarvis runtime is the validated environment for both CPU dataset builds
@@ -53,4 +61,5 @@ if [[ "${actual_python}" != "${TORCH_ENV}/bin/python" ]]; then
     echo "ERROR: expected ${TORCH_ENV}/bin/python, got ${actual_python}" >&2
     return 2 2>/dev/null || exit 2
 fi
+echo "[trajectory-env] use_dcu=${USE_DCU} load_hip_runtime=${LOAD_HIP_RUNTIME}"
 python -c "import ssl, sys, torch; print('[trajectory-env] python=' + sys.executable); print('[trajectory-env] torch=' + torch.__version__); print('[trajectory-env] openssl=' + ssl.OPENSSL_VERSION)"

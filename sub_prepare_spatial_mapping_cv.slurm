@@ -19,11 +19,8 @@ RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 FOLD_SEED="${FOLD_SEED:-20260815}"
 BUFFER_KM="${BUFFER_KM:-50}"
 
-module purge
-module load compiler/devtoolset/7.3.1
-module load mpi/hpcx/2.11.0/gcc-7.3.1
-unset LD_PRELOAD
 export LOWVIS_DIFFUSION_USE_DCU=0
+export LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME=1
 source "${REPO_ROOT}/activate_lowvis_diffusion_runtime.sh"
 
 export PYTHONUNBUFFERED=1
