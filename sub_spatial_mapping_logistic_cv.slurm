@@ -3,7 +3,7 @@
 #SBATCH -p kshcexclu04
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH -t 48:00:00
 #SBATCH --array=0-4%1
@@ -26,8 +26,8 @@ source /public/home/jarvis226/miniconda3/bin/activate
 conda activate torch
 
 export PYTHONUNBUFFERED=1
-export OMP_NUM_THREADS="${SLURM_CPUS_ON_NODE:-64}"
-export MKL_NUM_THREADS="${SLURM_CPUS_ON_NODE:-64}"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
 
 mkdir -p "${REPO_ROOT}/logs" "${OUTPUT_DIR}"
 cd "${REPO_ROOT}"
