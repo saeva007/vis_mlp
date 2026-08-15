@@ -20,8 +20,10 @@ FOLD_SEED="${FOLD_SEED:-20260815}"
 BUFFER_KM="${BUFFER_KM:-50}"
 
 module purge
-source /public/home/jarvis226/miniconda3/bin/activate
-conda activate torch
+module load compiler/devtoolset/7.3.1
+module load mpi/hpcx/2.11.0/gcc-7.3.1
+export LOWVIS_DIFFUSION_USE_DCU=0
+source "${REPO_ROOT}/activate_lowvis_diffusion_runtime.sh"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"

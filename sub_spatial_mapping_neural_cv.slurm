@@ -36,15 +36,8 @@ CKPT_DIR="${OUTPUT_DIR}/checkpoints"
 FOLD_DIR="${RESULT_ROOT}/folds/fold_${FOLD}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 
-module purge
-module load compiler/devtoolset/7.3.1
-module load mpi/hpcx/2.11.0/gcc-7.3.1
-source /public/home/xichen/ncydata/dtk/dtk-24.04.1/env.sh
-export LD_LIBRARY_PATH=/public/home/xichen/ncydata/dtk/dtk-24.04.1/.hyhal/lib:$LD_LIBRARY_PATH
-source /public/home/jarvis226/miniconda3/bin/activate
-conda activate torch
-export LD_LIBRARY_PATH=/public/home/xichen/.conda/envs/py310_ppy/openssl/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/public/home/xichen/ncydata/panpy_test_liud/hipnn/lib/release/:$LD_LIBRARY_PATH
+export LOWVIS_DIFFUSION_USE_DCU=1
+source "${REPO_ROOT}/activate_lowvis_diffusion_runtime.sh"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=4

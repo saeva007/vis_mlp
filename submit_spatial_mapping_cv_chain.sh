@@ -47,6 +47,7 @@ echo "[worker] data=${DATA_DIR}"
 echo "[worker] result_root=${RESULT_ROOT}"
 
 for script in \
+    activate_lowvis_diffusion_runtime.sh \
     spatial_mapping_cv.py \
     train_static_rnn_lowvis.py \
     sub_prepare_spatial_mapping_cv.slurm \

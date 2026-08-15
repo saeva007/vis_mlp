@@ -18,8 +18,10 @@ RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-}"
 
 module purge
-source /public/home/jarvis226/miniconda3/bin/activate
-conda activate torch
+module load compiler/devtoolset/7.3.1
+module load mpi/hpcx/2.11.0/gcc-7.3.1
+export LOWVIS_DIFFUSION_USE_DCU=0
+source "${REPO_ROOT}/activate_lowvis_diffusion_runtime.sh"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
