@@ -43,6 +43,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from sklearn.metrics import average_precision_score
 from sklearn.preprocessing import RobustScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
@@ -229,7 +230,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Static MLP + GRU/LSTM low-vis training")
 
     p.add_argument("--mode", choices=["s1", "s2", "both"], default="both")
-    p.add_argument("--encoder", choices=["gru", "lstm"], default="gru")
+    p.add_argument(
+        "--encoder",
+        choices=["gru", "lstm", "mlp"],
+        default="gru",
+        help=(
+            "Dynamic encoder. 'mlp' uses only the final forecast state and is "
+            "the instantaneous nonlinear mapping baseline."
+        ),
+    )
     p.add_argument("--run-id", default=os.environ.get("LOWVIS_RNN_RUN_ID", f"exp_{int(time.time())}_static_rnn"))
     p.add_argument("--seed", type=int, default=int(os.environ.get("LOWVIS_RNN_SEED", "42")))
     p.add_argument(
@@ -246,6 +255,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-data-dir", default=DEFAULT_S2_DIR)
     p.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR)
     p.add_argument("--pretrained-ckpt", default="")
+    p.add_argument(
+        "--row-index-dir",
+        default="",
+        help=(
+            "Optional directory containing stage/split row-index files such as "
+            "s2_train_indices.npy and s2_val_indices.npy. The selected rows are "
+            "applied before scaler fitting and Dataset construction."
+        ),
+    )
     p.add_argument(
         "--pretrained-layout-policy",
         choices=["strict", "compatible"],
@@ -308,6 +326,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--s2-lr-head-b", type=float, default=1e-5)
     p.add_argument("--s2-lr-head-c", type=float, default=2e-5)
     p.add_argument("--s2-lr-head-d", type=float, default=2e-5)
+    p.add_argument(
+        "--s2-from-scratch",
+        action="store_true",
+        help=(
+            "Train S2 end-to-end from random initialization, skipping the "
+            "pretrained/head-only phase. Intended for fair architecture baselines."
+        ),
+    )
+    p.add_argument("--s2-from-scratch-lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--grad-clip", type=float, default=0.5)
@@ -886,6 +913,7 @@ class LowVisDataset(Dataset):
         use_fe: bool,
         use_pm: bool,
         args: argparse.Namespace,
+        row_indices: Optional[np.ndarray] = None,
         time_group_ids: Optional[np.ndarray] = None,
         time_group_index: Optional[TimeGroupIndex] = None,
     ) -> None:
@@ -895,6 +923,7 @@ class LowVisDataset(Dataset):
         self.use_fe = bool(use_fe)
         self.use_pm = bool(use_pm)
         self.args = args
+        self.row_indices = None if row_indices is None else np.asarray(row_indices, dtype=np.int64)
         self.time_group_ids = time_group_ids
         self.time_group_index = time_group_index
         self.y_raw = torch.as_tensor(np.maximum(y_raw, 0.0), dtype=torch.float32)
@@ -903,6 +932,11 @@ class LowVisDataset(Dataset):
         self.base_weights = boundary_weight_from_visibility(np.maximum(y_raw, 0.0), args)
         self.log_mask = build_dyn_log_mask(layout)
         self.X = None
+        if self.row_indices is not None:
+            if self.row_indices.ndim != 1 or len(self.row_indices) != len(self.y_cls):
+                raise ValueError("row_indices must be one-dimensional and aligned with selected labels")
+            if len(self.row_indices) and np.any(self.row_indices[1:] <= self.row_indices[:-1]):
+                raise ValueError("row_indices must be strictly increasing and duplicate-free")
 
     def __len__(self) -> int:
         return len(self.y_cls)
@@ -955,7 +989,8 @@ class LowVisDataset(Dataset):
         idx = int(idx)
         if self.X is None:
             self.X = np.load(self.x_path, mmap_mode="r")
-        row = self.X[idx]
+        source_idx = idx if self.row_indices is None else int(self.row_indices[idx])
+        row = self.X[source_idx]
         core = row[: self.layout.core_dim][None, :]
         core = apply_core_transform(core, self.layout, self.use_pm, self.log_mask)[0]
         if self.scaler is not None:
@@ -999,6 +1034,28 @@ def load_split_paths(
     return x_tr, y_tr, x_va, y_va
 
 
+def load_split_row_indices(
+    args: argparse.Namespace,
+    stage: str,
+    split: str,
+    n_rows: int,
+) -> Optional[np.ndarray]:
+    index_dir = str(getattr(args, "row_index_dir", "") or "").strip()
+    if not index_dir:
+        return None
+    path = os.path.join(index_dir, f"{stage}_{split}_indices.npy")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing spatial row index for {stage}/{split}: {path}")
+    indices = np.asarray(np.load(path), dtype=np.int64)
+    if indices.ndim != 1 or not len(indices):
+        raise ValueError(f"Spatial row index must be a non-empty vector: {path}")
+    if np.any(indices < 0) or np.any(indices >= int(n_rows)):
+        raise ValueError(f"Spatial row index is out of bounds for {stage}/{split}: {path}")
+    if np.any(indices[1:] <= indices[:-1]):
+        raise ValueError(f"Spatial row index must be strictly increasing and unique: {path}")
+    return indices
+
+
 def fit_or_load_scaler(
     args: argparse.Namespace,
     stage: str,
@@ -1008,6 +1065,7 @@ def fit_or_load_scaler(
     rank: int,
     world_size: int,
     device: torch.device,
+    train_indices: Optional[np.ndarray] = None,
 ) -> RobustScaler:
     os.makedirs(args.ckpt_dir, exist_ok=True)
     path = scaler_cache_path(args, stage, layout, use_pm)
@@ -1017,10 +1075,12 @@ def fit_or_load_scaler(
         if not os.path.exists(path):
             print(f"[Scaler] fitting {path}", flush=True)
             x_m = np.load(x_train_path, mmap_mode="r")
-            n = len(x_m)
+            eligible = np.arange(len(x_m), dtype=np.int64) if train_indices is None else train_indices
+            n = len(eligible)
             max_samples = min(200000, n)
             rng = np.random.default_rng(42)
-            idx = np.arange(n) if n <= max_samples else np.sort(rng.choice(n, size=max_samples, replace=False))
+            chosen = np.arange(n) if n <= max_samples else np.sort(rng.choice(n, size=max_samples, replace=False))
+            idx = eligible[chosen]
             core = x_m[idx, : layout.core_dim].astype(np.float32)
             core = apply_core_transform(core, layout, use_pm, log_mask)
             scaler = RobustScaler(quantile_range=(5.0, 95.0)).fit(core)
@@ -1049,17 +1109,42 @@ def load_data(
     va_layout = resolve_layout_from_file(x_va, args.window_size, data_dir)
     if asdict(layout) != asdict(va_layout):
         raise ValueError(f"train/val layout mismatch: {layout} vs {va_layout}")
-    y_raw_tr, y_cls_tr = visibility_to_labels(np.load(y_tr))
-    y_raw_va, y_cls_va = visibility_to_labels(np.load(y_va))
-    if len(y_raw_tr) != np.load(x_tr, mmap_mode="r").shape[0]:
+    x_tr_rows = int(np.load(x_tr, mmap_mode="r").shape[0])
+    x_va_rows = int(np.load(x_va, mmap_mode="r").shape[0])
+    y_tr_all = np.load(y_tr, mmap_mode="r")
+    y_va_all = np.load(y_va, mmap_mode="r")
+    if len(y_tr_all) != x_tr_rows:
         raise ValueError("train X/y length mismatch")
-    if len(y_raw_va) != np.load(x_va, mmap_mode="r").shape[0]:
+    if len(y_va_all) != x_va_rows:
         raise ValueError("val X/y length mismatch")
-    scaler = fit_or_load_scaler(args, stage, x_tr, layout, use_pm, rank, world_size, device)
+    train_indices = load_split_row_indices(args, stage, "train", x_tr_rows)
+    val_indices = load_split_row_indices(args, stage, "val", x_va_rows)
+    y_raw_tr, y_cls_tr = visibility_to_labels(
+        np.asarray(y_tr_all if train_indices is None else y_tr_all[train_indices])
+    )
+    y_raw_va, y_cls_va = visibility_to_labels(
+        np.asarray(y_va_all if val_indices is None else y_va_all[val_indices])
+    )
+    scaler = fit_or_load_scaler(
+        args,
+        stage,
+        x_tr,
+        layout,
+        use_pm,
+        rank,
+        world_size,
+        device,
+        train_indices=train_indices,
+    )
     train_groups = None
     val_groups = None
     train_group_index = None
     if stage == "s2" and (event_footprint_enabled(args) or sampling_calibration_enabled(args)):
+        if train_indices is not None or val_indices is not None:
+            raise ValueError(
+                "Spatial row-index training currently supports Phase A/B only; "
+                "disable Phase C/D so event time groups cannot be misaligned."
+            )
         train_groups = ensure_time_group_ids(
             args, data_dir, stage, "train", len(y_cls_tr), rank, world_size, device
         )
@@ -1078,6 +1163,7 @@ def load_data(
         use_fe,
         use_pm,
         args,
+        row_indices=train_indices,
         time_group_ids=train_groups,
         time_group_index=train_group_index,
     )
@@ -1090,9 +1176,15 @@ def load_data(
         use_fe,
         use_pm,
         args,
+        row_indices=val_indices,
         time_group_ids=val_groups,
     )
-    rank0(rank, f"[Data:{stage}] train={len(tr_ds)} val={len(va_ds)} layout={layout} use_fe={use_fe} use_pm={use_pm}")
+    rank0(
+        rank,
+        f"[Data:{stage}] train={len(tr_ds)}/{x_tr_rows} val={len(va_ds)}/{x_va_rows} "
+        f"layout={layout} use_fe={use_fe} use_pm={use_pm} "
+        f"row_index_dir={getattr(args, 'row_index_dir', '') or 'none'}",
+    )
     return tr_ds, va_ds, layout, scaler
 
 
@@ -1127,16 +1219,19 @@ class StaticRNNLowVisNet(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        rnn_cls = nn.GRU if encoder == "gru" else nn.LSTM
-        self.rnn = rnn_cls(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=rnn_layers,
-            batch_first=True,
-            dropout=rnn_dropout,
-            bidirectional=bidirectional,
-        )
-        dyn_out = hidden_dim * (2 if bidirectional else 1)
+        if encoder == "mlp":
+            self.rnn = None
+        else:
+            rnn_cls = nn.GRU if encoder == "gru" else nn.LSTM
+            self.rnn = rnn_cls(
+                input_size=hidden_dim,
+                hidden_size=hidden_dim,
+                num_layers=rnn_layers,
+                batch_first=True,
+                dropout=rnn_dropout,
+                bidirectional=bidirectional,
+            )
+        dyn_out = hidden_dim if encoder == "mlp" else hidden_dim * (2 if bidirectional else 1)
         self.dynamic_norm = nn.LayerNorm(dyn_out)
         self.attn_pool = nn.Linear(dyn_out, 1) if pooling == "attention" else None
 
@@ -1190,9 +1285,12 @@ class StaticRNNLowVisNet(nn.Module):
         veg = torch.clamp(x[:, split_static].long(), 0, 31)
         extra = x[:, split_static + 1 :] if self.use_fe else None
 
-        dyn_in = self.dynamic_proj(dyn)
-        dyn_seq, _ = self.rnn(dyn_in)
-        dyn_feat = self.dynamic_norm(self._pool_dynamic(dyn_seq))
+        if self.encoder == "mlp":
+            dyn_feat = self.dynamic_norm(self.dynamic_proj(dyn[:, -1, :]))
+        else:
+            dyn_in = self.dynamic_proj(dyn)
+            dyn_seq, _ = self.rnn(dyn_in)
+            dyn_feat = self.dynamic_norm(self._pool_dynamic(dyn_seq))
 
         stat_feat = self.static_encoder(torch.cat([stat, self.veg_embedding(veg)], dim=1))
         parts = [dyn_feat, stat_feat]
@@ -1538,6 +1636,22 @@ def build_metrics(y_true: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
     }
 
 
+def add_probability_metrics(
+    metrics: Dict[str, float],
+    y_true: np.ndarray,
+    probs: np.ndarray,
+) -> Dict[str, float]:
+    low_true = (np.asarray(y_true, dtype=np.int64) <= 1).astype(np.int64)
+    low_prob = np.asarray(probs, dtype=np.float64)[:, 0] + np.asarray(probs, dtype=np.float64)[:, 1]
+    metrics = dict(metrics)
+    metrics["low_vis_ap"] = (
+        float(average_precision_score(low_true, low_prob))
+        if np.unique(low_true).size == 2
+        else float("nan")
+    )
+    return metrics
+
+
 def event_group_metrics(
     y_true: np.ndarray,
     pred: np.ndarray,
@@ -1818,7 +1932,11 @@ def evaluate(
     if rank == 0:
         if args.threshold_mode == "argmax":
             pred = np.argmax(all_probs, axis=1)
-            metrics = build_metrics(all_targets.astype(np.int64), pred)
+            metrics = add_probability_metrics(
+                build_metrics(all_targets.astype(np.int64), pred),
+                all_targets.astype(np.int64),
+                all_probs,
+            )
             metric_name = selection_metric or args.selection_metric
             if all_groups is not None:
                 min_fog_count = (
@@ -1846,6 +1964,7 @@ def evaluate(
             th = {"mode": "argmax"}
         else:
             score, th, metrics = threshold_search(args, all_probs, all_targets.astype(np.int64))
+            metrics = add_probability_metrics(metrics, all_targets.astype(np.int64), all_probs)
         return score, th, metrics
     return -1.0, {"fog": 0.5, "mist": 0.5}, {}
 
@@ -2530,6 +2649,17 @@ def train_stage(
                 "use_fe": bool(raw_for_meta.use_fe),
                 "encoder": raw_for_meta.encoder,
                 "pooling": raw_for_meta.pooling,
+                "architecture": {
+                    "hidden_dim": int(args.hidden_dim),
+                    "static_hidden_dim": int(args.static_hidden_dim),
+                    "fe_hidden_dim": int(args.fe_hidden_dim),
+                    "fusion_hidden_dim": int(args.fusion_hidden_dim),
+                    "veg_emb_dim": int(args.veg_emb_dim),
+                    "rnn_layers": int(args.rnn_layers),
+                    "dropout": float(args.dropout),
+                    "bidirectional": bool(args.bidirectional),
+                },
+                "row_index_dir": str(getattr(args, "row_index_dir", "") or ""),
                 "score": score,
                 "thresholds": th,
                 "metrics": metrics,
@@ -2650,6 +2780,12 @@ def write_run_config(args: argparse.Namespace, rank: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.s2_from_scratch and args.mode != "s2":
+        raise ValueError("--s2-from-scratch requires --mode s2")
+    if args.s2_from_scratch and args.pretrained_ckpt:
+        raise ValueError("--s2-from-scratch cannot be combined with --pretrained-ckpt")
+    if args.encoder == "mlp" and args.bidirectional:
+        raise ValueError("--bidirectional is not applicable to --encoder mlp")
     use_fe = not args.no_fe
     use_pm = not args.no_pm
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -2684,33 +2820,49 @@ def main() -> None:
         tr, va, layout, _ = load_data(args, args.s2_data_dir, "s2", use_fe, use_pm, rank, local_rank, world_size, device)
         model = build_model(args, layout, use_fe, device)
         pretrained = args.pretrained_ckpt or s1_best
-        if pretrained:
-            load_compatible_checkpoint(model, pretrained, rank, device, args.pretrained_layout_policy)
-        l2_ref = clone_state(model, device) if pretrained else None
-        set_trainable(model, "head")
-        ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=True)
-        rank0(rank, f"[Model:S2] params={sum(p.numel() for p in unwrap(ddp_model).parameters()) / 1e6:.3f}M pretrained={pretrained or 'none'}")
+        if args.s2_from_scratch:
+            pretrained = ""
+            l2_ref = None
+            phase_a_best = ""
+            set_trainable(model, "all")
+            ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=False)
+            rank0(
+                rank,
+                f"[Model:S2_FromScratch] params={sum(p.numel() for p in unwrap(ddp_model).parameters()) / 1e6:.3f}M",
+            )
+            phase_b_best = train_stage(
+                args, "S2_FromScratch", ddp_model, tr, va, device, rank, world_size,
+                args.s2_phase_b_steps, args.fog_ratio_s2, args.mist_ratio_s2,
+                args.s2_from_scratch_lr, None, "all", None, 0.0,
+            )
+        else:
+            if pretrained:
+                load_compatible_checkpoint(model, pretrained, rank, device, args.pretrained_layout_policy)
+            l2_ref = clone_state(model, device) if pretrained else None
+            set_trainable(model, "head")
+            ddp_model = wrap_ddp(model, local_rank, world_size, find_unused=True)
+            rank0(rank, f"[Model:S2] params={sum(p.numel() for p in unwrap(ddp_model).parameters()) / 1e6:.3f}M pretrained={pretrained or 'none'}")
 
-        phase_a_best = train_stage(
-            args, "S2_PhaseA", ddp_model, tr, va, device, rank, world_size,
-            args.s2_phase_a_steps, args.fog_ratio_s2, args.mist_ratio_s2,
-            args.s2_lr_head_a, None, "head", l2_ref, args.l2sp_alpha_a,
-        )
-        safe_barrier(world_size, device)
-        raw_model = unwrap(ddp_model)
-        if world_size > 1:
-            del ddp_model
-            torch.cuda.empty_cache()
+            phase_a_best = train_stage(
+                args, "S2_PhaseA", ddp_model, tr, va, device, rank, world_size,
+                args.s2_phase_a_steps, args.fog_ratio_s2, args.mist_ratio_s2,
+                args.s2_lr_head_a, None, "head", l2_ref, args.l2sp_alpha_a,
+            )
             safe_barrier(world_size, device)
-        if phase_a_best:
-            load_compatible_checkpoint(raw_model, phase_a_best, rank, device, args.pretrained_layout_policy)
-        set_trainable(raw_model, "all")
-        ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
-        phase_b_best = train_stage(
-            args, "S2_PhaseB", ddp_model, tr, va, device, rank, world_size,
-            args.s2_phase_b_steps, args.fog_ratio_s2, args.mist_ratio_s2,
-            args.s2_lr_backbone_b, args.s2_lr_head_b, "all", l2_ref, args.l2sp_alpha_b,
-        )
+            raw_model = unwrap(ddp_model)
+            if world_size > 1:
+                del ddp_model
+                torch.cuda.empty_cache()
+                safe_barrier(world_size, device)
+            if phase_a_best:
+                load_compatible_checkpoint(raw_model, phase_a_best, rank, device, args.pretrained_layout_policy)
+            set_trainable(raw_model, "all")
+            ddp_model = wrap_ddp(raw_model, local_rank, world_size, find_unused=False)
+            phase_b_best = train_stage(
+                args, "S2_PhaseB", ddp_model, tr, va, device, rank, world_size,
+                args.s2_phase_b_steps, args.fog_ratio_s2, args.mist_ratio_s2,
+                args.s2_lr_backbone_b, args.s2_lr_head_b, "all", l2_ref, args.l2sp_alpha_b,
+            )
         safe_barrier(world_size, device)
 
         phase_c_best = ""

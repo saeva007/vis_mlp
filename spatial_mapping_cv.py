@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Formal spatially blocked mapping-operator experiment.
+
+The experiment preserves the existing temporal train/validation/test files and
+adds a second, station-level separation:
+
+* train/validation rows contain only stations outside the held-out spatial fold;
+* test rows contain only stations in the held-out fold;
+* fold construction uses station coordinates only (never visibility labels);
+* preprocessing and decision thresholds are fitted on training/validation rows;
+* test labels are loaded only after the fitted model and validation thresholds
+  are frozen.
+
+Subcommands prepare deterministic fold indices, fit an instantaneous
+multinomial logistic baseline, evaluate MLP/GRU checkpoints, and aggregate the
+five out-of-fold test partitions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import os
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.cluster import KMeans
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import average_precision_score
+from sklearn.preprocessing import RobustScaler
+from torch.utils.data import DataLoader
+
+import train_static_rnn_lowvis as rnn
+
+
+DEFAULT_DATA_DIR = "/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2"
+SPLITS = ("train", "val", "test")
+MODELS = ("logistic", "mlp", "gru")
+
+
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=True)
+    os.replace(temporary, path)
+
+
+def _atomic_npy(path: Path, values: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp.npy")
+    np.save(temporary, values)
+    os.replace(temporary, path)
+
+
+def _atomic_npz(path: Path, **arrays: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp.npz")
+    np.savez_compressed(temporary, **arrays)
+    os.replace(temporary, path)
+
+
+def _canonical_station_ids(values: Iterable[object]) -> np.ndarray:
+    series = pd.Series(values, dtype="string").str.strip().str.replace(r"\.0$", "", regex=True)
+    if series.isna().any() or (series == "").any():
+        raise ValueError("Station metadata contains missing or empty station_id values")
+    return series.astype(str).to_numpy()
+
+
+def _required_dataset_files(data_dir: Path) -> List[Path]:
+    return [data_dir / f"{stem}_{split}.{suffix}" for split in SPLITS for stem, suffix in (("X", "npy"), ("y", "npy"), ("meta", "csv"))]
+
+
+def _dataset_shapes(data_dir: Path) -> Dict[str, Dict[str, object]]:
+    missing = [str(path) for path in _required_dataset_files(data_dir) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Spatial CV dataset is incomplete: {missing}")
+    result: Dict[str, Dict[str, object]] = {}
+    for split in SPLITS:
+        x_shape = tuple(int(v) for v in np.load(data_dir / f"X_{split}.npy", mmap_mode="r").shape)
+        y_shape = tuple(int(v) for v in np.load(data_dir / f"y_{split}.npy", mmap_mode="r").shape)
+        if not x_shape or not y_shape or x_shape[0] != y_shape[0]:
+            raise ValueError(f"X/y row mismatch for {split}: X={x_shape}, y={y_shape}")
+        result[split] = {"x_shape": list(x_shape), "y_shape": list(y_shape)}
+    return result
+
+
+def _station_coordinate_table(data_dir: Path, chunksize: int) -> pd.DataFrame:
+    pieces: List[pd.DataFrame] = []
+    for split in SPLITS:
+        meta_path = data_dir / f"meta_{split}.csv"
+        header = pd.read_csv(meta_path, nrows=0).columns.tolist()
+        required = {"station_id", "lat", "lon"}
+        if not required.issubset(header):
+            raise ValueError(f"{meta_path} must contain {sorted(required)}, got {header}")
+        for chunk in pd.read_csv(meta_path, usecols=["station_id", "lat", "lon"], chunksize=chunksize):
+            chunk = chunk.copy()
+            chunk["station_id"] = _canonical_station_ids(chunk["station_id"])
+            chunk["lat"] = pd.to_numeric(chunk["lat"], errors="coerce")
+            chunk["lon"] = pd.to_numeric(chunk["lon"], errors="coerce")
+            if chunk[["lat", "lon"]].isna().any().any():
+                raise ValueError(f"{meta_path} contains missing/non-numeric coordinates")
+            pieces.append(chunk.drop_duplicates("station_id"))
+    merged = pd.concat(pieces, ignore_index=True)
+    grouped = merged.groupby("station_id", sort=True)
+    spread = grouped[["lat", "lon"]].agg(lambda x: float(np.nanmax(x) - np.nanmin(x)))
+    bad = spread[(spread["lat"] > 0.01) | (spread["lon"] > 0.01)]
+    if len(bad):
+        raise ValueError(f"Station coordinates are inconsistent across splits: {bad.head().to_dict('index')}")
+    stations = grouped[["lat", "lon"]].median().reset_index()
+    if not stations["lat"].between(-90.0, 90.0).all() or not stations["lon"].between(-180.0, 360.0).all():
+        raise ValueError("Station coordinates fall outside valid latitude/longitude ranges")
+    stations["lon"] = ((stations["lon"] + 180.0) % 360.0) - 180.0
+    return stations.sort_values("station_id").reset_index(drop=True)
+
+
+def _spherical_coordinates(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    lat_r = np.deg2rad(np.asarray(lat, dtype=np.float64))
+    lon_r = np.deg2rad(np.asarray(lon, dtype=np.float64))
+    return np.column_stack(
+        [np.cos(lat_r) * np.cos(lon_r), np.cos(lat_r) * np.sin(lon_r), np.sin(lat_r)]
+    )
+
+
+def _assign_spatial_folds(stations: pd.DataFrame, n_folds: int, seed: int) -> pd.DataFrame:
+    if len(stations) < n_folds * 2:
+        raise ValueError(f"Too few stations ({len(stations)}) for {n_folds} spatial folds")
+    xyz = _spherical_coordinates(stations["lat"].to_numpy(), stations["lon"].to_numpy())
+    raw = KMeans(n_clusters=n_folds, n_init=50, random_state=seed).fit_predict(xyz)
+    assigned = stations.copy()
+    assigned["raw_cluster"] = raw.astype(int)
+    centroids = (
+        assigned.groupby("raw_cluster", as_index=False)[["lat", "lon"]]
+        .mean()
+        .sort_values(["lon", "lat"], kind="stable")
+        .reset_index(drop=True)
+    )
+    remap = {int(row.raw_cluster): int(idx) for idx, row in centroids.iterrows()}
+    assigned["fold"] = assigned["raw_cluster"].map(remap).astype(int)
+    return assigned.drop(columns=["raw_cluster"]).sort_values(["fold", "station_id"]).reset_index(drop=True)
+
+
+def _haversine_min_distance_km(query: np.ndarray, reference: np.ndarray, chunk: int = 256) -> np.ndarray:
+    if not len(reference):
+        return np.full(len(query), np.inf, dtype=np.float64)
+    qlat = np.deg2rad(query[:, 0])
+    qlon = np.deg2rad(query[:, 1])
+    rlat = np.deg2rad(reference[:, 0])
+    rlon = np.deg2rad(reference[:, 1])
+    out = np.full(len(query), np.inf, dtype=np.float64)
+    for start in range(0, len(query), chunk):
+        stop = min(start + chunk, len(query))
+        dlat = qlat[start:stop, None] - rlat[None, :]
+        dlon = qlon[start:stop, None] - rlon[None, :]
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(qlat[start:stop, None]) * np.cos(rlat[None, :]) * np.sin(dlon / 2.0) ** 2
+        dist = 2.0 * 6371.0088 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+        out[start:stop] = np.min(dist, axis=1)
+    return out
+
+
+def _fold_station_sets(stations: pd.DataFrame, n_folds: int, buffer_km: float) -> Dict[int, Dict[str, set]]:
+    result: Dict[int, Dict[str, set]] = {}
+    coords = stations[["lat", "lon"]].to_numpy(dtype=np.float64)
+    for fold in range(n_folds):
+        held_mask = stations["fold"].to_numpy() == fold
+        held = set(stations.loc[held_mask, "station_id"].astype(str))
+        candidate = ~held_mask
+        if buffer_km > 0:
+            nearest = _haversine_min_distance_km(coords[candidate], coords[held_mask])
+            candidate_indices = np.flatnonzero(candidate)
+            buffer_indices = candidate_indices[nearest < float(buffer_km)]
+        else:
+            buffer_indices = np.empty(0, dtype=np.int64)
+        buffered = set(stations.iloc[buffer_indices]["station_id"].astype(str))
+        train = set(stations.loc[candidate, "station_id"].astype(str)) - buffered
+        if train & held:
+            raise AssertionError("Train and held-out station sets overlap")
+        result[fold] = {"train": train, "heldout": held, "buffered": buffered}
+    return result
+
+
+def _split_indices_by_fold(
+    meta_path: Path,
+    fold_sets: Mapping[int, Mapping[str, set]],
+    split: str,
+    chunksize: int,
+) -> Tuple[Dict[int, np.ndarray], int]:
+    pieces: Dict[int, List[np.ndarray]] = {fold: [] for fold in fold_sets}
+    offset = 0
+    for chunk in pd.read_csv(meta_path, usecols=["station_id"], chunksize=chunksize):
+        station_ids = _canonical_station_ids(chunk["station_id"])
+        for fold, sets in fold_sets.items():
+            allowed = sets["heldout"] if split == "test" else sets["train"]
+            mask = np.fromiter((sid in allowed for sid in station_ids), dtype=bool, count=len(station_ids))
+            local = np.flatnonzero(mask).astype(np.int64) + offset
+            if len(local):
+                pieces[fold].append(local)
+        offset += len(chunk)
+    result = {
+        fold: (np.concatenate(values) if values else np.empty(0, dtype=np.int64))
+        for fold, values in pieces.items()
+    }
+    return result, offset
+
+
+def prepare_folds(args: argparse.Namespace) -> None:
+    data_dir = Path(args.data_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
+        raise FileExistsError(f"Fold directory already contains files: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    shapes = _dataset_shapes(data_dir)
+    stations = _station_coordinate_table(data_dir, args.chunksize)
+    stations = _assign_spatial_folds(stations, args.n_folds, args.seed)
+    fold_sets = _fold_station_sets(stations, args.n_folds, args.buffer_km)
+
+    counts = stations.groupby("fold").size().reindex(range(args.n_folds), fill_value=0)
+    if int(counts.min()) < int(args.min_fold_stations):
+        raise ValueError(f"Spatial KMeans produced an undersized fold: {counts.to_dict()}")
+    stations.to_csv(output_dir / "station_folds.csv", index=False)
+
+    summary_rows: List[Dict[str, object]] = []
+    for split in SPLITS:
+        by_fold, meta_rows = _split_indices_by_fold(
+            data_dir / f"meta_{split}.csv", fold_sets, split, args.chunksize
+        )
+        expected_rows = int(shapes[split]["x_shape"][0])
+        if meta_rows != expected_rows:
+            raise ValueError(f"meta/X row mismatch for {split}: meta={meta_rows}, X={expected_rows}")
+        for fold, indices in by_fold.items():
+            if not len(indices):
+                raise ValueError(f"Fold {fold} has no selected {split} rows")
+            _atomic_npy(output_dir / f"fold_{fold}" / f"s2_{split}_indices.npy", indices)
+            summary_rows.append(
+                {
+                    "fold": int(fold),
+                    "split": split,
+                    "selected_rows": int(len(indices)),
+                    "source_rows": expected_rows,
+                    "selected_fraction": float(len(indices) / expected_rows),
+                    "selected_role": "heldout_test" if split == "test" else "nonheldout_train_or_val",
+                }
+            )
+
+    for fold, sets in fold_sets.items():
+        fold_dir = output_dir / f"fold_{fold}"
+        pd.Series(sorted(sets["train"]), name="station_id").to_csv(fold_dir / "train_stations.csv", index=False)
+        pd.Series(sorted(sets["heldout"]), name="station_id").to_csv(fold_dir / "heldout_stations.csv", index=False)
+        pd.Series(sorted(sets["buffered"]), name="station_id").to_csv(fold_dir / "buffer_excluded_stations.csv", index=False)
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(output_dir / "fold_row_summary.csv", index=False)
+    fold_manifest = {
+        "schema_version": 1,
+        "created_utc": pd.Timestamp.utcnow().isoformat(),
+        "data_dir": str(data_dir),
+        "data_shapes": shapes,
+        "n_folds": int(args.n_folds),
+        "seed": int(args.seed),
+        "algorithm": "spherical_xyz_kmeans_coordinates_only",
+        "kmeans_n_init": 50,
+        "buffer_km": float(args.buffer_km),
+        "station_count": int(len(stations)),
+        "fold_station_counts": {str(int(k)): int(v) for k, v in counts.items()},
+        "fold_buffer_excluded_counts": {
+            str(fold): int(len(sets["buffered"])) for fold, sets in fold_sets.items()
+        },
+        "label_access_during_fold_construction": False,
+        "temporal_contract": {
+            "train": "existing X_train/y_train rows, non-held-out stations only",
+            "validation": "existing X_val/y_val rows, non-held-out stations only",
+            "test": "existing frozen X_test/y_test rows, held-out stations only",
+        },
+        "files": {
+            "station_folds": str(output_dir / "station_folds.csv"),
+            "row_summary": str(output_dir / "fold_row_summary.csv"),
+        },
+    }
+    _atomic_json(output_dir / "fold_manifest.json", fold_manifest)
+    print(json.dumps(fold_manifest, indent=2, ensure_ascii=False), flush=True)
+
+
+def _load_indices(fold_dir: Path, split: str) -> np.ndarray:
+    path = fold_dir / f"s2_{split}_indices.npy"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    values = np.asarray(np.load(path), dtype=np.int64)
+    if values.ndim != 1 or not len(values) or np.any(values[1:] <= values[:-1]):
+        raise ValueError(f"Invalid row index file: {path}")
+    return values
+
+
+def _continuous_and_vegetation(
+    x_source: np.ndarray,
+    source_rows: np.ndarray,
+    layout: rnn.Layout,
+) -> Tuple[np.ndarray, np.ndarray]:
+    raw = np.asarray(x_source[source_rows], dtype=np.float32)
+    last = (layout.window_size - 1) * layout.dyn_vars
+    dynamic = raw[:, last : last + layout.dyn_vars].copy()
+    for idx in rnn.log1p_dyn_indices(layout):
+        dynamic[:, idx] = np.log1p(np.maximum(dynamic[:, idx], 0.0))
+    static = raw[:, layout.split_dyn : layout.split_dyn + 5]
+    continuous = np.concatenate([dynamic, static], axis=1).astype(np.float32, copy=False)
+    vegetation = np.clip(np.rint(raw[:, layout.split_dyn + 5]), 0, 31).astype(np.int64)
+    return continuous, vegetation
+
+
+def _fit_logistic_preprocessor(
+    x_train: np.ndarray,
+    train_indices: np.ndarray,
+    layout: rnn.Layout,
+    seed: int,
+    sample_rows: int,
+) -> Tuple[np.ndarray, RobustScaler]:
+    rng = np.random.default_rng(seed)
+    if len(train_indices) > sample_rows:
+        selected = np.sort(rng.choice(train_indices, size=sample_rows, replace=False))
+    else:
+        selected = train_indices
+    continuous, _ = _continuous_and_vegetation(x_train, selected, layout)
+    medians = np.nanmedian(continuous, axis=0).astype(np.float32)
+    medians = np.nan_to_num(medians, nan=0.0, posinf=0.0, neginf=0.0)
+    filled = np.where(np.isfinite(continuous), continuous, medians[None, :])
+    scaler = RobustScaler(quantile_range=(5.0, 95.0)).fit(filled)
+    return medians, scaler
+
+
+def _transform_logistic_batch(
+    x_source: np.ndarray,
+    source_rows: np.ndarray,
+    layout: rnn.Layout,
+    medians: np.ndarray,
+    scaler: RobustScaler,
+) -> np.ndarray:
+    continuous, vegetation = _continuous_and_vegetation(x_source, source_rows, layout)
+    continuous = np.where(np.isfinite(continuous), continuous, medians[None, :])
+    continuous = scaler.transform(continuous)
+    continuous = np.clip(np.nan_to_num(continuous, nan=0.0, posinf=10.0, neginf=-10.0), -10.0, 10.0)
+    one_hot = np.zeros((len(vegetation), 32), dtype=np.float32)
+    one_hot[np.arange(len(vegetation)), vegetation] = 1.0
+    return np.concatenate([continuous.astype(np.float32, copy=False), one_hot], axis=1)
+
+
+def _predict_logistic(
+    model: SGDClassifier,
+    x_source: np.ndarray,
+    row_indices: np.ndarray,
+    layout: rnn.Layout,
+    medians: np.ndarray,
+    scaler: RobustScaler,
+    batch_rows: int,
+) -> np.ndarray:
+    probs = np.empty((len(row_indices), 3), dtype=np.float32)
+    for start in range(0, len(row_indices), batch_rows):
+        stop = min(start + batch_rows, len(row_indices))
+        features = _transform_logistic_batch(
+            x_source, row_indices[start:stop], layout, medians, scaler
+        )
+        block = model.predict_proba(features)
+        aligned = np.zeros((len(block), 3), dtype=np.float32)
+        aligned[:, np.asarray(model.classes_, dtype=np.int64)] = np.asarray(block, dtype=np.float32)
+        probs[start:stop] = aligned
+    return probs
+
+
+def _threshold_args(args: argparse.Namespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        threshold_grid_low=float(args.threshold_grid_low),
+        threshold_grid_high=float(args.threshold_grid_high),
+        threshold_grid_step=float(args.threshold_grid_step),
+        min_fog_precision=float(args.min_fog_precision),
+        min_mist_precision=float(args.min_mist_precision),
+        min_clear_recall=float(args.min_clear_recall),
+        selection_metric="recall_csi",
+    )
+
+
+def _metrics_with_probabilities(y_true: np.ndarray, pred: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
+    return rnn.add_probability_metrics(rnn.build_metrics(y_true, pred), y_true, probs)
+
+
+def train_logistic(args: argparse.Namespace) -> None:
+    data_dir = Path(args.data_dir).resolve()
+    fold_dir = Path(args.fold_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_indices = _load_indices(fold_dir, "train")
+    val_indices = _load_indices(fold_dir, "val")
+    x_train = np.load(data_dir / "X_train.npy", mmap_mode="r")
+    x_val = np.load(data_dir / "X_val.npy", mmap_mode="r")
+    y_train_source = np.load(data_dir / "y_train.npy", mmap_mode="r")
+    y_val_source = np.load(data_dir / "y_val.npy", mmap_mode="r")
+    layout = rnn.resolve_layout_from_file(str(data_dir / "X_train.npy"), args.window_size, str(data_dir))
+
+    y_train = rnn.visibility_to_labels(np.asarray(y_train_source[train_indices]))[1]
+    y_val = rnn.visibility_to_labels(np.asarray(y_val_source[val_indices]))[1]
+    medians, scaler = _fit_logistic_preprocessor(
+        x_train, train_indices, layout, args.seed, args.scaler_sample_rows
+    )
+
+    counts = np.bincount(y_train, minlength=3).astype(np.float64)
+    if np.any(counts == 0):
+        raise ValueError(f"Training fold lacks a visibility class: {counts.tolist()}")
+    natural = counts / counts.sum()
+    target = np.asarray([args.fog_ratio, args.mist_ratio, 1.0 - args.fog_ratio - args.mist_ratio])
+    if np.any(target <= 0):
+        raise ValueError(f"Invalid target class proportions: {target.tolist()}")
+    class_weight = target / natural
+    class_weight /= float(np.sum(class_weight * natural))
+
+    model = SGDClassifier(
+        loss="log_loss",
+        penalty="l2",
+        alpha=float(args.alpha),
+        fit_intercept=True,
+        random_state=int(args.seed),
+        learning_rate="optimal",
+        average=True,
+    )
+    rng = np.random.default_rng(args.seed)
+    best_model: Optional[SGDClassifier] = None
+    best_ap = -math.inf
+    stale = 0
+    history: List[Dict[str, object]] = []
+    fitted = False
+    for epoch in range(1, args.max_epochs + 1):
+        block_starts = np.arange(0, len(train_indices), args.batch_rows, dtype=np.int64)
+        rng.shuffle(block_starts)
+        for start in block_starts:
+            local = np.arange(start, min(start + args.batch_rows, len(train_indices)), dtype=np.int64)
+            features = _transform_logistic_batch(
+                x_train, train_indices[local], layout, medians, scaler
+            )
+            labels = y_train[local]
+            weights = class_weight[labels].astype(np.float64)
+            if not fitted:
+                model.partial_fit(features, labels, classes=np.asarray([0, 1, 2]), sample_weight=weights)
+                fitted = True
+            else:
+                model.partial_fit(features, labels, sample_weight=weights)
+
+        val_probs = _predict_logistic(
+            model, x_val, val_indices, layout, medians, scaler, args.batch_rows
+        )
+        val_ap = float(average_precision_score((y_val <= 1).astype(np.int64), val_probs[:, :2].sum(axis=1)))
+        improved = val_ap > best_ap + float(args.min_delta)
+        history.append({"epoch": epoch, "val_low_vis_ap": val_ap, "improved": bool(improved)})
+        print(f"[Logistic] epoch={epoch} val_low_vis_ap={val_ap:.6f} improved={improved}", flush=True)
+        if improved:
+            best_ap = val_ap
+            best_model = copy.deepcopy(model)
+            stale = 0
+        else:
+            stale += 1
+        if stale >= args.patience:
+            break
+    if best_model is None:
+        raise RuntimeError("Logistic training did not produce a validation checkpoint")
+
+    # Freeze the model and thresholds before any test target is loaded.
+    val_probs = _predict_logistic(
+        best_model, x_val, val_indices, layout, medians, scaler, args.batch_rows
+    )
+    _, thresholds, val_metrics = rnn.threshold_search(_threshold_args(args), val_probs, y_val)
+    val_pred = rnn.pred_from_thresholds(val_probs, thresholds["fog"], thresholds["mist"])
+    val_metrics = _metrics_with_probabilities(y_val, val_pred, val_probs)
+
+    test_indices = _load_indices(fold_dir, "test")
+    x_test = np.load(data_dir / "X_test.npy", mmap_mode="r")
+    y_test_source = np.load(data_dir / "y_test.npy", mmap_mode="r")
+    y_test = rnn.visibility_to_labels(np.asarray(y_test_source[test_indices]))[1]
+    test_probs = _predict_logistic(
+        best_model, x_test, test_indices, layout, medians, scaler, args.batch_rows
+    )
+    test_pred = rnn.pred_from_thresholds(test_probs, thresholds["fog"], thresholds["mist"])
+    test_metrics = _metrics_with_probabilities(y_test, test_pred, test_probs)
+
+    joblib.dump(
+        {
+            "model": best_model,
+            "medians": medians,
+            "scaler": scaler,
+            "layout": rnn.asdict(layout),
+            "class_weight": class_weight,
+            "target_class_proportions": target,
+        },
+        output_dir / "logistic_model.joblib",
+    )
+    pd.DataFrame(history).to_csv(output_dir / "training_history.csv", index=False)
+    _atomic_npz(
+        output_dir / "val_predictions.npz",
+        row_index=val_indices,
+        y_true=y_val.astype(np.int8),
+        probs=val_probs.astype(np.float32),
+        pred=val_pred.astype(np.int8),
+    )
+    _atomic_npz(
+        output_dir / "test_predictions.npz",
+        row_index=test_indices,
+        y_true=y_test.astype(np.int8),
+        probs=test_probs.astype(np.float32),
+        pred=test_pred.astype(np.int8),
+    )
+    result = {
+        "schema_version": 1,
+        "model": "logistic",
+        "fold": int(args.fold),
+        "seed": int(args.seed),
+        "input_contract": "final dynamic timestep + five static continuous fields + 32-level vegetation one-hot; no FE block",
+        "objective": "multinomial_log_loss_with_training_only_class_prior_weights",
+        "train_rows": int(len(train_indices)),
+        "val_rows": int(len(val_indices)),
+        "test_rows": int(len(test_indices)),
+        "train_class_counts": counts.astype(int).tolist(),
+        "target_class_proportions": target.tolist(),
+        "best_validation_epoch": int(pd.DataFrame(history).iloc[int(np.argmax([row["val_low_vis_ap"] for row in history]))]["epoch"]),
+        "thresholds": thresholds,
+        "threshold_source": "held-in validation stations and validation times only",
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+        "test_access_policy": "loaded after model and thresholds were frozen",
+    }
+    _atomic_json(output_dir / "result.json", result)
+    print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+
+
+def _load_neural_model(checkpoint: Path, device: torch.device) -> Tuple[rnn.StaticRNNLowVisNet, Dict[str, object]]:
+    payload = torch.load(checkpoint, map_location="cpu")
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    state = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    layout_raw = metadata.get("layout")
+    architecture = metadata.get("architecture")
+    if not isinstance(layout_raw, dict) or not isinstance(architecture, dict):
+        raise ValueError("Checkpoint lacks formal spatial-CV layout/architecture metadata")
+    layout = rnn.Layout(
+        window_size=int(layout_raw["window_size"]),
+        dyn_vars=int(layout_raw["dyn_vars"]),
+        fe_dim=int(layout_raw["fe_dim"]),
+        dynamic_feature_order=layout_raw.get("dynamic_feature_order"),
+    )
+    model = rnn.StaticRNNLowVisNet(
+        layout=layout,
+        encoder=str(metadata["encoder"]),
+        hidden_dim=int(architecture["hidden_dim"]),
+        static_hidden_dim=int(architecture["static_hidden_dim"]),
+        fe_hidden_dim=int(architecture["fe_hidden_dim"]),
+        fusion_hidden_dim=int(architecture["fusion_hidden_dim"]),
+        veg_emb_dim=int(architecture["veg_emb_dim"]),
+        rnn_layers=int(architecture["rnn_layers"]),
+        dropout=float(architecture["dropout"]),
+        bidirectional=bool(architecture["bidirectional"]),
+        pooling=str(metadata["pooling"]),
+        use_fe=bool(metadata["use_fe"]),
+    )
+    model.load_state_dict(rnn._normalise_state_dict_keys(state), strict=True)
+    model.to(device).eval()
+    return model, metadata
+
+
+def _neural_split_predictions(
+    args: SimpleNamespace,
+    model: rnn.StaticRNNLowVisNet,
+    scaler: RobustScaler,
+    data_dir: Path,
+    fold_dir: Path,
+    split: str,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    indices = _load_indices(fold_dir, split)
+    x_path = str(data_dir / f"X_{split}.npy")
+    y_source = np.load(data_dir / f"y_{split}.npy", mmap_mode="r")
+    y_raw, y_cls = rnn.visibility_to_labels(np.asarray(y_source[indices]))
+    dataset = rnn.LowVisDataset(
+        x_path,
+        y_raw,
+        y_cls,
+        model.layout,
+        scaler,
+        bool(model.use_fe),
+        not bool(getattr(args, "no_pm", False)),
+        args,
+        row_indices=indices,
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    probs: List[np.ndarray] = []
+    with torch.no_grad():
+        for bx, _, _, _, _, _ in loader:
+            logits, _ = model(bx.to(device, non_blocking=True))
+            probs.append(torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32))
+    return indices, y_cls.astype(np.int64), np.concatenate(probs, axis=0)
+
+
+def evaluate_neural(args: argparse.Namespace) -> None:
+    data_dir = Path(args.data_dir).resolve()
+    fold_dir = Path(args.fold_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = Path(args.checkpoint).resolve()
+    config_path = Path(args.run_config).resolve()
+    scaler_path = Path(args.scaler).resolve()
+    if not checkpoint.is_file() or not config_path.is_file() or not scaler_path.is_file():
+        raise FileNotFoundError(f"Missing checkpoint/config/scaler: {checkpoint}, {config_path}, {scaler_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        run_args = SimpleNamespace(**json.load(handle))
+    device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    model, metadata = _load_neural_model(checkpoint, device)
+    scaler = joblib.load(scaler_path)
+
+    val_indices, y_val, val_probs = _neural_split_predictions(
+        run_args, model, scaler, data_dir, fold_dir, "val", device, args.batch_size, args.num_workers
+    )
+    threshold_mode = str(metadata.get("threshold_mode", "argmax"))
+    thresholds = metadata.get("thresholds", {"mode": "argmax"})
+    if threshold_mode == "argmax" or thresholds.get("mode") == "argmax":
+        val_pred = np.argmax(val_probs, axis=1)
+    else:
+        val_pred = rnn.pred_from_thresholds(val_probs, float(thresholds["fog"]), float(thresholds["mist"]))
+    val_metrics = _metrics_with_probabilities(y_val, val_pred, val_probs)
+
+    # Test data are opened only after checkpoint and validation thresholds are fixed.
+    test_indices, y_test, test_probs = _neural_split_predictions(
+        run_args, model, scaler, data_dir, fold_dir, "test", device, args.batch_size, args.num_workers
+    )
+    if threshold_mode == "argmax" or thresholds.get("mode") == "argmax":
+        test_pred = np.argmax(test_probs, axis=1)
+    else:
+        test_pred = rnn.pred_from_thresholds(test_probs, float(thresholds["fog"]), float(thresholds["mist"]))
+    test_metrics = _metrics_with_probabilities(y_test, test_pred, test_probs)
+
+    _atomic_npz(
+        output_dir / "val_predictions.npz",
+        row_index=val_indices,
+        y_true=y_val.astype(np.int8),
+        probs=val_probs.astype(np.float32),
+        pred=val_pred.astype(np.int8),
+    )
+    _atomic_npz(
+        output_dir / "test_predictions.npz",
+        row_index=test_indices,
+        y_true=y_test.astype(np.int8),
+        probs=test_probs.astype(np.float32),
+        pred=test_pred.astype(np.int8),
+    )
+    result = {
+        "schema_version": 1,
+        "model": str(args.model),
+        "fold": int(args.fold),
+        "seed": int(metadata.get("seed", -1)),
+        "checkpoint": str(checkpoint),
+        "run_config": str(config_path),
+        "scaler": str(scaler_path),
+        "encoder": str(metadata.get("encoder")),
+        "input_contract": (
+            "final dynamic timestep + static branch; no FE block"
+            if str(metadata.get("encoder")) == "mlp"
+            else "12-hour dynamic sequence + static branch; no FE block"
+        ),
+        "objective": str(metadata.get("loss_mode")),
+        "thresholds": thresholds,
+        "threshold_source": "checkpoint selected on non-held-out validation stations and validation times only",
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+        "test_rows": int(len(test_indices)),
+        "test_access_policy": "loaded after checkpoint and thresholds were frozen",
+    }
+    _atomic_json(output_dir / "result.json", result)
+    print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+
+
+def _load_prediction(path: Path) -> Dict[str, np.ndarray]:
+    with np.load(path) as payload:
+        return {name: np.asarray(payload[name]) for name in payload.files}
+
+
+def _station_metrics(
+    model: str,
+    row_index: np.ndarray,
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    probs: np.ndarray,
+    station_ids: np.ndarray,
+) -> List[Dict[str, object]]:
+    frame = pd.DataFrame(
+        {
+            "row_index": row_index,
+            "station_id": station_ids[row_index],
+            "y_true": y_true,
+            "pred": pred,
+            "p_low": probs[:, 0] + probs[:, 1],
+        }
+    )
+    rows: List[Dict[str, object]] = []
+    for station_id, group in frame.groupby("station_id", sort=True):
+        yt = group["y_true"].to_numpy(dtype=np.int64)
+        yp = group["pred"].to_numpy(dtype=np.int64)
+        p_low = group["p_low"].to_numpy(dtype=np.float64)
+        metrics = rnn.build_metrics(yt, yp)
+        metrics["low_vis_ap"] = (
+            float(average_precision_score((yt <= 1).astype(np.int64), p_low))
+            if np.unique(yt <= 1).size == 2
+            else float("nan")
+        )
+        rows.append(
+            {
+                "model": model,
+                "station_id": station_id,
+                "n": int(len(group)),
+                "n_low_vis": int(np.sum(yt <= 1)),
+                **metrics,
+            }
+        )
+    return rows
+
+
+def aggregate_results(args: argparse.Namespace) -> None:
+    folds_dir = Path(args.folds_dir).resolve()
+    results_dir = Path(args.results_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (folds_dir / "fold_manifest.json").open("r", encoding="utf-8") as handle:
+        fold_manifest = json.load(handle)
+    n_folds = int(fold_manifest["n_folds"])
+    data_dir = Path(fold_manifest["data_dir"])
+    n_test = int(fold_manifest["data_shapes"]["test"]["x_shape"][0])
+    station_ids = _canonical_station_ids(pd.read_csv(data_dir / "meta_test.csv", usecols=["station_id"])["station_id"])
+    if len(station_ids) != n_test:
+        raise ValueError("meta_test row count changed after fold construction")
+
+    fold_rows: List[Dict[str, object]] = []
+    pooled_rows: List[Dict[str, object]] = []
+    station_rows: List[Dict[str, object]] = []
+    pooled_by_model: Dict[str, Dict[str, np.ndarray]] = {}
+    models = [value.strip() for value in args.models.split(",") if value.strip()]
+    for model in models:
+        pieces: List[Dict[str, np.ndarray]] = []
+        for fold in range(n_folds):
+            fold_output = results_dir / model / f"fold_{fold}"
+            result_path = fold_output / "result.json"
+            prediction_path = fold_output / "test_predictions.npz"
+            if not result_path.is_file() or not prediction_path.is_file():
+                raise FileNotFoundError(f"Missing completed {model} fold {fold}: {fold_output}")
+            with result_path.open("r", encoding="utf-8") as handle:
+                result = json.load(handle)
+            fold_rows.append({"model": model, "fold": fold, **result["test_metrics"]})
+            pieces.append(_load_prediction(prediction_path))
+        combined = {name: np.concatenate([piece[name] for piece in pieces], axis=0) for name in pieces[0]}
+        order = np.argsort(combined["row_index"], kind="stable")
+        combined = {name: values[order] for name, values in combined.items()}
+        expected = np.arange(n_test, dtype=np.int64)
+        if not np.array_equal(combined["row_index"].astype(np.int64), expected):
+            raise ValueError(f"{model} out-of-fold predictions do not partition the frozen test rows exactly once")
+        metrics = _metrics_with_probabilities(
+            combined["y_true"].astype(np.int64),
+            combined["pred"].astype(np.int64),
+            combined["probs"].astype(np.float64),
+        )
+        pooled_rows.append({"model": model, "n": n_test, **metrics})
+        station_rows.extend(
+            _station_metrics(
+                model,
+                combined["row_index"].astype(np.int64),
+                combined["y_true"].astype(np.int64),
+                combined["pred"].astype(np.int64),
+                combined["probs"].astype(np.float64),
+                station_ids,
+            )
+        )
+        pooled_by_model[model] = combined
+
+    if args.ifs_csv:
+        ifs_path = Path(args.ifs_csv).resolve()
+        if not ifs_path.is_file():
+            raise FileNotFoundError(ifs_path)
+        ifs = pd.read_csv(ifs_path)
+        required = {"station_id", "y_true", "ifs_diagnostic_pred", "ifs_diagnostic_valid"}
+        if not required.issubset(ifs.columns):
+            raise ValueError(f"IFS CSV lacks required columns: {sorted(required - set(ifs.columns))}")
+        valid = ifs["ifs_diagnostic_valid"].astype(str).str.lower().isin(["true", "1", "yes"])
+        ifs = ifs.loc[valid].copy()
+        ifs["station_id"] = _canonical_station_ids(ifs["station_id"])
+        assignments = pd.read_csv(folds_dir / "station_folds.csv", dtype={"station_id": "string"})
+        assignments["station_id"] = _canonical_station_ids(assignments["station_id"])
+        ifs = ifs.merge(assignments[["station_id", "fold"]], on="station_id", how="inner", validate="many_to_one")
+        for fold, group in ifs.groupby("fold", sort=True):
+            metrics = rnn.build_metrics(
+                group["y_true"].to_numpy(dtype=np.int64),
+                group["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
+            )
+            fold_rows.append({"model": "ifs_native", "fold": int(fold), "low_vis_ap": float("nan"), **metrics})
+        metrics = rnn.build_metrics(
+            ifs["y_true"].to_numpy(dtype=np.int64),
+            ifs["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
+        )
+        pooled_rows.append({"model": "ifs_native", "n": int(len(ifs)), "low_vis_ap": float("nan"), **metrics})
+
+    fold_table = pd.DataFrame(fold_rows)
+    pooled_table = pd.DataFrame(pooled_rows)
+    station_table = pd.DataFrame(station_rows)
+    fold_table.to_csv(output_dir / "fold_metrics.csv", index=False)
+    pooled_table.to_csv(output_dir / "pooled_metrics.csv", index=False)
+    station_table.to_csv(output_dir / "station_metrics.csv", index=False)
+
+    delta_rows: List[Dict[str, object]] = []
+    metrics_to_compare = ["low_vis_ap", "low_vis_precision", "low_vis_recall", "low_vis_csi", "false_positive_rate"]
+    pooled_indexed = pooled_table.set_index("model")
+    for left, right in (("mlp", "logistic"), ("gru", "mlp"), ("gru", "logistic")):
+        if left not in pooled_indexed.index or right not in pooled_indexed.index:
+            continue
+        for metric in metrics_to_compare:
+            delta_rows.append(
+                {
+                    "comparison": f"{left}_minus_{right}",
+                    "metric": metric,
+                    "delta": float(pooled_indexed.loc[left, metric] - pooled_indexed.loc[right, metric]),
+                }
+            )
+    pd.DataFrame(delta_rows).to_csv(output_dir / "operator_deltas.csv", index=False)
+    coverage = {
+        "schema_version": 1,
+        "n_folds": n_folds,
+        "frozen_test_rows": n_test,
+        "models": models,
+        "each_learned_model_partitions_test_exactly_once": True,
+        "threshold_policy": "fold-specific validation-frozen thresholds",
+        "primary_metric": "pooled out-of-fold low_vis_ap",
+        "station_metric_policy": "station rows with no positive/negative variation retain NaN AP",
+        "generated_utc": pd.Timestamp.utcnow().isoformat(),
+    }
+    _atomic_json(output_dir / "coverage_manifest.json", coverage)
+    print(pooled_table.to_csv(index=False), flush=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("prepare", help="Create deterministic spatial fold row indices")
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=20260815)
+    p.add_argument("--buffer-km", type=float, default=50.0)
+    p.add_argument("--min-fold-stations", type=int, default=100)
+    p.add_argument("--chunksize", type=int, default=500_000)
+    p.add_argument("--overwrite", action="store_true")
+    p.set_defaults(func=prepare_folds)
+
+    p = sub.add_parser("train-logistic", help="Fit/evaluate one spatial-fold logistic baseline")
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p.add_argument("--fold-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--fold", type=int, required=True)
+    p.add_argument("--window-size", type=int, default=12)
+    p.add_argument("--seed", type=int, default=20260815)
+    p.add_argument("--alpha", type=float, default=1e-4)
+    p.add_argument("--max-epochs", type=int, default=20)
+    p.add_argument("--patience", type=int, default=4)
+    p.add_argument("--min-delta", type=float, default=1e-4)
+    p.add_argument("--batch-rows", type=int, default=65_536)
+    p.add_argument("--scaler-sample-rows", type=int, default=200_000)
+    p.add_argument("--fog-ratio", type=float, default=0.18)
+    p.add_argument("--mist-ratio", type=float, default=0.22)
+    p.add_argument("--min-fog-precision", type=float, default=0.10)
+    p.add_argument("--min-mist-precision", type=float, default=0.10)
+    p.add_argument("--min-clear-recall", type=float, default=0.88)
+    p.add_argument("--threshold-grid-low", type=float, default=0.10)
+    p.add_argument("--threshold-grid-high", type=float, default=0.95)
+    p.add_argument("--threshold-grid-step", type=float, default=0.03)
+    p.set_defaults(func=train_logistic)
+
+    p = sub.add_parser("evaluate-neural", help="Evaluate one validation-frozen MLP/GRU checkpoint")
+    p.add_argument("--model", choices=["mlp", "gru"], required=True)
+    p.add_argument("--fold", type=int, required=True)
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p.add_argument("--fold-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--run-config", required=True)
+    p.add_argument("--scaler", required=True)
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--device", default="")
+    p.set_defaults(func=evaluate_neural)
+
+    p = sub.add_parser("aggregate", help="Aggregate five out-of-fold operator results")
+    p.add_argument("--folds-dir", required=True)
+    p.add_argument("--results-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--models", default=",".join(MODELS))
+    p.add_argument("--ifs-csv", default="")
+    p.set_defaults(func=aggregate_results)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    started = time.time()
+    args.func(args)
+    print(f"[Done] command={args.command} elapsed_seconds={time.time() - started:.1f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
