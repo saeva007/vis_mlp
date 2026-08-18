@@ -19,6 +19,7 @@ DEFAULT_IFS_PER_SAMPLE_CSV="/public/home/putianshu/vis_mlp/static_rnn_eval_resul
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-${DEFAULT_IFS_PER_SAMPLE_CSV}}"
 REQUIRE_IFS_BASELINE="${REQUIRE_IFS_BASELINE:-1}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
+MAPPING_MODELS="${MAPPING_MODELS:-logistic,mlp,gru}"
 
 case "${MAPPING_DECISION_RULE}" in
     argmax|val_search) ;;
@@ -41,6 +42,7 @@ command=(
     --folds-dir "${RESULT_ROOT}/folds"
     --results-dir "${RESULT_ROOT}/results"
     --output-dir "${RESULT_ROOT}/aggregate"
+    --models "${MAPPING_MODELS}"
     --decision-rule "${MAPPING_DECISION_RULE}"
 )
 
@@ -56,6 +58,8 @@ elif [ "${REQUIRE_IFS_BASELINE}" = "1" ]; then
 else
     echo "[preflight] IFS baseline disabled explicitly; learned operators only"
 fi
+
+echo "[preflight] learned_models=${MAPPING_MODELS}"
 
 "${command[@]}"
 

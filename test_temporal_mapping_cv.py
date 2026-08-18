@@ -199,14 +199,14 @@ class TemporalFoldContractTests(unittest.TestCase):
 
 class MappingCVFigureTests(unittest.TestCase):
     @staticmethod
-    def _write_result(root: Path, kind: str) -> None:
+    def _write_result(root: Path, kind: str, models=MODEL_ORDER) -> None:
         aggregate = root / "aggregate"
         folds = root / "folds"
         aggregate.mkdir(parents=True)
         folds.mkdir(parents=True)
         rows = []
         pooled = []
-        for model_index, model in enumerate(MODEL_ORDER):
+        for model_index, model in enumerate(models):
             for fold in range(5):
                 rows.append(
                     {
@@ -243,6 +243,7 @@ class MappingCVFigureTests(unittest.TestCase):
                     "ifs_baseline": {"included": True, "valid_matched_rows": 100},
                     "checkpoint_selection_rules": ["argmax"],
                     "all_checkpoints_selected_with_argmax": True,
+                    "models": list(models),
                 },
                 handle,
             )
@@ -295,6 +296,37 @@ class MappingCVFigureTests(unittest.TestCase):
             self.assertTrue(
                 (output / "mapping_cv_test_viscast_vs_ifs_manifest.json").is_file()
             )
+
+    def test_plot_supports_formal_gru_only_experiment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spatial = root / "spatial"
+            temporal = root / "temporal"
+            output = root / "figures"
+            models = ("ifs_native", "gru")
+            self._write_result(spatial, "spatial", models)
+            self._write_result(temporal, "temporal", models)
+            written = plot_mapping_cv(
+                spatial,
+                temporal,
+                output,
+                "ifs_gru_cv_test",
+                ["png"],
+                120,
+                "IFS-input Static-MLP + GRU (12 h)",
+            )
+            self.assertEqual(written, [output / "ifs_gru_cv_test.png"])
+            source = pd.read_csv(output / "ifs_gru_cv_test_source_data.csv")
+            self.assertEqual(set(source["model"]), {"ifs_native", "gru"})
+            self.assertEqual(
+                set(source["model_label"]),
+                {"IFS diagnostic VIS", "IFS-input Static-MLP + GRU (12 h)"},
+            )
+            with (output / "ifs_gru_cv_test_manifest.json").open(
+                "r", encoding="utf-8"
+            ) as handle:
+                manifest = json.load(handle)
+            self.assertEqual(len(manifest["models"]), 2)
 
 
 if __name__ == "__main__":

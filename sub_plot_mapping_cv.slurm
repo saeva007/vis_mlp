@@ -18,6 +18,8 @@ TEMPORAL_RESULT_ROOT="${TEMPORAL_RESULT_ROOT:?set TEMPORAL_RESULT_ROOT}"
 FIGURE_OUTPUT_DIR="${FIGURE_OUTPUT_DIR:-${TEMPORAL_RESULT_ROOT}/figures}"
 PLOT_ENV="${PLOT_ENV:-/public/home/jarvis226/miniconda3/envs/torch}"
 PLOT_PYTHON="${PLOT_PYTHON:-${PLOT_ENV}/bin/python}"
+FIGURE_STEM="${FIGURE_STEM:-mapping_operator_spatiotemporal_cv}"
+MAPPING_GRU_LABEL="${MAPPING_GRU_LABEL:-Static-MLP + GRU (12 h)}"
 
 # This script imports NumPy/pandas/matplotlib only.  Do not initialize the
 # HIP-linked Torch runtime: that emits irrelevant HyHAL warnings on CPU nodes.
@@ -68,6 +70,8 @@ fi
     --spatial-result-root "${SPATIAL_RESULT_ROOT}" \
     --temporal-result-root "${TEMPORAL_RESULT_ROOT}" \
     --output-dir "${FIGURE_OUTPUT_DIR}" \
+    --stem "${FIGURE_STEM}" \
+    --gru-label "${MAPPING_GRU_LABEL}" \
     --formats svg,pdf,png,tiff \
     --dpi 600
 

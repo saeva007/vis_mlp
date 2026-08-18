@@ -131,8 +131,24 @@ def _load_cv_result(
         "low_vis_recall",
     }.issubset(pooled.columns):
         raise ValueError(f"{pooled_path} lacks pooled low-visibility metrics")
+    unknown_fold_models = sorted(set(folds["model"].astype(str)) - set(MODEL_ORDER))
+    unknown_pooled_models = sorted(set(pooled["model"].astype(str)) - set(MODEL_ORDER))
+    if unknown_fold_models or unknown_pooled_models:
+        raise ValueError(
+            f"{expected_kind} contains unsupported models; "
+            f"fold={unknown_fold_models} pooled={unknown_pooled_models}"
+        )
     folds = folds.loc[folds["model"].isin(MODEL_ORDER)].copy()
     pooled = pooled.loc[pooled["model"].isin(MODEL_ORDER)].copy()
+    observed_models = set(folds["model"].astype(str))
+    if observed_models != set(pooled["model"].astype(str)):
+        raise ValueError(f"{expected_kind} fold and pooled tables contain different models")
+    coverage_models = set(str(model) for model in coverage.get("models", []))
+    if coverage_models and coverage_models != observed_models:
+        raise ValueError(
+            f"{expected_kind} coverage models disagree with metric tables; "
+            f"coverage={sorted(coverage_models)} observed={sorted(observed_models)}"
+        )
     learned_fold_rules = set(
         folds.loc[folds["model"] != "ifs_native", "decision_rule"].astype(str)
     )
@@ -164,7 +180,8 @@ def _load_cv_result(
             raise ValueError(f"{expected_kind} {metric} values must be finite and within [0, 1]")
     n_folds = int(manifest["n_folds"])
     expected_folds = list(range(n_folds))
-    for model in MODEL_ORDER:
+    available_models = tuple(model for model in MODEL_ORDER if model in observed_models)
+    for model in available_models:
         model_rows = folds.loc[folds["model"] == model]
         observed = sorted(model_rows["fold"].tolist())
         if observed != expected_folds:
@@ -257,16 +274,18 @@ def _source_table(
     spatial: pd.DataFrame,
     temporal_labels: Sequence[str],
     spatial_labels: Sequence[str],
+    model_order: Sequence[str] = MODEL_ORDER,
+    model_labels: Mapping[str, str] = MODEL_LABELS,
 ) -> pd.DataFrame:
     pieces: List[pd.DataFrame] = []
     for kind, table, labels in (
         ("temporal", temporal, temporal_labels),
         ("spatial", spatial, spatial_labels),
     ):
-        part = table.loc[table["model"].isin(MODEL_ORDER)].copy()
+        part = table.loc[table["model"].isin(model_order)].copy()
         part.insert(0, "cv_type", kind)
         part["fold_label"] = part["fold"].map({index: label.replace("\n", " ") for index, label in enumerate(labels)})
-        part["model_label"] = part["model"].map(MODEL_LABELS)
+        part["model_label"] = part["model"].map(model_labels)
         pieces.append(
             part[
                 [
@@ -290,13 +309,15 @@ def _summary_table(
     temporal_pooled: pd.DataFrame,
     spatial_folds: pd.DataFrame,
     spatial_pooled: pd.DataFrame,
+    model_order: Sequence[str] = MODEL_ORDER,
+    model_labels: Mapping[str, str] = MODEL_LABELS,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     for kind, folds, pooled in (
         ("temporal", temporal_folds, temporal_pooled),
         ("spatial", spatial_folds, spatial_pooled),
     ):
-        for model in MODEL_ORDER:
+        for model in model_order:
             fold_rows = folds.loc[folds["model"] == model]
             pooled_row = pooled.loc[pooled["model"] == model].iloc[0]
             for metric in ("low_vis_csi", "low_vis_recall"):
@@ -305,7 +326,7 @@ def _summary_table(
                     {
                         "cv_type": kind,
                         "model": model,
-                        "model_label": MODEL_LABELS[model],
+                        "model_label": model_labels[model],
                         "sample_scope": str(pooled_row["sample_scope"]),
                         "decision_rule": str(pooled_row["decision_rule"]),
                         "metric": metric,
@@ -399,6 +420,7 @@ def plot_mapping_cv(
     stem: str,
     formats: Iterable[str],
     dpi: int,
+    gru_label: str = MODEL_LABELS["gru"],
 ) -> List[Path]:
     setup_style()
     spatial_folds, spatial_pooled, spatial_manifest, spatial_coverage = _load_cv_result(
@@ -409,6 +431,31 @@ def plot_mapping_cv(
     )
     if int(spatial_manifest["n_folds"]) != int(temporal_manifest["n_folds"]):
         raise ValueError("Spatial and temporal experiments must use the same fold count")
+    spatial_models = tuple(
+        model for model in MODEL_ORDER if model in set(spatial_folds["model"].astype(str))
+    )
+    temporal_models = tuple(
+        model for model in MODEL_ORDER if model in set(temporal_folds["model"].astype(str))
+    )
+    if spatial_models != temporal_models:
+        raise ValueError(
+            "Spatial and temporal metric tables must contain the same models; "
+            f"spatial={spatial_models} temporal={temporal_models}"
+        )
+    full_mode = spatial_models == MODEL_ORDER
+    direct_mode = set(spatial_models) == set(DIRECT_MODEL_ORDER)
+    if not full_mode and not direct_mode:
+        raise ValueError(
+            "Plotting supports either the complete operator set or the formal "
+            f"GRU-plus-IFS set; found={spatial_models}"
+        )
+    full_labels = dict(MODEL_LABELS)
+    full_labels["gru"] = str(gru_label)
+    direct_labels = dict(DIRECT_MODEL_LABELS)
+    if str(gru_label) != MODEL_LABELS["gru"]:
+        direct_labels["gru"] = str(gru_label)
+    primary_order = MODEL_ORDER if full_mode else DIRECT_MODEL_ORDER
+    primary_labels = full_labels if full_mode else direct_labels
     temporal_labels = _temporal_tick_labels(temporal_manifest)
     spatial_labels = _spatial_tick_labels(spatial_manifest)
 
@@ -420,10 +467,22 @@ def plot_mapping_cv(
     )
     if not clean_formats:
         raise ValueError("At least one output format is required")
-    source = _source_table(temporal_folds, spatial_folds, temporal_labels, spatial_labels)
+    source = _source_table(
+        temporal_folds,
+        spatial_folds,
+        temporal_labels,
+        spatial_labels,
+        primary_order,
+        primary_labels,
+    )
     source.to_csv(output_dir / f"{stem}_source_data.csv", index=False)
     summary = _summary_table(
-        temporal_folds, temporal_pooled, spatial_folds, spatial_pooled
+        temporal_folds,
+        temporal_pooled,
+        spatial_folds,
+        spatial_pooled,
+        primary_order,
+        primary_labels,
     )
     summary.to_csv(output_dir / f"{stem}_summary.csv", index=False)
     written = _render_grid(
@@ -435,28 +494,8 @@ def plot_mapping_cv(
         stem,
         clean_formats,
         dpi,
-        MODEL_ORDER,
-        MODEL_LABELS,
-    )
-
-    direct_stem = f"{stem}_viscast_vs_ifs"
-    direct_source = source.loc[source["model"].isin(DIRECT_MODEL_ORDER)].copy()
-    direct_source["model_label"] = direct_source["model"].map(DIRECT_MODEL_LABELS)
-    direct_source.to_csv(output_dir / f"{direct_stem}_source_data.csv", index=False)
-    direct_summary = summary.loc[summary["model"].isin(DIRECT_MODEL_ORDER)].copy()
-    direct_summary["model_label"] = direct_summary["model"].map(DIRECT_MODEL_LABELS)
-    direct_summary.to_csv(output_dir / f"{direct_stem}_summary.csv", index=False)
-    direct_written = _render_grid(
-        temporal_folds,
-        spatial_folds,
-        temporal_labels,
-        spatial_labels,
-        output_dir,
-        direct_stem,
-        clean_formats,
-        dpi,
-        DIRECT_MODEL_ORDER,
-        DIRECT_MODEL_LABELS,
+        primary_order,
+        primary_labels,
     )
 
     figure_manifest = {
@@ -464,6 +503,9 @@ def plot_mapping_cv(
         "core_conclusion": (
             "Tests whether learned mapping operators improve on native IFS diagnostic visibility, "
             "and whether nonlinear and temporal gains persist across held-out calendar and station blocks."
+            if full_mode
+            else "Directly compares the IFS-driven mainline mapping model with native IFS "
+            "diagnostic visibility across held-out calendar and station blocks."
         ),
         "archetype": "quantitative grid",
         "backend": "Python/matplotlib",
@@ -474,10 +516,10 @@ def plot_mapping_cv(
             "c": "spatial-fold low-visibility CSI",
             "d": "spatial-fold low-visibility recall",
         },
-        "models": [MODEL_LABELS[model] for model in MODEL_ORDER],
+        "models": [primary_labels[model] for model in primary_order],
         "sample_scope": (
             "common frozen-test rows with valid native IFS diagnostic visibility; "
-            "identical within each CV type for all four plotted operators"
+            f"identical within each CV type for all {len(primary_order)} plotted operators"
         ),
         "metric_definition": "binary low visibility is visibility < 1000 m",
         "variability_definition": "five held-out fold values; no row-level error bars",
@@ -510,6 +552,28 @@ def plot_mapping_cv(
     with (output_dir / f"{stem}_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(figure_manifest, handle, indent=2, ensure_ascii=False)
 
+    if not full_mode:
+        return written
+
+    direct_stem = f"{stem}_viscast_vs_ifs"
+    direct_source = source.loc[source["model"].isin(DIRECT_MODEL_ORDER)].copy()
+    direct_source["model_label"] = direct_source["model"].map(direct_labels)
+    direct_source.to_csv(output_dir / f"{direct_stem}_source_data.csv", index=False)
+    direct_summary = summary.loc[summary["model"].isin(DIRECT_MODEL_ORDER)].copy()
+    direct_summary["model_label"] = direct_summary["model"].map(direct_labels)
+    direct_summary.to_csv(output_dir / f"{direct_stem}_summary.csv", index=False)
+    direct_written = _render_grid(
+        temporal_folds,
+        spatial_folds,
+        temporal_labels,
+        spatial_labels,
+        output_dir,
+        direct_stem,
+        clean_formats,
+        dpi,
+        DIRECT_MODEL_ORDER,
+        direct_labels,
+    )
     direct_manifest = {
         "schema_version": 1,
         "core_conclusion": (
@@ -520,7 +584,7 @@ def plot_mapping_cv(
         "backend": "Python/matplotlib",
         "final_size_mm": {"width": 183.0, "height": 132.0},
         "panels": figure_manifest["panels"],
-        "models": [DIRECT_MODEL_LABELS[model] for model in DIRECT_MODEL_ORDER],
+        "models": [direct_labels[model] for model in DIRECT_MODEL_ORDER],
         "sample_scope": (
             "common frozen-test rows with valid native IFS diagnostic visibility; "
             "identical for VisCast and IFS within each CV type"
@@ -553,6 +617,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stem", default="mapping_operator_spatiotemporal_cv")
     parser.add_argument("--formats", default="svg,pdf,png,tiff")
     parser.add_argument("--dpi", type=int, default=600)
+    parser.add_argument("--gru-label", default=MODEL_LABELS["gru"])
     return parser.parse_args()
 
 
@@ -565,6 +630,7 @@ def main() -> None:
         args.stem,
         args.formats.split(","),
         int(args.dpi),
+        str(args.gru_label),
     )
     for path in written:
         print(f"[figure] {path}", flush=True)

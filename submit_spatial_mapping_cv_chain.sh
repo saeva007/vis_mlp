@@ -9,6 +9,7 @@ RESULT_ROOT="${RESULT_ROOT:-${RESULT_BASE}/${BUNDLE_ID}}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
 MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
+MAPPING_MODELS="${MAPPING_MODELS:-logistic,mlp,gru}"
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv}"
 STATE_FILE="${STATE_FILE:-${RESULT_ROOT}/submission_state.sh}"
 SUBMIT_LOG="${SUBMIT_LOG:-${RESULT_ROOT}/submission.log}"
@@ -22,6 +23,7 @@ write_state() {
         printf 'MAPPING_DECISION_RULE=%q\n' "${MAPPING_DECISION_RULE}"
         printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
         printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
+        printf 'MAPPING_MODELS=%q\n' "${MAPPING_MODELS}"
         printf 'IFS_PER_SAMPLE_CSV=%q\n' "${IFS_PER_SAMPLE_CSV}"
         printf 'PREP_JOB_ID=%q\n' "${PREP_JOB_ID:-}"
         printf 'LOGISTIC_JOB_ID=%q\n' "${LOGISTIC_JOB_ID:-}"
@@ -42,6 +44,7 @@ if [ "${1:-}" != "--worker" ]; then
         MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE}" \
         MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
         MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+        MAPPING_MODELS="${MAPPING_MODELS}" \
         IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
         STATE_FILE="${STATE_FILE}" SUBMIT_LOG="${SUBMIT_LOG}" \
         nohup bash "${REPO_ROOT}/submit_spatial_mapping_cv_chain.sh" --worker \
@@ -57,7 +60,7 @@ echo "[worker] started=$(date --iso-8601=seconds)"
 echo "[worker] repo=${REPO_ROOT}"
 echo "[worker] data=${DATA_DIR}"
 echo "[worker] result_root=${RESULT_ROOT}"
-echo "[worker] decision_rule=${MAPPING_DECISION_RULE} logistic_concurrency=${MAPPING_LOGISTIC_CONCURRENCY} neural_concurrency=${MAPPING_NEURAL_CONCURRENCY}"
+echo "[worker] decision_rule=${MAPPING_DECISION_RULE} models=${MAPPING_MODELS} logistic_concurrency=${MAPPING_LOGISTIC_CONCURRENCY} neural_concurrency=${MAPPING_NEURAL_CONCURRENCY}"
 echo "[worker] ifs_per_sample=${IFS_PER_SAMPLE_CSV}"
 
 case "${MAPPING_DECISION_RULE}" in
@@ -67,6 +70,25 @@ esac
 case "${MAPPING_LOGISTIC_CONCURRENCY}:${MAPPING_NEURAL_CONCURRENCY}" in
     *[!0-9:]*|0:*|*:0) echo "[preflight] concurrency values must be positive integers" >&2; exit 2 ;;
 esac
+
+IFS=',' read -r -a REQUESTED_MODELS <<< "${MAPPING_MODELS}"
+declare -A MODEL_SEEN=()
+for model in "${REQUESTED_MODELS[@]}"; do
+    case "${model}" in
+        logistic|mlp|gru) ;;
+        *) echo "[preflight] invalid model in MAPPING_MODELS=${MAPPING_MODELS}: ${model}" >&2; exit 2 ;;
+    esac
+    if [ -n "${MODEL_SEEN[${model}]:-}" ]; then
+        echo "[preflight] duplicate model in MAPPING_MODELS=${MAPPING_MODELS}: ${model}" >&2
+        exit 2
+    fi
+    MODEL_SEEN[${model}]=1
+done
+if [ "${#REQUESTED_MODELS[@]}" -eq 0 ]; then
+    echo "[preflight] MAPPING_MODELS must not be empty" >&2
+    exit 2
+fi
+export MAPPING_MODELS
 
 for script in \
     activate_lowvis_diffusion_runtime.sh \
@@ -95,36 +117,66 @@ SUBMISSION_STATUS=preflight_ok
 write_state
 
 PREP_JOB_ID=$(sbatch --parsable \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT}" \
+    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV}" \
     "${REPO_ROOT}/sub_prepare_spatial_mapping_cv.slurm")
 PREP_JOB_ID="${PREP_JOB_ID%%;*}"
 SUBMISSION_STATUS=prep_submitted
 write_state
 echo "[submit] prep_job=${PREP_JOB_ID}"
 
-LOGISTIC_JOB_ID=$(sbatch --parsable \
-    --array="0-4%${MAPPING_LOGISTIC_CONCURRENCY}" \
-    --dependency="afterok:${PREP_JOB_ID}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
-    "${REPO_ROOT}/sub_spatial_mapping_logistic_cv.slurm")
-LOGISTIC_JOB_ID="${LOGISTIC_JOB_ID%%;*}"
-SUBMISSION_STATUS=logistic_submitted
+LOGISTIC_JOB_ID=""
+if [ -n "${MODEL_SEEN[logistic]:-}" ]; then
+    LOGISTIC_JOB_ID=$(sbatch --parsable \
+        --array="0-4%${MAPPING_LOGISTIC_CONCURRENCY}" \
+        --dependency="afterok:${PREP_JOB_ID}" \
+        --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
+        "${REPO_ROOT}/sub_spatial_mapping_logistic_cv.slurm")
+    LOGISTIC_JOB_ID="${LOGISTIC_JOB_ID%%;*}"
+    echo "[submit] logistic_array_job=${LOGISTIC_JOB_ID}"
+else
+    echo "[submit] logistic_array_job=SKIPPED"
+fi
+SUBMISSION_STATUS=logistic_stage_complete
 write_state
-echo "[submit] logistic_array_job=${LOGISTIC_JOB_ID}"
 
-NEURAL_JOB_ID=$(sbatch --parsable \
-    --array="0-9%${MAPPING_NEURAL_CONCURRENCY}" \
-    --dependency="afterok:${PREP_JOB_ID}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},BUNDLE_ID=${BUNDLE_ID},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
-    "${REPO_ROOT}/sub_spatial_mapping_neural_cv.slurm")
-NEURAL_JOB_ID="${NEURAL_JOB_ID%%;*}"
-SUBMISSION_STATUS=neural_submitted
+NEURAL_JOB_ID=""
+NEURAL_EXPORT="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},BUNDLE_ID=${BUNDLE_ID},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}"
+if [ -n "${MODEL_SEEN[mlp]:-}" ] && [ -n "${MODEL_SEEN[gru]:-}" ]; then
+    NEURAL_ARRAY="0-9%${MAPPING_NEURAL_CONCURRENCY}"
+elif [ -n "${MODEL_SEEN[mlp]:-}" ]; then
+    NEURAL_ARRAY="0-4%${MAPPING_NEURAL_CONCURRENCY}"
+    NEURAL_EXPORT="${NEURAL_EXPORT},MAPPING_NEURAL_MODEL=mlp"
+elif [ -n "${MODEL_SEEN[gru]:-}" ]; then
+    NEURAL_ARRAY="0-4%${MAPPING_NEURAL_CONCURRENCY}"
+    NEURAL_EXPORT="${NEURAL_EXPORT},MAPPING_NEURAL_MODEL=gru"
+else
+    NEURAL_ARRAY=""
+fi
+if [ -n "${NEURAL_ARRAY}" ]; then
+    NEURAL_JOB_ID=$(sbatch --parsable \
+        --array="${NEURAL_ARRAY}" \
+        --dependency="afterok:${PREP_JOB_ID}" \
+        --export="${NEURAL_EXPORT}" \
+        "${REPO_ROOT}/sub_spatial_mapping_neural_cv.slurm")
+    NEURAL_JOB_ID="${NEURAL_JOB_ID%%;*}"
+    echo "[submit] neural_array_job=${NEURAL_JOB_ID}"
+else
+    echo "[submit] neural_array_job=SKIPPED"
+fi
+SUBMISSION_STATUS=training_submitted
 write_state
-echo "[submit] neural_array_job=${NEURAL_JOB_ID}"
 
+AGGREGATE_DEPENDENCY="afterok"
+for job_id in "${LOGISTIC_JOB_ID}" "${NEURAL_JOB_ID}"; do
+    if [ -n "${job_id}" ]; then AGGREGATE_DEPENDENCY="${AGGREGATE_DEPENDENCY}:${job_id}"; fi
+done
+if [ "${AGGREGATE_DEPENDENCY}" = "afterok" ]; then
+    echo "[preflight] no model jobs were submitted" >&2
+    exit 2
+fi
 AGGREGATE_EXPORT="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV},REQUIRE_IFS_BASELINE=1"
 AGGREGATE_JOB_ID=$(sbatch --parsable \
-    --dependency="afterok:${LOGISTIC_JOB_ID}:${NEURAL_JOB_ID}" \
+    --dependency="${AGGREGATE_DEPENDENCY}" \
     --export="${AGGREGATE_EXPORT}" \
     "${REPO_ROOT}/sub_aggregate_spatial_mapping_cv.slurm")
 AGGREGATE_JOB_ID="${AGGREGATE_JOB_ID%%;*}"

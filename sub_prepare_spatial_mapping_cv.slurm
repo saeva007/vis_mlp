@@ -18,6 +18,7 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 FOLD_SEED="${FOLD_SEED:-20260815}"
 BUFFER_KM="${BUFFER_KM:-50}"
+IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-}"
 
 export LOWVIS_DIFFUSION_USE_DCU=0
 export LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME=1
@@ -50,5 +51,14 @@ python -u "${REPO_ROOT}/spatial_mapping_cv.py" prepare \
     --seed "${FOLD_SEED}" \
     --buffer-km "${BUFFER_KM}" \
     --min-fold-stations 100
+
+if [ -n "${IFS_PER_SAMPLE_CSV}" ]; then
+    test -s "${IFS_PER_SAMPLE_CSV}"
+    python -u "${REPO_ROOT}/spatial_mapping_cv.py" validate-ifs-baseline \
+        --data-dir "${DATA_DIR}" \
+        --ifs-csv "${IFS_PER_SAMPLE_CSV}" \
+        --output-json "${RESULT_ROOT}/folds/ifs_baseline_compatibility.json"
+    echo "[preflight] IFS baseline exact test-row alignment=OK"
+fi
 
 echo "[done] spatial folds prepared at $(date)"

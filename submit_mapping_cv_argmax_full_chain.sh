@@ -1,10 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# One-shot formal rerun in which Logistic, MLP, and GRU all use argmax for
-# validation checkpoint selection and frozen-test classification. Spatial and
-# temporal training are submitted together; the combined figure waits for both
-# aggregate jobs.
+# One-shot formal argmax rerun for the models listed in MAPPING_MODELS
+# (default: Logistic, MLP, and GRU). Spatial and temporal training are submitted
+# together; the combined figure waits for both aggregate jobs.
 
 REPO_ROOT="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2}"
@@ -15,6 +14,7 @@ SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT:-/public/home/putianshu/vis_mlp/spati
 TEMPORAL_RESULT_ROOT="${TEMPORAL_RESULT_ROOT:-/public/home/putianshu/vis_mlp/temporal_mapping_cv/${TEMPORAL_BUNDLE_ID}}"
 MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
 MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
+MAPPING_MODELS="${MAPPING_MODELS:-logistic,mlp,gru}"
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv}"
 MASTER_STATE_FILE="${MASTER_STATE_FILE:-${TEMPORAL_RESULT_ROOT}/argmax_full_chain_state.sh}"
 MASTER_LOG="${MASTER_LOG:-${TEMPORAL_RESULT_ROOT}/argmax_full_chain_submission.log}"
@@ -32,6 +32,7 @@ write_master_state() {
         printf 'MAPPING_DECISION_RULE=%q\n' "argmax"
         printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
         printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
+        printf 'MAPPING_MODELS=%q\n' "${MAPPING_MODELS}"
         printf 'IFS_PER_SAMPLE_CSV=%q\n' "${IFS_PER_SAMPLE_CSV}"
         printf 'SPATIAL_BUNDLE_ID=%q\n' "${SPATIAL_BUNDLE_ID}"
         printf 'TEMPORAL_BUNDLE_ID=%q\n' "${TEMPORAL_BUNDLE_ID}"
@@ -67,6 +68,7 @@ if [ "${1:-}" != "--worker" ]; then
         TEMPORAL_RESULT_ROOT="${TEMPORAL_RESULT_ROOT}" \
         MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
         MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+        MAPPING_MODELS="${MAPPING_MODELS}" \
         IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
         MASTER_STATE_FILE="${MASTER_STATE_FILE}" MASTER_LOG="${MASTER_LOG}" \
         nohup bash "${REPO_ROOT}/submit_mapping_cv_argmax_full_chain.sh" --worker \
@@ -99,6 +101,7 @@ REPO_ROOT="${REPO_ROOT}" DATA_DIR="${DATA_DIR}" \
     STATE_FILE="${SPATIAL_STATE_FILE}" MAPPING_DECISION_RULE=argmax \
     MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
     MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+    MAPPING_MODELS="${MAPPING_MODELS}" \
     IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
     bash "${REPO_ROOT}/submit_spatial_mapping_cv_chain.sh" --worker
 
@@ -112,6 +115,7 @@ REPO_ROOT="${REPO_ROOT}" DATA_DIR="${DATA_DIR}" \
     STATE_FILE="${TEMPORAL_STATE_FILE}" MAPPING_DECISION_RULE=argmax \
     MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
     MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+    MAPPING_MODELS="${MAPPING_MODELS}" \
     IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
     SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT}" \
     SPATIAL_AGGREGATE_JOB_ID="${SPATIAL_AGGREGATE_JOB_ID}" \

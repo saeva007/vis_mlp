@@ -18,6 +18,7 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 TEMPORAL_EMBARGO_HOURS="${TEMPORAL_EMBARGO_HOURS:-24}"
 INPUT_WINDOW_HOURS="${INPUT_WINDOW_HOURS:-12}"
+IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-}"
 
 export LOWVIS_DIFFUSION_USE_DCU=0
 export LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME=1
@@ -50,5 +51,14 @@ python -u "${REPO_ROOT}/temporal_mapping_cv.py" prepare \
     --n-folds 5 \
     --embargo-hours "${TEMPORAL_EMBARGO_HOURS}" \
     --window-hours "${INPUT_WINDOW_HOURS}"
+
+if [ -n "${IFS_PER_SAMPLE_CSV}" ]; then
+    test -s "${IFS_PER_SAMPLE_CSV}"
+    python -u "${REPO_ROOT}/spatial_mapping_cv.py" validate-ifs-baseline \
+        --data-dir "${DATA_DIR}" \
+        --ifs-csv "${IFS_PER_SAMPLE_CSV}" \
+        --output-json "${RESULT_ROOT}/folds/ifs_baseline_compatibility.json"
+    echo "[preflight] IFS baseline exact test-row alignment=OK"
+fi
 
 echo "[done] temporal folds prepared at $(date)"

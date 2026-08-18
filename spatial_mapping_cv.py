@@ -1045,6 +1045,51 @@ def _load_aligned_ifs_baseline(
     return result, provenance
 
 
+def validate_ifs_baseline(args: argparse.Namespace) -> None:
+    """Fail closed unless an IFS diagnostic file exactly matches frozen test rows."""
+    data_dir = Path(args.data_dir).resolve()
+    ifs_path = Path(args.ifs_csv).resolve()
+    output_json = Path(args.output_json).resolve()
+    meta_test = pd.read_csv(
+        data_dir / "meta_test.csv", usecols=["station_id", "time"]
+    )
+    y_test_source = np.load(data_dir / "y_test.npy", mmap_mode="r")
+    if len(meta_test) != len(y_test_source):
+        raise ValueError(
+            "Frozen test metadata and labels have different row counts; "
+            f"meta={len(meta_test)} labels={len(y_test_source)}"
+        )
+    _, reference_y = rnn.visibility_to_labels(np.asarray(y_test_source))
+    _, provenance = _load_aligned_ifs_baseline(
+        ifs_path,
+        meta_test,
+        np.asarray(reference_y, dtype=np.int64),
+    )
+    payload = {
+        "schema_version": 1,
+        "status": "compatible",
+        "data_dir": str(data_dir),
+        "test_rows": int(len(meta_test)),
+        "ifs_baseline": provenance,
+        "verified_utc": pd.Timestamp.utcnow().isoformat(),
+    }
+    _atomic_json(output_json, payload)
+    print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
+
+
+def _parse_models(raw_models: str) -> List[str]:
+    models = [value.strip() for value in raw_models.split(",") if value.strip()]
+    if not models:
+        raise ValueError("At least one learned mapping model is required")
+    unknown = sorted(set(models) - set(MODELS))
+    if unknown:
+        raise ValueError(f"Unsupported mapping models: {unknown}; allowed={list(MODELS)}")
+    duplicates = sorted({model for model in models if models.count(model) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate mapping models are not allowed: {duplicates}")
+    return models
+
+
 def _station_metrics(
     model: str,
     row_index: np.ndarray,
@@ -1110,7 +1155,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
     decision_effect_rows: List[Dict[str, object]] = []
     checkpoint_rule_rows: List[Dict[str, object]] = []
     pooled_by_model: Dict[str, Dict[str, np.ndarray]] = {}
-    models = [value.strip() for value in args.models.split(",") if value.strip()]
+    models = _parse_models(args.models)
     for model in models:
         pieces: List[Dict[str, np.ndarray]] = []
         for fold in range(n_folds):
@@ -1492,6 +1537,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Primary OOF analysis rule; argmax recomputes labels from saved probabilities.",
     )
     p.set_defaults(func=aggregate_results)
+
+    p = sub.add_parser(
+        "validate-ifs-baseline",
+        help="Verify exact frozen-test alignment of the native IFS diagnostic baseline",
+    )
+    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p.add_argument("--ifs-csv", required=True)
+    p.add_argument("--output-json", required=True)
+    p.set_defaults(func=validate_ifs_baseline)
     return parser
 
 

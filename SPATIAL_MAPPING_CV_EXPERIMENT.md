@@ -67,3 +67,42 @@ bash submit_spatial_mapping_cv_chain.sh
 The launcher detaches its worker, stores every JobID in
 `$RESULT_ROOT/submission_state.sh`, and submits preparation, Logistic and neural
 arrays, then aggregation through `afterok` dependencies.
+
+## IFS-input mainline-only transfer run
+
+`submit_ifs_gru_mapping_cv_chain.sh` repeats both the balanced spatial blocked
+five-fold experiment and the embargoed calendar-blocked temporal five-fold
+experiment with the IFS `source_full` S2 dataset. It submits only the mainline
+`gru` operator: no Logistic or instantaneous MLP jobs are created. The two
+five-task neural arrays are independent and can run concurrently.
+
+Each fold is trained from scratch. Reusing the existing full-data IFS S1/S2
+checkpoint would expose held-out stations to the spatial-CV model through
+pretraining, so it is not valid for this transferability endpoint. Fold-local
+scalers, argmax checkpoint selection, and the frozen-test rule are unchanged.
+
+Before either neural array can start, each preparation job verifies that the
+native IFS diagnostic CSV covers every frozen IFS test row exactly once by UTC
+time, station ID, and within-key occurrence, and that the observed class labels
+match. Aggregation is restricted to `gru,ifs_native`; the plotter emits a
+two-operator CSI/recall figure.
+
+Default data and output roots:
+
+```text
+DATA_DIR=/public/home/putianshu/vis_mlp/ifs_baseline/ml_dataset_overlap_ifs_12h_pm10_pm25_source_full
+SPATIAL_RESULT_ROOT=/public/home/putianshu/vis_mlp/spatial_mapping_cv_ifs/<run>_spatial
+TEMPORAL_RESULT_ROOT=/public/home/putianshu/vis_mlp/temporal_mapping_cv_ifs/<run>_temporal
+```
+
+Submit from the synchronized repository root:
+
+```bash
+bash submit_ifs_gru_mapping_cv_chain.sh
+```
+
+This `source_full` run measures source-specific operational transfer. It must
+not be described as a controlled Tianji-versus-IFS data-quality attribution,
+because the available predictor inventories differ. For that stricter claim,
+override `DATA_DIR` with the agreed common-variable IFS dataset and pair it with
+the corresponding Tianji common-variable run.

@@ -23,13 +23,28 @@ MODEL_SEED="${MODEL_SEED:-20260815}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 CV_PREFIX="${CV_PREFIX:-spcv}"
 TASK_ID="${SLURM_ARRAY_TASK_ID}"
+MAPPING_NEURAL_MODEL="${MAPPING_NEURAL_MODEL:-}"
 
-if [ "${TASK_ID}" -lt 5 ]; then
+if [ -n "${MAPPING_NEURAL_MODEL}" ]; then
+    case "${MAPPING_NEURAL_MODEL}" in
+        mlp|gru) ;;
+        *) echo "[preflight] invalid MAPPING_NEURAL_MODEL=${MAPPING_NEURAL_MODEL}" >&2; exit 2 ;;
+    esac
+    if [ "${TASK_ID}" -lt 0 ] || [ "${TASK_ID}" -gt 4 ]; then
+        echo "[preflight] single-model array task must be in [0,4], got ${TASK_ID}" >&2
+        exit 2
+    fi
+    MODEL="${MAPPING_NEURAL_MODEL}"
+    FOLD="${TASK_ID}"
+elif [ "${TASK_ID}" -lt 5 ]; then
     MODEL=mlp
     FOLD="${TASK_ID}"
-else
+elif [ "${TASK_ID}" -lt 10 ]; then
     MODEL=gru
     FOLD="$((TASK_ID - 5))"
+else
+    echo "[preflight] combined neural array task must be in [0,9], got ${TASK_ID}" >&2
+    exit 2
 fi
 
 RUN_ID="${CV_PREFIX}_${BUNDLE_ID}_${MODEL}_fold${FOLD}"

@@ -185,6 +185,49 @@ class InstantaneousMLPTests(unittest.TestCase):
 
 
 class ArgmaxAggregationTests(unittest.TestCase):
+    def test_model_parser_accepts_gru_only_and_rejects_duplicates(self):
+        self.assertEqual(spcv._parse_models("gru"), ["gru"])
+        with self.assertRaises(ValueError):
+            spcv._parse_models("gru,gru")
+
+    def test_ifs_baseline_preflight_verifies_frozen_test_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "data"
+            data_dir.mkdir()
+            times = pd.date_range("2025-01-01", periods=3, freq="h")
+            pd.DataFrame(
+                {"station_id": ["S0", "S1", "S2"], "time": times}
+            ).to_csv(data_dir / "meta_test.csv", index=False)
+            np.save(
+                data_dir / "y_test.npy",
+                np.asarray([300.0, 700.0, 2000.0], dtype=np.float32),
+            )
+            ifs_path = root / "ifs.csv"
+            pd.DataFrame(
+                {
+                    "station_id": ["S2", "S0", "S1"],
+                    "time": times[[2, 0, 1]],
+                    "y_true": [2, 0, 1],
+                    "ifs_diagnostic_vis_m": [1400.0, 350.0, 800.0],
+                    "ifs_diagnostic_pred": [2, 0, 1],
+                    "ifs_diagnostic_valid": [True, True, True],
+                }
+            ).to_csv(ifs_path, index=False)
+            output_json = root / "compatibility.json"
+            spcv.validate_ifs_baseline(
+                Namespace(
+                    data_dir=str(data_dir),
+                    ifs_csv=str(ifs_path),
+                    output_json=str(output_json),
+                )
+            )
+            with output_json.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["status"], "compatible")
+            self.assertEqual(payload["ifs_baseline"]["aligned_rows"], 3)
+            self.assertTrue(payload["ifs_baseline"]["label_match_verified"])
+
     def test_aggregate_recomputes_argmax_and_reports_saved_rule_effects(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
