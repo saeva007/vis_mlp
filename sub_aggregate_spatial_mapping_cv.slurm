@@ -28,18 +28,23 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-32}"
 mkdir -p "${REPO_ROOT}/logs" "${RESULT_ROOT}/aggregate"
 cd "${REPO_ROOT}"
 
-IFS_ARGS=()
+command=(
+    python -u "${REPO_ROOT}/spatial_mapping_cv.py" aggregate
+    --folds-dir "${RESULT_ROOT}/folds"
+    --results-dir "${RESULT_ROOT}/results"
+    --output-dir "${RESULT_ROOT}/aggregate"
+)
+
+# Bash 4.2 on the cluster treats an empty-array expansion as an unbound
+# variable under `set -u`. Keep the command array non-empty and append the
+# optional IFS arguments only when the baseline file actually exists.
 if [ -n "${IFS_PER_SAMPLE_CSV}" ] && [ -s "${IFS_PER_SAMPLE_CSV}" ]; then
-    IFS_ARGS=(--ifs-csv "${IFS_PER_SAMPLE_CSV}")
+    command+=(--ifs-csv "${IFS_PER_SAMPLE_CSV}")
     echo "[preflight] IFS per-sample baseline=${IFS_PER_SAMPLE_CSV}"
 else
     echo "[preflight] IFS per-sample baseline unavailable; learned operators only"
 fi
 
-python -u "${REPO_ROOT}/spatial_mapping_cv.py" aggregate \
-    --folds-dir "${RESULT_ROOT}/folds" \
-    --results-dir "${RESULT_ROOT}/results" \
-    --output-dir "${RESULT_ROOT}/aggregate" \
-    "${IFS_ARGS[@]}"
+"${command[@]}"
 
 echo "[done] aggregate=${RESULT_ROOT}/aggregate at $(date)"
