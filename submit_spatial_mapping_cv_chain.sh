@@ -50,6 +50,7 @@ for script in \
     activate_lowvis_diffusion_runtime.sh \
     spatial_mapping_cv.py \
     train_static_rnn_lowvis.py \
+    prepare_static_rnn_local_cache.sh \
     sub_prepare_spatial_mapping_cv.slurm \
     sub_spatial_mapping_logistic_cv.slurm \
     sub_spatial_mapping_neural_cv.slurm \

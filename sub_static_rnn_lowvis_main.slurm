@@ -95,6 +95,10 @@ export LOWVIS_RNN_PATIENCE="${LOWVIS_RNN_PATIENCE:-10}"
 export LOWVIS_RNN_PRETRAINED_CKPT="${LOWVIS_RNN_PRETRAINED_CKPT:-}"
 export LOWVIS_RNN_THRESHOLD_MODE="${LOWVIS_RNN_THRESHOLD_MODE:-val_search}"
 export LOWVIS_RNN_EXTRA_ARGS="${LOWVIS_RNN_EXTRA_ARGS:-}"
+export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-static_rnn_main_shared_data}"
+export LOWVIS_RNN_LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+export LOWVIS_RNN_CLEAN_LOCAL_CACHE="${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-1}"
+export LOWVIS_RNN_REQUIRE_LOCAL_CACHE="${LOWVIS_RNN_REQUIRE_LOCAL_CACHE:-0}"
 
 echo "Head Node       : ${head_node}"
 echo "MASTER_ADDR     : ${MASTER_ADDR}"
@@ -107,8 +111,59 @@ echo "S2_A_STEPS      : ${LOWVIS_RNN_S2_A_STEPS}"
 echo "S2_B_STEPS      : ${LOWVIS_RNN_S2_B_STEPS}"
 echo "S1_DATA_DIR     : ${LOWVIS_RNN_S1_DATA_DIR}"
 echo "S2_DATA_DIR     : ${LOWVIS_RNN_S2_DATA_DIR}"
+echo "LOCAL_CACHE_ID  : ${LOWVIS_RNN_LOCAL_CACHE_ID}"
+echo "LOCAL_CACHE_DIR : ${LOWVIS_RNN_LOCAL_CACHE_DIR}"
+echo "CLEAN_LOCAL_CACHE: ${LOWVIS_RNN_CLEAN_LOCAL_CACHE}"
+echo "REQUIRE_LOCAL_CACHE: ${LOWVIS_RNN_REQUIRE_LOCAL_CACHE}"
 echo "THRESHOLD_MODE  : ${LOWVIS_RNN_THRESHOLD_MODE}"
 echo "EXTRA_ARGS      : ${LOWVIS_RNN_EXTRA_ARGS}"
+
+CACHE_SOURCE_FILES=()
+case "${LOWVIS_RNN_MODE}" in
+    s1)
+        CACHE_SOURCE_FILES=(
+            "${LOWVIS_RNN_S1_DATA_DIR}/X_train.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/y_train.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/X_val.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/y_val.npy"
+        )
+        ;;
+    s2)
+        CACHE_SOURCE_FILES=(
+            "${LOWVIS_RNN_S2_DATA_DIR}/X_train.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/y_train.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/X_val.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/y_val.npy"
+        )
+        ;;
+    both)
+        CACHE_SOURCE_FILES=(
+            "${LOWVIS_RNN_S1_DATA_DIR}/X_train.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/y_train.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/X_val.npy"
+            "${LOWVIS_RNN_S1_DATA_DIR}/y_val.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/X_train.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/y_train.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/X_val.npy"
+            "${LOWVIS_RNN_S2_DATA_DIR}/y_val.npy"
+        )
+        ;;
+    *)
+        echo "Unsupported LOWVIS_RNN_MODE=${LOWVIS_RNN_MODE}" >&2
+        exit 2
+        ;;
+esac
+
+echo "Preparing user-owned node-local Static-RNN cache on all allocated nodes..."
+srun --nodes=${SLURM_NNODES} \
+     --ntasks=${SLURM_NNODES} \
+     --ntasks-per-node=1 \
+     /bin/bash "${SCRIPT_DIR}/prepare_static_rnn_local_cache.sh" \
+     --cache-dir "${LOWVIS_RNN_LOCAL_CACHE_DIR}" \
+     --cache-id "${LOWVIS_RNN_LOCAL_CACHE_ID}" \
+     --clean "${LOWVIS_RNN_CLEAN_LOCAL_CACHE}" \
+     --require-local "${LOWVIS_RNN_REQUIRE_LOCAL_CACHE}" \
+     "${CACHE_SOURCE_FILES[@]}"
 
 echo "Cleaning /dev/shm on all allocated nodes..."
 srun --nodes=${SLURM_NNODES} \
@@ -140,6 +195,7 @@ srun --nodes=${SLURM_NNODES} \
              --mode \"${LOWVIS_RNN_MODE}\" \
              --encoder gru \
              --run-id \"${LOWVIS_RNN_RUN_ID}\" \
+             --local-cache-id \"${LOWVIS_RNN_LOCAL_CACHE_ID}\" \
              --s1-data-dir \"${LOWVIS_RNN_S1_DATA_DIR}\" \
              --s2-data-dir \"${LOWVIS_RNN_S2_DATA_DIR}\" \
              --pooling mean \

@@ -63,6 +63,7 @@ for required in \
     temporal_mapping_cv.py \
     spatial_mapping_cv.py \
     train_static_rnn_lowvis.py \
+    prepare_static_rnn_local_cache.sh \
     plot_mapping_cv_folds.py \
     sub_prepare_temporal_mapping_cv.slurm \
     sub_spatial_mapping_logistic_cv.slurm \

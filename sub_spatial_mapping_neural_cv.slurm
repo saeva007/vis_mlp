@@ -37,6 +37,11 @@ CKPT_DIR="${OUTPUT_DIR}/checkpoints"
 FOLD_DIR="${RESULT_ROOT}/folds/fold_${FOLD}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 
+export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-mapping_cv_s2_shared_data}"
+export LOWVIS_RNN_LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
+export LOWVIS_RNN_CLEAN_LOCAL_CACHE="${LOWVIS_RNN_CLEAN_LOCAL_CACHE:-1}"
+export LOWVIS_RNN_REQUIRE_LOCAL_CACHE="${LOWVIS_RNN_REQUIRE_LOCAL_CACHE:-1}"
+
 export LOWVIS_DIFFUSION_USE_DCU=1
 source "${REPO_ROOT}/activate_lowvis_diffusion_runtime.sh"
 
@@ -62,6 +67,18 @@ test -s "${FOLD_DIR}/s2_val_indices.npy"
 test -s "${FOLD_DIR}/s2_test_indices.npy"
 echo "[preflight] model=${MODEL} fold=${FOLD} run_id=${RUN_ID} indices=OK"
 
+echo "[preflight] preparing node-local Static-RNN cache"
+srun --nodes=1 --ntasks=1 --cpus-per-task=1 \
+    /bin/bash "${REPO_ROOT}/prepare_static_rnn_local_cache.sh" \
+    --cache-dir "${LOWVIS_RNN_LOCAL_CACHE_DIR}" \
+    --cache-id "${LOWVIS_RNN_LOCAL_CACHE_ID}" \
+    --clean "${LOWVIS_RNN_CLEAN_LOCAL_CACHE}" \
+    --require-local "${LOWVIS_RNN_REQUIRE_LOCAL_CACHE}" \
+    "${DATA_DIR}/X_train.npy" \
+    "${DATA_DIR}/y_train.npy" \
+    "${DATA_DIR}/X_val.npy" \
+    "${DATA_DIR}/y_val.npy"
+
 srun --nodes=1 --ntasks=1 --cpus-per-task="${CPUS_PER_TASK}" bash -c "
     set -euo pipefail
     cd \"${REPO_ROOT}\"
@@ -73,7 +90,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task="${CPUS_PER_TASK}" bash -c "
         --s2-from-scratch \
         --encoder \"${MODEL}\" \
         --run-id \"${RUN_ID}\" \
-        --local-cache-id \"${BUNDLE_ID}_${MODEL}_fold${FOLD}\" \
+        --local-cache-id \"${LOWVIS_RNN_LOCAL_CACHE_ID}\" \
         --s2-data-dir \"${DATA_DIR}\" \
         --row-index-dir \"${FOLD_DIR}\" \
         --ckpt-dir \"${CKPT_DIR}\" \
