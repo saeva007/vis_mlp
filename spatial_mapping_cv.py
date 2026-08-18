@@ -883,6 +883,168 @@ def _load_prediction(path: Path) -> Dict[str, np.ndarray]:
         return {name: np.asarray(payload[name]) for name in payload.files}
 
 
+def _test_fold_assignments(folds_dir: Path, n_folds: int, n_test: int) -> np.ndarray:
+    assignments = np.full(n_test, -1, dtype=np.int16)
+    for fold in range(n_folds):
+        indices = _load_indices(folds_dir / f"fold_{fold}", "test")
+        if int(indices.max()) >= n_test:
+            raise ValueError(f"Fold {fold} contains a frozen-test row outside [0, {n_test})")
+        if np.any(assignments[indices] != -1):
+            raise ValueError(f"Frozen-test rows occur in more than one fold; conflict at fold {fold}")
+        assignments[indices] = fold
+    missing = np.flatnonzero(assignments < 0)
+    if len(missing):
+        raise ValueError(
+            f"Fold test indices do not partition the frozen test set; missing_rows={len(missing)}"
+        )
+    return assignments
+
+
+def _sample_alignment_keys(frame: pd.DataFrame, source: str) -> pd.DataFrame:
+    required = {"station_id", "time"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"{source} lacks alignment columns: {sorted(required - set(frame.columns))}")
+    times = pd.to_datetime(frame["time"], errors="coerce", utc=True)
+    if times.isna().any():
+        raise ValueError(f"{source} contains {int(times.isna().sum())} unparseable time values")
+    keys = pd.DataFrame(
+        {
+            "station_key": _canonical_station_ids(frame["station_id"]),
+            "time_ns_utc": times.astype("int64").to_numpy(dtype=np.int64),
+        }
+    )
+    keys["duplicate_index"] = keys.groupby(
+        ["time_ns_utc", "station_key"], sort=False
+    ).cumcount()
+    return keys
+
+
+def _load_aligned_ifs_baseline(
+    path: Path,
+    meta_test: pd.DataFrame,
+    reference_y: np.ndarray,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+    y_column = "y_true" if "y_true" in header else "y_cls" if "y_cls" in header else ""
+    required = {"station_id", "time", "ifs_diagnostic_vis_m"}
+    if not y_column:
+        required.add("y_true")
+    if not required.issubset(header):
+        raise ValueError(f"IFS per-sample CSV lacks columns: {sorted(required - set(header))}")
+    valid_column = "ifs_diagnostic_valid" if "ifs_diagnostic_valid" in header else ""
+    usecols = ["station_id", "time", y_column, "ifs_diagnostic_vis_m"]
+    prediction_column = "ifs_diagnostic_pred" if "ifs_diagnostic_pred" in header else ""
+    if prediction_column:
+        usecols.append(prediction_column)
+    if valid_column:
+        usecols.append(valid_column)
+    baseline = pd.read_csv(path, usecols=usecols)
+    if baseline.empty:
+        raise ValueError(f"IFS per-sample CSV is empty: {path}")
+
+    main_keys = _sample_alignment_keys(meta_test, "frozen meta_test.csv")
+    main_keys["row_index"] = np.arange(len(main_keys), dtype=np.int64)
+    baseline_keys = _sample_alignment_keys(baseline, str(path))
+    baseline_keys["baseline_y"] = pd.to_numeric(baseline[y_column], errors="coerce")
+    baseline_keys["ifs_diagnostic_vis_m"] = pd.to_numeric(
+        baseline["ifs_diagnostic_vis_m"], errors="coerce"
+    )
+    if prediction_column:
+        baseline_keys["source_ifs_diagnostic_pred"] = pd.to_numeric(
+            baseline[prediction_column], errors="coerce"
+        )
+    if valid_column:
+        baseline_keys["ifs_diagnostic_valid"] = (
+            baseline[valid_column].astype(str).str.lower().isin(["true", "1", "yes"])
+        )
+    else:
+        baseline_keys["ifs_diagnostic_valid"] = True
+
+    aligned = baseline_keys.merge(
+        main_keys,
+        on=["time_ns_utc", "station_key", "duplicate_index"],
+        how="left",
+        validate="one_to_one",
+        indicator=True,
+    )
+    unmatched = aligned["row_index"].isna()
+    if unmatched.any():
+        raise ValueError(
+            "IFS per-sample CSV is not a subset of the frozen test metadata; "
+            f"unmatched_rows={int(unmatched.sum())}"
+        )
+    aligned["row_index"] = aligned["row_index"].astype(np.int64)
+    row_indices = aligned["row_index"].to_numpy(dtype=np.int64)
+    expected_rows = np.arange(len(meta_test), dtype=np.int64)
+    if len(aligned) != len(meta_test) or not np.array_equal(
+        np.sort(row_indices), expected_rows
+    ):
+        raise ValueError(
+            "IFS per-sample CSV must cover every frozen-test row exactly once before "
+            f"the diagnostic-valid mask is applied; source_rows={len(aligned)} "
+            f"frozen_test_rows={len(meta_test)}"
+        )
+    baseline_y = aligned["baseline_y"].to_numpy(dtype=np.float64)
+    if not np.isfinite(baseline_y).all():
+        raise ValueError("IFS per-sample CSV contains non-finite observed class labels")
+    baseline_y_int = baseline_y.astype(np.int64)
+    if not np.array_equal(baseline_y, baseline_y_int.astype(np.float64)):
+        raise ValueError("IFS per-sample observed labels are not integer classes")
+    expected = np.asarray(reference_y, dtype=np.int64)[row_indices]
+    mismatch = baseline_y_int != expected
+    if mismatch.any():
+        raise ValueError(
+            "IFS per-sample labels do not match frozen-test labels after exact alignment; "
+            f"mismatched_rows={int(mismatch.sum())}"
+        )
+
+    valid = aligned["ifs_diagnostic_valid"].to_numpy(dtype=bool)
+    diagnostic_vis = aligned["ifs_diagnostic_vis_m"].to_numpy(dtype=np.float64)
+    valid &= np.isfinite(diagnostic_vis)
+    if not np.any(valid):
+        raise ValueError("IFS diagnostic baseline has no finite matched visibility values")
+    recomputed_pred = np.full(len(aligned), 2, dtype=np.int64)
+    recomputed_pred[diagnostic_vis < 1000.0] = 1
+    recomputed_pred[diagnostic_vis < 500.0] = 0
+    if prediction_column:
+        source_pred = aligned["source_ifs_diagnostic_pred"].to_numpy(dtype=np.float64)
+        source_valid = valid & np.isfinite(source_pred)
+        if not np.all(source_valid[valid]):
+            raise ValueError("IFS diagnostic class is missing for a visibility-valid row")
+        if not np.array_equal(source_pred[valid], recomputed_pred[valid].astype(np.float64)):
+            raise ValueError(
+                "IFS diagnostic classes disagree with classes recomputed from native "
+                "visibility at 500 m and 1000 m"
+            )
+
+    result = pd.DataFrame(
+        {
+            "row_index": row_indices[valid],
+            "station_id": aligned.loc[valid, "station_key"].astype(str).to_numpy(),
+            "y_true": baseline_y_int[valid],
+            "ifs_diagnostic_vis_m": diagnostic_vis[valid],
+            "ifs_diagnostic_pred": recomputed_pred[valid],
+        }
+    ).sort_values("row_index", kind="stable")
+    if result["row_index"].duplicated().any():
+        raise ValueError("IFS baseline maps more than once to a frozen-test row")
+    provenance = {
+        "path": str(path),
+        "source_rows": int(len(baseline)),
+        "aligned_rows": int(len(aligned)),
+        "valid_matched_rows": int(len(result)),
+        "frozen_test_rows": int(len(meta_test)),
+        "valid_coverage": float(len(result) / max(len(meta_test), 1)),
+        "alignment_keys": ["time_utc", "station_id", "duplicate_index_within_key"],
+        "source_covers_frozen_test_exactly_once": True,
+        "label_match_verified": True,
+        "decision_rule": "recomputed from native IFS VIS: fog <500 m, mist <1000 m",
+    }
+    return result, provenance
+
+
 def _station_metrics(
     model: str,
     row_index: np.ndarray,
@@ -935,9 +1097,12 @@ def aggregate_results(args: argparse.Namespace) -> None:
     n_folds = int(fold_manifest["n_folds"])
     data_dir = Path(fold_manifest["data_dir"])
     n_test = int(fold_manifest["data_shapes"]["test"]["x_shape"][0])
-    station_ids = _canonical_station_ids(pd.read_csv(data_dir / "meta_test.csv", usecols=["station_id"])["station_id"])
+    meta_columns = ["station_id", "time"] if args.ifs_csv else ["station_id"]
+    meta_test = pd.read_csv(data_dir / "meta_test.csv", usecols=meta_columns)
+    station_ids = _canonical_station_ids(meta_test["station_id"])
     if len(station_ids) != n_test:
         raise ValueError("meta_test row count changed after fold construction")
+    test_row_folds = _test_fold_assignments(folds_dir, n_folds, n_test)
 
     fold_rows: List[Dict[str, object]] = []
     pooled_rows: List[Dict[str, object]] = []
@@ -966,6 +1131,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
             fold_rows.append(
                 {
                     "cv_kind": cv_kind,
+                    "sample_scope": "full_frozen_test_for_learned_operators",
                     "model": model,
                     "fold": fold,
                     "decision_rule": args.decision_rule,
@@ -1014,6 +1180,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
         pooled_rows.append(
             {
                 "cv_kind": cv_kind,
+                "sample_scope": "full_frozen_test_for_learned_operators",
                 "model": model,
                 "n": n_test,
                 "decision_rule": args.decision_rule,
@@ -1049,57 +1216,122 @@ def aggregate_results(args: argparse.Namespace) -> None:
             station_ids,
         )
         station_rows.extend(
-            {"cv_kind": cv_kind, "decision_rule": args.decision_rule, **row}
+            {
+                "cv_kind": cv_kind,
+                "sample_scope": "full_frozen_test_for_learned_operators",
+                "decision_rule": args.decision_rule,
+                **row,
+            }
             for row in station_metrics
         )
         pooled_by_model[model] = combined
 
+    matched_fold_rows: List[Dict[str, object]] = []
+    matched_pooled_rows: List[Dict[str, object]] = []
+    ifs_provenance: Optional[Dict[str, object]] = None
     if args.ifs_csv:
         ifs_path = Path(args.ifs_csv).resolve()
-        if not ifs_path.is_file():
-            raise FileNotFoundError(ifs_path)
-        ifs = pd.read_csv(ifs_path)
-        required = {"station_id", "y_true", "ifs_diagnostic_pred", "ifs_diagnostic_valid"}
-        if not required.issubset(ifs.columns):
-            raise ValueError(f"IFS CSV lacks required columns: {sorted(required - set(ifs.columns))}")
-        valid = ifs["ifs_diagnostic_valid"].astype(str).str.lower().isin(["true", "1", "yes"])
-        ifs = ifs.loc[valid].copy()
-        ifs["station_id"] = _canonical_station_ids(ifs["station_id"])
-        assignments = pd.read_csv(folds_dir / "station_folds.csv", dtype={"station_id": "string"})
-        assignments["station_id"] = _canonical_station_ids(assignments["station_id"])
-        ifs = ifs.merge(assignments[["station_id", "fold"]], on="station_id", how="inner", validate="many_to_one")
-        for fold, group in ifs.groupby("fold", sort=True):
-            metrics = rnn.build_metrics(
-                group["y_true"].to_numpy(dtype=np.int64),
-                group["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
-            )
-            fold_rows.append(
+        reference_model = models[0]
+        reference_y = pooled_by_model[reference_model]["y_true"].astype(np.int64)
+        ifs, ifs_provenance = _load_aligned_ifs_baseline(
+            ifs_path,
+            meta_test,
+            reference_y,
+        )
+        ifs_row_index = ifs["row_index"].to_numpy(dtype=np.int64)
+        ifs_y = ifs["y_true"].to_numpy(dtype=np.int64)
+        ifs_pred = ifs["ifs_diagnostic_pred"].to_numpy(dtype=np.int64)
+        ifs_fold = test_row_folds[ifs_row_index].astype(np.int64)
+        per_fold_rows = {str(fold): int(np.sum(ifs_fold == fold)) for fold in range(n_folds)}
+        empty_folds = [fold for fold, count in per_fold_rows.items() if count == 0]
+        if empty_folds:
+            raise ValueError(f"IFS diagnostic baseline has no matched rows in folds: {empty_folds}")
+        ifs_provenance["matched_rows_by_fold"] = per_fold_rows
+        ifs_provenance["common_sample_policy"] = (
+            "All plotted operators are restricted to the same IFS-diagnostic-valid frozen-test rows"
+        )
+
+        for fold in range(n_folds):
+            fold_mask = ifs_fold == fold
+            fold_indices = ifs_row_index[fold_mask]
+            fold_y = ifs_y[fold_mask]
+            for model in models:
+                combined = pooled_by_model[model]
+                model_y = combined["y_true"][fold_indices].astype(np.int64)
+                if not np.array_equal(model_y, fold_y):
+                    raise ValueError(f"{model} labels differ from IFS-matched labels in fold {fold}")
+                model_metrics = _metrics_with_probabilities(
+                    model_y,
+                    combined["pred"][fold_indices].astype(np.int64),
+                    combined["probs"][fold_indices].astype(np.float64),
+                )
+                matched_fold_rows.append(
+                    {
+                        "cv_kind": cv_kind,
+                        "sample_scope": "ifs_diagnostic_matched_test",
+                        "model": model,
+                        "fold": fold,
+                        "n": int(len(fold_indices)),
+                        "decision_rule": args.decision_rule,
+                        **model_metrics,
+                    }
+                )
+            ifs_metrics = rnn.build_metrics(fold_y, ifs_pred[fold_mask])
+            matched_fold_rows.append(
                 {
                     "cv_kind": cv_kind,
+                    "sample_scope": "ifs_diagnostic_matched_test",
                     "model": "ifs_native",
-                    "fold": int(fold),
-                    "decision_rule": "native_physical_visibility",
+                    "fold": fold,
+                    "n": int(len(fold_indices)),
+                    "decision_rule": "native_visibility_500_1000m",
                     "low_vis_ap": float("nan"),
-                    **metrics,
+                    **ifs_metrics,
                 }
             )
-        metrics = rnn.build_metrics(
-            ifs["y_true"].to_numpy(dtype=np.int64),
-            ifs["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
-        )
-        pooled_rows.append(
+
+        for model in models:
+            combined = pooled_by_model[model]
+            model_y = combined["y_true"][ifs_row_index].astype(np.int64)
+            if not np.array_equal(model_y, ifs_y):
+                raise ValueError(f"{model} pooled labels differ from IFS-matched labels")
+            model_metrics = _metrics_with_probabilities(
+                model_y,
+                combined["pred"][ifs_row_index].astype(np.int64),
+                combined["probs"][ifs_row_index].astype(np.float64),
+            )
+            matched_pooled_rows.append(
+                {
+                    "cv_kind": cv_kind,
+                    "sample_scope": "ifs_diagnostic_matched_test",
+                    "model": model,
+                    "n": int(len(ifs_row_index)),
+                    "decision_rule": args.decision_rule,
+                    **model_metrics,
+                }
+            )
+        matched_pooled_rows.append(
             {
                 "cv_kind": cv_kind,
+                "sample_scope": "ifs_diagnostic_matched_test",
                 "model": "ifs_native",
-                "n": int(len(ifs)),
-                "decision_rule": "native_physical_visibility",
+                "n": int(len(ifs_row_index)),
+                "decision_rule": "native_visibility_500_1000m",
                 "low_vis_ap": float("nan"),
-                **metrics,
+                **rnn.build_metrics(ifs_y, ifs_pred),
             }
         )
 
-    fold_table = pd.DataFrame(fold_rows)
-    pooled_table = pd.DataFrame(pooled_rows)
+    full_fold_table = pd.DataFrame(fold_rows)
+    full_pooled_table = pd.DataFrame(pooled_rows)
+    if ifs_provenance is not None:
+        full_fold_table.to_csv(output_dir / "fold_metrics_full_learned_test.csv", index=False)
+        full_pooled_table.to_csv(output_dir / "pooled_metrics_full_learned_test.csv", index=False)
+        fold_table = pd.DataFrame(matched_fold_rows)
+        pooled_table = pd.DataFrame(matched_pooled_rows)
+    else:
+        fold_table = full_fold_table
+        pooled_table = full_pooled_table
     station_table = pd.DataFrame(station_rows)
     fold_table.to_csv(output_dir / "fold_metrics.csv", index=False)
     pooled_table.to_csv(output_dir / "pooled_metrics.csv", index=False)
@@ -1113,13 +1345,24 @@ def aggregate_results(args: argparse.Namespace) -> None:
     delta_rows: List[Dict[str, object]] = []
     metrics_to_compare = ["low_vis_ap", "low_vis_precision", "low_vis_recall", "low_vis_csi", "false_positive_rate"]
     pooled_indexed = pooled_table.set_index("model")
-    for left, right in (("mlp", "logistic"), ("gru", "mlp"), ("gru", "logistic")):
+    comparison_scope = (
+        str(pooled_table["sample_scope"].iloc[0])
+        if "sample_scope" in pooled_table.columns and len(pooled_table)
+        else "unknown"
+    )
+    comparisons = [("mlp", "logistic"), ("gru", "mlp"), ("gru", "logistic")]
+    if "ifs_native" in pooled_indexed.index:
+        comparisons.extend((model, "ifs_native") for model in models)
+    for left, right in comparisons:
         if left not in pooled_indexed.index or right not in pooled_indexed.index:
             continue
         for metric in metrics_to_compare:
+            if metric == "low_vis_ap" and right == "ifs_native":
+                continue
             delta_rows.append(
                 {
                     "cv_kind": cv_kind,
+                    "sample_scope": comparison_scope,
                     "comparison": f"{left}_minus_{right}",
                     "decision_rule": args.decision_rule,
                     "metric": metric,
@@ -1131,12 +1374,12 @@ def aggregate_results(args: argparse.Namespace) -> None:
         checkpoint_rule_table["checkpoint_selection_rule"].astype(str).unique().tolist()
     )
     coverage = {
-        "schema_version": 2,
+        "schema_version": 3,
         "cv_kind": cv_kind,
         "fold_algorithm": fold_algorithm,
         "n_folds": n_folds,
         "frozen_test_rows": n_test,
-        "models": models,
+        "models": models + (["ifs_native"] if ifs_provenance is not None else []),
         "each_learned_model_partitions_test_exactly_once": True,
         "analysis_decision_rule": args.decision_rule,
         "checkpoint_selection_rules": checkpoint_rules,
@@ -1146,9 +1389,26 @@ def aggregate_results(args: argparse.Namespace) -> None:
             if args.decision_rule == "argmax"
             else "use each fold's saved validation-frozen decision rule"
         ),
+        "primary_sample_scope": (
+            "ifs_diagnostic_matched_test"
+            if ifs_provenance is not None
+            else "full_frozen_test_for_learned_operators"
+        ),
+        "ifs_baseline": {
+            "included": ifs_provenance is not None,
+            **(ifs_provenance or {}),
+        },
         "primary_metrics": ["pooled out-of-fold low_vis_csi", "pooled out-of-fold low_vis_recall"],
+        "full_learned_sensitivity_tables": (
+            ["fold_metrics_full_learned_test.csv", "pooled_metrics_full_learned_test.csv"]
+            if ifs_provenance is not None
+            else []
+        ),
         "decision_rule_effects": "decision_rule_effects.csv compares argmax with each fold's saved predictions",
-        "station_metric_policy": "station rows with no positive/negative variation retain NaN AP",
+        "station_metric_policy": (
+            "learned-operator station metrics use the full frozen test; rows with no "
+            "positive/negative variation retain NaN AP"
+        ),
         "generated_utc": pd.Timestamp.utcnow().isoformat(),
     }
     _atomic_json(output_dir / "coverage_manifest.json", coverage)

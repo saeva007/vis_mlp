@@ -213,7 +213,10 @@ class MappingCVFigureTests(unittest.TestCase):
                         "cv_kind": kind,
                         "model": model,
                         "fold": fold,
-                        "decision_rule": "argmax",
+                        "sample_scope": "ifs_diagnostic_matched_test",
+                        "decision_rule": (
+                            "native_visibility_500_1000m" if model == "ifs_native" else "argmax"
+                        ),
                         "low_vis_csi": 0.20 + 0.05 * model_index + 0.01 * fold,
                         "low_vis_recall": 0.40 + 0.06 * model_index + 0.01 * fold,
                     }
@@ -222,7 +225,10 @@ class MappingCVFigureTests(unittest.TestCase):
                 {
                     "cv_kind": kind,
                     "model": model,
-                    "decision_rule": "argmax",
+                    "sample_scope": "ifs_diagnostic_matched_test",
+                    "decision_rule": (
+                        "native_visibility_500_1000m" if model == "ifs_native" else "argmax"
+                    ),
                     "low_vis_csi": 0.22 + 0.05 * model_index,
                     "low_vis_recall": 0.42 + 0.06 * model_index,
                 }
@@ -233,6 +239,8 @@ class MappingCVFigureTests(unittest.TestCase):
             json.dump(
                 {
                     "analysis_decision_rule": "argmax",
+                    "primary_sample_scope": "ifs_diagnostic_matched_test",
+                    "ifs_baseline": {"included": True, "valid_matched_rows": 100},
                     "checkpoint_selection_rules": ["argmax"],
                     "all_checkpoints_selected_with_argmax": True,
                 },
@@ -269,7 +277,8 @@ class MappingCVFigureTests(unittest.TestCase):
             self.assertTrue((output / "mapping_cv_test_summary.csv").is_file())
             self.assertTrue((output / "mapping_cv_test_manifest.json").is_file())
             source = pd.read_csv(output / "mapping_cv_test_source_data.csv")
-            self.assertEqual(len(source), 2 * 3 * 5)
+            self.assertEqual(len(source), 2 * 4 * 5)
+            self.assertIn("IFS diagnostic VIS", set(source["model_label"]))
 
 
 if __name__ == "__main__":

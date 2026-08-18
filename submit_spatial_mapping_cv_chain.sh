@@ -9,6 +9,7 @@ RESULT_ROOT="${RESULT_ROOT:-${RESULT_BASE}/${BUNDLE_ID}}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
 MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
+IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv}"
 STATE_FILE="${STATE_FILE:-${RESULT_ROOT}/submission_state.sh}"
 SUBMIT_LOG="${SUBMIT_LOG:-${RESULT_ROOT}/submission.log}"
 
@@ -21,6 +22,7 @@ write_state() {
         printf 'MAPPING_DECISION_RULE=%q\n' "${MAPPING_DECISION_RULE}"
         printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
         printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
+        printf 'IFS_PER_SAMPLE_CSV=%q\n' "${IFS_PER_SAMPLE_CSV}"
         printf 'PREP_JOB_ID=%q\n' "${PREP_JOB_ID:-}"
         printf 'LOGISTIC_JOB_ID=%q\n' "${LOGISTIC_JOB_ID:-}"
         printf 'NEURAL_JOB_ID=%q\n' "${NEURAL_JOB_ID:-}"
@@ -40,6 +42,7 @@ if [ "${1:-}" != "--worker" ]; then
         MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE}" \
         MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
         MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+        IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
         STATE_FILE="${STATE_FILE}" SUBMIT_LOG="${SUBMIT_LOG}" \
         nohup bash "${REPO_ROOT}/submit_spatial_mapping_cv_chain.sh" --worker \
         </dev/null >"${SUBMIT_LOG}" 2>&1 &
@@ -55,6 +58,7 @@ echo "[worker] repo=${REPO_ROOT}"
 echo "[worker] data=${DATA_DIR}"
 echo "[worker] result_root=${RESULT_ROOT}"
 echo "[worker] decision_rule=${MAPPING_DECISION_RULE} logistic_concurrency=${MAPPING_LOGISTIC_CONCURRENCY} neural_concurrency=${MAPPING_NEURAL_CONCURRENCY}"
+echo "[worker] ifs_per_sample=${IFS_PER_SAMPLE_CSV}"
 
 case "${MAPPING_DECISION_RULE}" in
     argmax|val_search) ;;
@@ -84,6 +88,8 @@ for split in train val test; do
         echo "[preflight] ${stem}_${split}.${suffix}=OK"
     done
 done
+test -s "${IFS_PER_SAMPLE_CSV}"
+echo "[preflight] IFS per-sample baseline=OK"
 
 SUBMISSION_STATUS=preflight_ok
 write_state
@@ -116,10 +122,7 @@ SUBMISSION_STATUS=neural_submitted
 write_state
 echo "[submit] neural_array_job=${NEURAL_JOB_ID}"
 
-AGGREGATE_EXPORT="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}"
-if [ -n "${IFS_PER_SAMPLE_CSV:-}" ]; then
-    AGGREGATE_EXPORT="${AGGREGATE_EXPORT},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV}"
-fi
+AGGREGATE_EXPORT="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV},REQUIRE_IFS_BASELINE=1"
 AGGREGATE_JOB_ID=$(sbatch --parsable \
     --dependency="afterok:${LOGISTIC_JOB_ID}:${NEURAL_JOB_ID}" \
     --export="${AGGREGATE_EXPORT}" \

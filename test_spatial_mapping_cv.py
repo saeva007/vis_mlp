@@ -197,6 +197,7 @@ class ArgmaxAggregationTests(unittest.TestCase):
             pd.DataFrame(
                 {
                     "station_id": ["S0", "S1", "S2", "S3"],
+                    "time": pd.date_range("2025-01-01", periods=4, freq="h"),
                 }
             ).to_csv(data_dir / "meta_test.csv", index=False)
             with (folds_dir / "fold_manifest.json").open("w", encoding="utf-8") as handle:
@@ -222,8 +223,13 @@ class ArgmaxAggregationTests(unittest.TestCase):
                 dtype=np.float32,
             )
             stored_pred = np.asarray([2, 0, 2, 2], dtype=np.int8)
+            fold_rows = (np.asarray([0, 1]), np.asarray([2, 3]))
+            for fold, rows in enumerate(fold_rows):
+                fold_dir = folds_dir / f"fold_{fold}"
+                fold_dir.mkdir()
+                np.save(fold_dir / "s2_test_indices.npy", rows)
             for model in spcv.MODELS:
-                for fold, rows in enumerate((np.asarray([0, 1]), np.asarray([2, 3]))):
+                for fold, rows in enumerate(fold_rows):
                     fold_output = results_dir / model / f"fold_{fold}"
                     fold_output.mkdir(parents=True)
                     with (fold_output / "result.json").open("w", encoding="utf-8") as handle:
@@ -244,22 +250,47 @@ class ArgmaxAggregationTests(unittest.TestCase):
                         pred=stored_pred[rows],
                     )
 
+            ifs_path = root / "per_sample_eval.csv"
+            baseline_order = np.asarray([2, 0, 3, 1])
+            pd.DataFrame(
+                {
+                    "station_id": np.asarray(["S0", "S1", "S2", "S3"])[baseline_order],
+                    "time": pd.date_range("2025-01-01", periods=4, freq="h")[baseline_order],
+                    "y_true": y_true[baseline_order],
+                    "ifs_diagnostic_vis_m": np.asarray(
+                        [300.0, 1500.0, 700.0, 1200.0], dtype=np.float64
+                    )[baseline_order],
+                    "ifs_diagnostic_pred": np.asarray([0, 2, 1, 2], dtype=np.int8)[baseline_order],
+                    "ifs_diagnostic_valid": np.asarray([True, False, True, True])[baseline_order],
+                }
+            ).to_csv(ifs_path, index=False)
+
             spcv.aggregate_results(
                 Namespace(
                     folds_dir=str(folds_dir),
                     results_dir=str(results_dir),
                     output_dir=str(output_dir),
                     models=",".join(spcv.MODELS),
-                    ifs_csv="",
+                    ifs_csv=str(ifs_path),
                     decision_rule="argmax",
                 )
             )
 
             pooled = pd.read_csv(output_dir / "pooled_metrics.csv")
-            self.assertEqual(set(pooled["decision_rule"]), {"argmax"})
-            expected = trainer.build_metrics(y_true, np.argmax(probs, axis=1))
+            self.assertEqual(set(pooled["model"]), {*spcv.MODELS, "ifs_native"})
+            self.assertEqual(set(pooled["sample_scope"]), {"ifs_diagnostic_matched_test"})
+            self.assertEqual(
+                set(pooled.loc[pooled["model"] != "ifs_native", "decision_rule"]),
+                {"argmax"},
+            )
+            valid_rows = np.asarray([0, 2, 3])
+            expected = trainer.build_metrics(
+                y_true[valid_rows], np.argmax(probs[valid_rows], axis=1)
+            )
             logistic = pooled.loc[pooled["model"] == "logistic"].iloc[0]
             self.assertAlmostEqual(float(logistic["low_vis_csi"]), expected["low_vis_csi"])
+            self.assertTrue((output_dir / "fold_metrics_full_learned_test.csv").is_file())
+            self.assertTrue((output_dir / "pooled_metrics_full_learned_test.csv").is_file())
 
             effects = pd.read_csv(output_dir / "decision_rule_effects.csv")
             pooled_csi = effects.loc[
@@ -273,6 +304,12 @@ class ArgmaxAggregationTests(unittest.TestCase):
                 coverage = json.load(handle)
             self.assertEqual(coverage["analysis_decision_rule"], "argmax")
             self.assertFalse(coverage["all_checkpoints_selected_with_argmax"])
+            self.assertEqual(coverage["primary_sample_scope"], "ifs_diagnostic_matched_test")
+            self.assertTrue(coverage["ifs_baseline"]["included"])
+            self.assertEqual(coverage["ifs_baseline"]["valid_matched_rows"], 3)
+            self.assertTrue(
+                coverage["ifs_baseline"]["source_covers_frozen_test_exactly_once"]
+            )
 
 
 if __name__ == "__main__":

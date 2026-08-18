@@ -21,8 +21,9 @@ from nonlinear instantaneous mapping versus 12-hour temporal context?
 - Validation rows: existing validation times at the same eligible stations.
 - Final rows: existing frozen test times at held-out stations only.
 - Preprocessing: fitted independently from each fold's training rows.
-- Thresholds: selected independently from each fold's validation rows and then
-  frozen before the corresponding test labels are loaded.
+- Decision rule: learned operators use three-class argmax; the same rule is
+  used for validation checkpoint selection and is frozen before test labels
+  are loaded.
 
 ## Operators
 
@@ -33,18 +34,24 @@ from nonlinear instantaneous mapping versus 12-hour temporal context?
 All learned operators omit the separate engineered-feature block so that the
 MLP cannot receive hidden 12-hour summaries. They use the same dynamic/static
 information contract, three visibility classes, training-only target class
-proportions (Fog 0.18, Mist 0.22, Clear 0.60), and validation threshold policy.
+proportions (Fog 0.18, Mist 0.22, Clear 0.60), and argmax checkpoint-selection policy.
 The neural baselines are trained from scratch on S2 so neither receives a
 pretraining advantage unavailable to logistic regression.
 
-The native IFS diagnostic can be added during aggregation as a fitting-free
-operational reference. It is not treated as an architecture rung and has no AP
-because it does not provide class probabilities.
+The native IFS diagnostic is required during formal aggregation as a
+fitting-free operational reference. It is exactly aligned to the frozen test
+metadata by UTC time, station ID, and within-key occurrence, must cover the
+entire frozen test set before validity masking, and is reclassified directly
+from native visibility at 500 m and 1000 m. All four plotted operators are
+restricted to the same IFS-valid rows within each fold. IFS is not treated as
+an architecture rung and has no AP because it does not provide class
+probabilities.
 
 ## Paper-facing endpoints
 
-- Primary: pooled out-of-fold low-visibility average precision.
-- Secondary: validation-frozen low-visibility precision, recall, CSI, and FPR.
+- Primary: pooled out-of-fold low-visibility CSI and recall on the common
+  IFS-diagnostic-matched test rows.
+- Secondary: argmax low-visibility precision and FPR, plus learned-operator AP.
 - Robustness display: the five fold values and station-level metrics.
 
 ## Submission

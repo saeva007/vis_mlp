@@ -4,8 +4,9 @@
 
 The figure follows the manuscript's existing visual language while using the
 four-panel logic of temporal (top) and spatial (bottom) fold comparisons.  It
-reports binary low-visibility CSI and recall for Logistic, instantaneous
-Static-MLP, and 12 h Static-MLP + GRU operators.
+reports binary low-visibility CSI and recall for the native IFS diagnostic,
+Logistic, instantaneous Static-MLP, and 12 h Static-MLP + GRU operators on the
+same IFS-diagnostic-matched frozen-test rows.
 """
 
 from __future__ import annotations
@@ -24,21 +25,30 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_ORDER = ("logistic", "mlp", "gru")
+MODEL_ORDER = ("ifs_native", "logistic", "mlp", "gru")
 MODEL_LABELS = {
+    "ifs_native": "IFS diagnostic VIS",
     "logistic": "Logistic",
     "mlp": "Static-MLP",
     "gru": "Static-MLP + GRU (12 h)",
 }
 MODEL_COLORS = {
+    "ifs_native": "#2F2F2F",
     "logistic": "#8A8F98",
     "mlp": "#D09A3A",
     "gru": "#2E5A87",
 }
 MODEL_MARKERS = {
+    "ifs_native": "^",
     "logistic": "D",
     "mlp": "o",
     "gru": "s",
+}
+MODEL_LINESTYLES = {
+    "ifs_native": "--",
+    "logistic": "-",
+    "mlp": "-",
+    "gru": "-",
 }
 INK = "#25282B"
 GRID = "#E5E7EB"
@@ -93,21 +103,53 @@ def _load_cv_result(
         raise ValueError(f"Expected {expected_kind} CV at {result_root}, found {actual_kind}")
     if str(coverage.get("analysis_decision_rule", "")) != "argmax":
         raise ValueError(f"{coverage_path} is not an argmax primary analysis")
+    if str(coverage.get("primary_sample_scope", "")) != "ifs_diagnostic_matched_test":
+        raise ValueError(f"{coverage_path} is not an IFS-matched primary analysis")
+    if not bool(dict(coverage.get("ifs_baseline", {})).get("included", False)):
+        raise ValueError(f"{coverage_path} does not include the required IFS baseline")
 
-    required = {"model", "fold", "decision_rule", "low_vis_csi", "low_vis_recall"}
+    required = {
+        "model",
+        "fold",
+        "sample_scope",
+        "decision_rule",
+        "low_vis_csi",
+        "low_vis_recall",
+    }
     if not required.issubset(folds.columns):
         raise ValueError(f"{fold_path} lacks columns: {sorted(required - set(folds.columns))}")
-    if not {"model", "decision_rule", "low_vis_csi", "low_vis_recall"}.issubset(pooled.columns):
+    if not {
+        "model",
+        "sample_scope",
+        "decision_rule",
+        "low_vis_csi",
+        "low_vis_recall",
+    }.issubset(pooled.columns):
         raise ValueError(f"{pooled_path} lacks pooled low-visibility metrics")
     folds = folds.loc[folds["model"].isin(MODEL_ORDER)].copy()
     pooled = pooled.loc[pooled["model"].isin(MODEL_ORDER)].copy()
-    fold_rules = set(folds["decision_rule"].astype(str))
-    pooled_rules = set(pooled["decision_rule"].astype(str))
-    if fold_rules != {"argmax"} or pooled_rules != {"argmax"}:
+    learned_fold_rules = set(
+        folds.loc[folds["model"] != "ifs_native", "decision_rule"].astype(str)
+    )
+    learned_pooled_rules = set(
+        pooled.loc[pooled["model"] != "ifs_native", "decision_rule"].astype(str)
+    )
+    if learned_fold_rules != {"argmax"} or learned_pooled_rules != {"argmax"}:
         raise ValueError(
-            f"{expected_kind} plotted metrics must use argmax; "
-            f"fold_rules={sorted(fold_rules)} pooled_rules={sorted(pooled_rules)}"
+            f"{expected_kind} learned-operator metrics must use argmax; "
+            f"fold_rules={sorted(learned_fold_rules)} "
+            f"pooled_rules={sorted(learned_pooled_rules)}"
         )
+    if set(
+        folds.loc[folds["model"] == "ifs_native", "decision_rule"].astype(str)
+    ) != {"native_visibility_500_1000m"} or set(
+        pooled.loc[pooled["model"] == "ifs_native", "decision_rule"].astype(str)
+    ) != {"native_visibility_500_1000m"}:
+        raise ValueError(f"{expected_kind} IFS baseline must use native 500/1000 m classes")
+    if set(folds["sample_scope"].astype(str)) != {"ifs_diagnostic_matched_test"}:
+        raise ValueError(f"{expected_kind} fold metrics mix incompatible sample scopes")
+    if set(pooled["sample_scope"].astype(str)) != {"ifs_diagnostic_matched_test"}:
+        raise ValueError(f"{expected_kind} pooled metrics mix incompatible sample scopes")
     folds["fold"] = pd.to_numeric(folds["fold"], errors="raise").astype(int)
     for metric in ("low_vis_csi", "low_vis_recall"):
         folds[metric] = pd.to_numeric(folds[metric], errors="raise")
@@ -173,6 +215,7 @@ def _panel(
             markeredgecolor="white",
             markeredgewidth=0.65,
             linewidth=1.55,
+            linestyle=MODEL_LINESTYLES[model],
             label=MODEL_LABELS[model],
             zorder=3,
         )
@@ -225,6 +268,7 @@ def _source_table(
                     "fold_label",
                     "model",
                     "model_label",
+                    "sample_scope",
                     "decision_rule",
                     "low_vis_csi",
                     "low_vis_recall",
@@ -255,7 +299,8 @@ def _summary_table(
                         "cv_type": kind,
                         "model": model,
                         "model_label": MODEL_LABELS[model],
-                        "decision_rule": "argmax",
+                        "sample_scope": str(pooled_row["sample_scope"]),
+                        "decision_rule": str(pooled_row["decision_rule"]),
                         "metric": metric,
                         "fold_mean": float(np.mean(values)),
                         "fold_sd": float(np.std(values, ddof=1)),
@@ -345,7 +390,7 @@ def plot_mapping_cv(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.52, 0.995),
-        ncol=3,
+        ncol=4,
         handlelength=1.8,
         columnspacing=1.5,
     )
@@ -367,10 +412,10 @@ def plot_mapping_cv(
     plt.close(fig)
 
     figure_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "core_conclusion": (
-            "Tests whether nonlinear and temporal mapping-operator gains persist across both "
-            "held-out calendar blocks and geographically held-out station blocks."
+            "Tests whether learned mapping operators improve on native IFS diagnostic visibility, "
+            "and whether nonlinear and temporal gains persist across held-out calendar and station blocks."
         ),
         "archetype": "quantitative grid",
         "backend": "Python/matplotlib",
@@ -382,9 +427,16 @@ def plot_mapping_cv(
             "d": "spatial-fold low-visibility recall",
         },
         "models": [MODEL_LABELS[model] for model in MODEL_ORDER],
+        "sample_scope": (
+            "common frozen-test rows with valid native IFS diagnostic visibility; "
+            "identical within each CV type for all four plotted operators"
+        ),
         "metric_definition": "binary low visibility is visibility < 1000 m",
         "variability_definition": "five held-out fold values; no row-level error bars",
-        "decision_rule": "argmax",
+        "decision_rule": {
+            "learned_operators": "argmax",
+            "ifs_native": "diagnostic visibility thresholds at 500 m and 1000 m",
+        },
         "checkpoint_selection": {
             "spatial": {
                 "rules": spatial_coverage.get("checkpoint_selection_rules", []),
@@ -396,8 +448,8 @@ def plot_mapping_cv(
             },
         },
         "threshold_policy": (
-            "argmax of the three class probabilities; no model- or fold-specific "
-            "probability thresholds are used in the plotted predictions"
+            "learned operators use argmax of the three class probabilities; native IFS VIS "
+            "uses fixed physical classes <500 m, 500-1000 m, and >=1000 m"
         ),
         "input_artifacts": {
             "spatial": "aggregate/fold_metrics.csv and aggregate/pooled_metrics.csv",

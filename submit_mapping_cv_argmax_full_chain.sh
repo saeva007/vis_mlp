@@ -15,6 +15,7 @@ SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT:-/public/home/putianshu/vis_mlp/spati
 TEMPORAL_RESULT_ROOT="${TEMPORAL_RESULT_ROOT:-/public/home/putianshu/vis_mlp/temporal_mapping_cv/${TEMPORAL_BUNDLE_ID}}"
 MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
 MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
+IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv}"
 MASTER_STATE_FILE="${MASTER_STATE_FILE:-${TEMPORAL_RESULT_ROOT}/argmax_full_chain_state.sh}"
 MASTER_LOG="${MASTER_LOG:-${TEMPORAL_RESULT_ROOT}/argmax_full_chain_submission.log}"
 
@@ -31,6 +32,7 @@ write_master_state() {
         printf 'MAPPING_DECISION_RULE=%q\n' "argmax"
         printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
         printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
+        printf 'IFS_PER_SAMPLE_CSV=%q\n' "${IFS_PER_SAMPLE_CSV}"
         printf 'SPATIAL_BUNDLE_ID=%q\n' "${SPATIAL_BUNDLE_ID}"
         printf 'TEMPORAL_BUNDLE_ID=%q\n' "${TEMPORAL_BUNDLE_ID}"
         printf 'SPATIAL_RESULT_ROOT=%q\n' "${SPATIAL_RESULT_ROOT}"
@@ -65,6 +67,7 @@ if [ "${1:-}" != "--worker" ]; then
         TEMPORAL_RESULT_ROOT="${TEMPORAL_RESULT_ROOT}" \
         MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
         MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+        IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
         MASTER_STATE_FILE="${MASTER_STATE_FILE}" MASTER_LOG="${MASTER_LOG}" \
         nohup bash "${REPO_ROOT}/submit_mapping_cv_argmax_full_chain.sh" --worker \
         </dev/null >"${MASTER_LOG}" 2>&1 &
@@ -83,6 +86,8 @@ for required in \
     test -s "${REPO_ROOT}/${required}"
     echo "[preflight] ${required}=OK"
 done
+test -s "${IFS_PER_SAMPLE_CSV}"
+echo "[preflight] IFS per-sample baseline=${IFS_PER_SAMPLE_CSV}"
 
 SPATIAL_STATE_FILE="${SPATIAL_RESULT_ROOT}/submission_state.sh"
 TEMPORAL_STATE_FILE="${TEMPORAL_RESULT_ROOT}/submission_state.sh"
@@ -94,6 +99,7 @@ REPO_ROOT="${REPO_ROOT}" DATA_DIR="${DATA_DIR}" \
     STATE_FILE="${SPATIAL_STATE_FILE}" MAPPING_DECISION_RULE=argmax \
     MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
     MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+    IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
     bash "${REPO_ROOT}/submit_spatial_mapping_cv_chain.sh" --worker
 
 SPATIAL_AGGREGATE_JOB_ID="$(state_value "${SPATIAL_STATE_FILE}" AGGREGATE_JOB_ID)"
@@ -106,6 +112,7 @@ REPO_ROOT="${REPO_ROOT}" DATA_DIR="${DATA_DIR}" \
     STATE_FILE="${TEMPORAL_STATE_FILE}" MAPPING_DECISION_RULE=argmax \
     MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
     MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+    IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
     SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT}" \
     SPATIAL_AGGREGATE_JOB_ID="${SPATIAL_AGGREGATE_JOB_ID}" \
     bash "${REPO_ROOT}/submit_temporal_mapping_cv_chain.sh" --worker

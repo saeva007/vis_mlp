@@ -15,7 +15,9 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
-IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-}"
+DEFAULT_IFS_PER_SAMPLE_CSV="/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv"
+IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-${DEFAULT_IFS_PER_SAMPLE_CSV}}"
+REQUIRE_IFS_BASELINE="${REQUIRE_IFS_BASELINE:-1}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 
 case "${MAPPING_DECISION_RULE}" in
@@ -42,14 +44,17 @@ command=(
     --decision-rule "${MAPPING_DECISION_RULE}"
 )
 
-# Bash 4.2 on the cluster treats an empty-array expansion as an unbound
-# variable under `set -u`. Keep the command array non-empty and append the
-# optional IFS arguments only when the baseline file actually exists.
-if [ -n "${IFS_PER_SAMPLE_CSV}" ] && [ -s "${IFS_PER_SAMPLE_CSV}" ]; then
+# The formal mapping figure requires the native IFS diagnostic on the same
+# frozen-test rows.  Fail closed rather than silently producing learned-only
+# tables that the plotting step cannot use.
+if [ -s "${IFS_PER_SAMPLE_CSV}" ]; then
     command+=(--ifs-csv "${IFS_PER_SAMPLE_CSV}")
     echo "[preflight] IFS per-sample baseline=${IFS_PER_SAMPLE_CSV}"
+elif [ "${REQUIRE_IFS_BASELINE}" = "1" ]; then
+    echo "ERROR: required IFS per-sample baseline is missing or empty: ${IFS_PER_SAMPLE_CSV}" >&2
+    exit 3
 else
-    echo "[preflight] IFS per-sample baseline unavailable; learned operators only"
+    echo "[preflight] IFS baseline disabled explicitly; learned operators only"
 fi
 
 "${command[@]}"
