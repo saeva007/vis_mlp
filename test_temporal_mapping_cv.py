@@ -271,14 +271,30 @@ class MappingCVFigureTests(unittest.TestCase):
                 ["png"],
                 120,
             )
-            self.assertEqual(written, [output / "mapping_cv_test.png"])
-            self.assertTrue(written[0].is_file())
+            self.assertEqual(
+                written,
+                [
+                    output / "mapping_cv_test.png",
+                    output / "mapping_cv_test_viscast_vs_ifs.png",
+                ],
+            )
+            self.assertTrue(all(path.is_file() for path in written))
             self.assertTrue((output / "mapping_cv_test_source_data.csv").is_file())
             self.assertTrue((output / "mapping_cv_test_summary.csv").is_file())
             self.assertTrue((output / "mapping_cv_test_manifest.json").is_file())
             source = pd.read_csv(output / "mapping_cv_test_source_data.csv")
             self.assertEqual(len(source), 2 * 4 * 5)
             self.assertIn("IFS diagnostic VIS", set(source["model_label"]))
+            direct_source = pd.read_csv(
+                output / "mapping_cv_test_viscast_vs_ifs_source_data.csv"
+            )
+            self.assertEqual(set(direct_source["model"]), {"ifs_native", "gru"})
+            self.assertEqual(
+                set(direct_source["model_label"]), {"IFS diagnostic VIS", "VisCast"}
+            )
+            self.assertTrue(
+                (output / "mapping_cv_test_viscast_vs_ifs_manifest.json").is_file()
+            )
 
 
 if __name__ == "__main__":

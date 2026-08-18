@@ -50,6 +50,11 @@ MODEL_LINESTYLES = {
     "mlp": "-",
     "gru": "-",
 }
+DIRECT_MODEL_ORDER = ("gru", "ifs_native")
+DIRECT_MODEL_LABELS = {
+    "ifs_native": "IFS diagnostic VIS",
+    "gru": "VisCast",
+}
 INK = "#25282B"
 GRID = "#E5E7EB"
 
@@ -202,9 +207,11 @@ def _panel(
     xlabel: str,
     ylabel: str,
     letter: str,
+    model_order: Sequence[str] = MODEL_ORDER,
+    model_labels: Mapping[str, str] = MODEL_LABELS,
 ) -> None:
     x = np.arange(len(tick_labels), dtype=float)
-    for model in MODEL_ORDER:
+    for model in model_order:
         rows = table.loc[table["model"] == model].sort_values("fold")
         ax.plot(
             x,
@@ -216,7 +223,7 @@ def _panel(
             markeredgewidth=0.65,
             linewidth=1.55,
             linestyle=MODEL_LINESTYLES[model],
-            label=MODEL_LABELS[model],
+            label=model_labels[model],
             zorder=3,
         )
     ax.set_xticks(x)
@@ -313,6 +320,78 @@ def _summary_table(
     return pd.DataFrame(rows)
 
 
+def _render_grid(
+    temporal_folds: pd.DataFrame,
+    spatial_folds: pd.DataFrame,
+    temporal_labels: Sequence[str],
+    spatial_labels: Sequence[str],
+    output_dir: Path,
+    stem: str,
+    formats: Sequence[str],
+    dpi: int,
+    model_order: Sequence[str],
+    model_labels: Mapping[str, str],
+) -> List[Path]:
+    width_in = 183.0 / 25.4
+    height_in = 132.0 / 25.4
+    fig, axes = plt.subplots(2, 2, figsize=(width_in, height_in), sharey="col")
+    panel_specs = (
+        (
+            axes[0, 0], temporal_folds, "low_vis_csi", temporal_labels,
+            "Temporal transfer: low-visibility CSI", "Held-out temporal block", "CSI", "a",
+        ),
+        (
+            axes[0, 1], temporal_folds, "low_vis_recall", temporal_labels,
+            "Temporal transfer: low-visibility recall", "Held-out temporal block", "Recall", "b",
+        ),
+        (
+            axes[1, 0], spatial_folds, "low_vis_csi", spatial_labels,
+            "Spatial transfer: low-visibility CSI", "Held-out spatial block (west to east)", "CSI", "c",
+        ),
+        (
+            axes[1, 1], spatial_folds, "low_vis_recall", spatial_labels,
+            "Spatial transfer: low-visibility recall", "Held-out spatial block (west to east)", "Recall", "d",
+        ),
+    )
+    for spec in panel_specs:
+        _panel(
+            *spec,
+            model_order=model_order,
+            model_labels=model_labels,
+        )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.52, 0.995),
+        ncol=len(model_order),
+        handlelength=1.8,
+        columnspacing=1.5,
+    )
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.985,
+        bottom=0.10,
+        top=0.91,
+        wspace=0.25,
+        hspace=0.43,
+    )
+
+    written: List[Path] = []
+    for fmt in formats:
+        if fmt not in {"svg", "pdf", "png", "tiff"}:
+            raise ValueError(f"Unsupported output format: {fmt}")
+        path = output_dir / f"{stem}.{fmt}"
+        save_kwargs: Dict[str, object] = {"bbox_inches": "tight", "facecolor": "white"}
+        if fmt in {"png", "tiff"}:
+            save_kwargs["dpi"] = int(dpi)
+        fig.savefig(path, **save_kwargs)
+        written.append(path)
+    plt.close(fig)
+    return written
+
+
 def plot_mapping_cv(
     spatial_result_root: Path,
     temporal_result_root: Path,
@@ -334,82 +413,51 @@ def plot_mapping_cv(
     spatial_labels = _spatial_tick_labels(spatial_manifest)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    clean_formats = tuple(
+        raw_format.strip().lower()
+        for raw_format in formats
+        if raw_format.strip()
+    )
+    if not clean_formats:
+        raise ValueError("At least one output format is required")
     source = _source_table(temporal_folds, spatial_folds, temporal_labels, spatial_labels)
     source.to_csv(output_dir / f"{stem}_source_data.csv", index=False)
     summary = _summary_table(
         temporal_folds, temporal_pooled, spatial_folds, spatial_pooled
     )
     summary.to_csv(output_dir / f"{stem}_summary.csv", index=False)
-
-    width_in = 183.0 / 25.4
-    height_in = 132.0 / 25.4
-    fig, axes = plt.subplots(2, 2, figsize=(width_in, height_in), sharey="col")
-    _panel(
-        axes[0, 0],
+    written = _render_grid(
         temporal_folds,
-        "low_vis_csi",
-        temporal_labels,
-        "Temporal transfer: low-visibility CSI",
-        "Held-out temporal block",
-        "CSI",
-        "a",
-    )
-    _panel(
-        axes[0, 1],
-        temporal_folds,
-        "low_vis_recall",
-        temporal_labels,
-        "Temporal transfer: low-visibility recall",
-        "Held-out temporal block",
-        "Recall",
-        "b",
-    )
-    _panel(
-        axes[1, 0],
         spatial_folds,
-        "low_vis_csi",
+        temporal_labels,
         spatial_labels,
-        "Spatial transfer: low-visibility CSI",
-        "Held-out spatial block (west to east)",
-        "CSI",
-        "c",
+        output_dir,
+        stem,
+        clean_formats,
+        dpi,
+        MODEL_ORDER,
+        MODEL_LABELS,
     )
-    _panel(
-        axes[1, 1],
-        spatial_folds,
-        "low_vis_recall",
-        spatial_labels,
-        "Spatial transfer: low-visibility recall",
-        "Held-out spatial block (west to east)",
-        "Recall",
-        "d",
-    )
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.52, 0.995),
-        ncol=4,
-        handlelength=1.8,
-        columnspacing=1.5,
-    )
-    fig.subplots_adjust(left=0.09, right=0.985, bottom=0.10, top=0.91, wspace=0.25, hspace=0.43)
 
-    written: List[Path] = []
-    for raw_format in formats:
-        fmt = raw_format.strip().lower()
-        if not fmt:
-            continue
-        if fmt not in {"svg", "pdf", "png", "tiff"}:
-            raise ValueError(f"Unsupported output format: {fmt}")
-        path = output_dir / f"{stem}.{fmt}"
-        save_kwargs: Dict[str, object] = {"bbox_inches": "tight", "facecolor": "white"}
-        if fmt in {"png", "tiff"}:
-            save_kwargs["dpi"] = int(dpi)
-        fig.savefig(path, **save_kwargs)
-        written.append(path)
-    plt.close(fig)
+    direct_stem = f"{stem}_viscast_vs_ifs"
+    direct_source = source.loc[source["model"].isin(DIRECT_MODEL_ORDER)].copy()
+    direct_source["model_label"] = direct_source["model"].map(DIRECT_MODEL_LABELS)
+    direct_source.to_csv(output_dir / f"{direct_stem}_source_data.csv", index=False)
+    direct_summary = summary.loc[summary["model"].isin(DIRECT_MODEL_ORDER)].copy()
+    direct_summary["model_label"] = direct_summary["model"].map(DIRECT_MODEL_LABELS)
+    direct_summary.to_csv(output_dir / f"{direct_stem}_summary.csv", index=False)
+    direct_written = _render_grid(
+        temporal_folds,
+        spatial_folds,
+        temporal_labels,
+        spatial_labels,
+        output_dir,
+        direct_stem,
+        clean_formats,
+        dpi,
+        DIRECT_MODEL_ORDER,
+        DIRECT_MODEL_LABELS,
+    )
 
     figure_manifest = {
         "schema_version": 2,
@@ -461,7 +509,40 @@ def plot_mapping_cv(
     }
     with (output_dir / f"{stem}_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(figure_manifest, handle, indent=2, ensure_ascii=False)
-    return written
+
+    direct_manifest = {
+        "schema_version": 1,
+        "core_conclusion": (
+            "Directly compares VisCast with native IFS diagnostic visibility across "
+            "held-out calendar and station blocks."
+        ),
+        "archetype": "quantitative grid",
+        "backend": "Python/matplotlib",
+        "final_size_mm": {"width": 183.0, "height": 132.0},
+        "panels": figure_manifest["panels"],
+        "models": [DIRECT_MODEL_LABELS[model] for model in DIRECT_MODEL_ORDER],
+        "sample_scope": (
+            "common frozen-test rows with valid native IFS diagnostic visibility; "
+            "identical for VisCast and IFS within each CV type"
+        ),
+        "metric_definition": figure_manifest["metric_definition"],
+        "variability_definition": figure_manifest["variability_definition"],
+        "decision_rule": {
+            "VisCast": "argmax",
+            "ifs_native": "diagnostic visibility thresholds at 500 m and 1000 m",
+        },
+        "checkpoint_selection": figure_manifest["checkpoint_selection"],
+        "threshold_policy": figure_manifest["threshold_policy"],
+        "input_artifacts": figure_manifest["input_artifacts"],
+        "source_data": f"{direct_stem}_source_data.csv",
+        "summary_data": f"{direct_stem}_summary.csv",
+        "outputs": [path.name for path in direct_written],
+    }
+    with (output_dir / f"{direct_stem}_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(direct_manifest, handle, indent=2, ensure_ascii=False)
+    return written + direct_written
 
 
 def parse_args() -> argparse.Namespace:

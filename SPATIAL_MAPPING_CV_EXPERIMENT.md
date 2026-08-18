@@ -53,6 +53,8 @@ probabilities.
   IFS-diagnostic-matched test rows.
 - Secondary: argmax low-visibility precision and FPR, plus learned-operator AP.
 - Robustness display: the five fold values and station-level metrics.
+- Figure exports: the complete operator ladder and a companion direct comparison
+  containing only VisCast (`gru`) and native IFS diagnostic visibility.
 
 ## Submission
 
