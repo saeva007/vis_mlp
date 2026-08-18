@@ -20,6 +20,7 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 BUNDLE_ID="${BUNDLE_ID:?set BUNDLE_ID}"
 MODEL_SEED="${MODEL_SEED:-20260815}"
+CV_PREFIX="${CV_PREFIX:-spcv}"
 TASK_ID="${SLURM_ARRAY_TASK_ID}"
 
 if [ "${TASK_ID}" -lt 5 ]; then
@@ -30,7 +31,7 @@ else
     FOLD="$((TASK_ID - 5))"
 fi
 
-RUN_ID="spcv_${BUNDLE_ID}_${MODEL}_fold${FOLD}"
+RUN_ID="${CV_PREFIX}_${BUNDLE_ID}_${MODEL}_fold${FOLD}"
 OUTPUT_DIR="${RESULT_ROOT}/results/${MODEL}/fold_${FOLD}"
 CKPT_DIR="${OUTPUT_DIR}/checkpoints"
 FOLD_DIR="${RESULT_ROOT}/folds/fold_${FOLD}"

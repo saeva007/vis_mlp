@@ -311,6 +311,7 @@ def prepare_folds(args: argparse.Namespace) -> None:
     fold_manifest = {
         "schema_version": 2,
         "created_utc": pd.Timestamp.utcnow().isoformat(),
+        "cv_kind": "spatial",
         "data_dir": str(data_dir),
         "data_shapes": shapes,
         "n_folds": int(args.n_folds),
@@ -346,6 +347,23 @@ def _load_indices(fold_dir: Path, split: str) -> np.ndarray:
     if values.ndim != 1 or not len(values) or np.any(values[1:] <= values[:-1]):
         raise ValueError(f"Invalid row index file: {path}")
     return values
+
+
+def _fold_provenance(fold_dir: Path, model_family: str) -> Tuple[str, str, str]:
+    manifest_path = fold_dir.parent / "fold_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    cv_kind = str(manifest.get("cv_kind", "spatial"))
+    algorithm = str(manifest.get("algorithm", "unknown"))
+    if cv_kind == "temporal":
+        threshold_source = "validation rows outside the held-out temporal block only"
+    elif model_family == "logistic":
+        threshold_source = "held-in validation stations and validation times only"
+    else:
+        threshold_source = "checkpoint selected on non-held-out validation stations and validation times only"
+    return cv_kind, algorithm, threshold_source
 
 
 def _continuous_and_vegetation(
@@ -443,6 +461,7 @@ def train_logistic(args: argparse.Namespace) -> None:
     fold_dir = Path(args.fold_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cv_kind, fold_algorithm, threshold_source = _fold_provenance(fold_dir, "logistic")
 
     train_indices = _load_indices(fold_dir, "train")
     val_indices = _load_indices(fold_dir, "val")
@@ -563,6 +582,8 @@ def train_logistic(args: argparse.Namespace) -> None:
     )
     result = {
         "schema_version": 1,
+        "cv_kind": cv_kind,
+        "fold_algorithm": fold_algorithm,
         "model": "logistic",
         "fold": int(args.fold),
         "seed": int(args.seed),
@@ -575,7 +596,7 @@ def train_logistic(args: argparse.Namespace) -> None:
         "target_class_proportions": target.tolist(),
         "best_validation_epoch": int(pd.DataFrame(history).iloc[int(np.argmax([row["val_low_vis_ap"] for row in history]))]["epoch"]),
         "thresholds": thresholds,
-        "threshold_source": "held-in validation stations and validation times only",
+        "threshold_source": threshold_source,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
         "test_access_policy": "loaded after model and thresholds were frozen",
@@ -657,6 +678,7 @@ def evaluate_neural(args: argparse.Namespace) -> None:
     fold_dir = Path(args.fold_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cv_kind, fold_algorithm, threshold_source = _fold_provenance(fold_dir, "neural")
     checkpoint = Path(args.checkpoint).resolve()
     config_path = Path(args.run_config).resolve()
     scaler_path = Path(args.scaler).resolve()
@@ -705,6 +727,8 @@ def evaluate_neural(args: argparse.Namespace) -> None:
     )
     result = {
         "schema_version": 1,
+        "cv_kind": cv_kind,
+        "fold_algorithm": fold_algorithm,
         "model": str(args.model),
         "fold": int(args.fold),
         "seed": int(metadata.get("seed", -1)),
@@ -719,7 +743,7 @@ def evaluate_neural(args: argparse.Namespace) -> None:
         ),
         "objective": str(metadata.get("loss_mode")),
         "thresholds": thresholds,
-        "threshold_source": "checkpoint selected on non-held-out validation stations and validation times only",
+        "threshold_source": threshold_source,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
         "test_rows": int(len(test_indices)),
@@ -781,6 +805,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with (folds_dir / "fold_manifest.json").open("r", encoding="utf-8") as handle:
         fold_manifest = json.load(handle)
+    cv_kind = str(fold_manifest.get("cv_kind", "spatial"))
+    fold_algorithm = str(fold_manifest.get("algorithm", "unknown"))
     n_folds = int(fold_manifest["n_folds"])
     data_dir = Path(fold_manifest["data_dir"])
     n_test = int(fold_manifest["data_shapes"]["test"]["x_shape"][0])
@@ -803,7 +829,9 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 raise FileNotFoundError(f"Missing completed {model} fold {fold}: {fold_output}")
             with result_path.open("r", encoding="utf-8") as handle:
                 result = json.load(handle)
-            fold_rows.append({"model": model, "fold": fold, **result["test_metrics"]})
+            fold_rows.append(
+                {"cv_kind": cv_kind, "model": model, "fold": fold, **result["test_metrics"]}
+            )
             pieces.append(_load_prediction(prediction_path))
         combined = {name: np.concatenate([piece[name] for piece in pieces], axis=0) for name in pieces[0]}
         order = np.argsort(combined["row_index"], kind="stable")
@@ -816,17 +844,16 @@ def aggregate_results(args: argparse.Namespace) -> None:
             combined["pred"].astype(np.int64),
             combined["probs"].astype(np.float64),
         )
-        pooled_rows.append({"model": model, "n": n_test, **metrics})
-        station_rows.extend(
-            _station_metrics(
-                model,
-                combined["row_index"].astype(np.int64),
-                combined["y_true"].astype(np.int64),
-                combined["pred"].astype(np.int64),
-                combined["probs"].astype(np.float64),
-                station_ids,
-            )
+        pooled_rows.append({"cv_kind": cv_kind, "model": model, "n": n_test, **metrics})
+        station_metrics = _station_metrics(
+            model,
+            combined["row_index"].astype(np.int64),
+            combined["y_true"].astype(np.int64),
+            combined["pred"].astype(np.int64),
+            combined["probs"].astype(np.float64),
+            station_ids,
         )
+        station_rows.extend({"cv_kind": cv_kind, **row} for row in station_metrics)
         pooled_by_model[model] = combined
 
     if args.ifs_csv:
@@ -848,12 +875,28 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 group["y_true"].to_numpy(dtype=np.int64),
                 group["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
             )
-            fold_rows.append({"model": "ifs_native", "fold": int(fold), "low_vis_ap": float("nan"), **metrics})
+            fold_rows.append(
+                {
+                    "cv_kind": cv_kind,
+                    "model": "ifs_native",
+                    "fold": int(fold),
+                    "low_vis_ap": float("nan"),
+                    **metrics,
+                }
+            )
         metrics = rnn.build_metrics(
             ifs["y_true"].to_numpy(dtype=np.int64),
             ifs["ifs_diagnostic_pred"].to_numpy(dtype=np.int64),
         )
-        pooled_rows.append({"model": "ifs_native", "n": int(len(ifs)), "low_vis_ap": float("nan"), **metrics})
+        pooled_rows.append(
+            {
+                "cv_kind": cv_kind,
+                "model": "ifs_native",
+                "n": int(len(ifs)),
+                "low_vis_ap": float("nan"),
+                **metrics,
+            }
+        )
 
     fold_table = pd.DataFrame(fold_rows)
     pooled_table = pd.DataFrame(pooled_rows)
@@ -871,6 +914,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
         for metric in metrics_to_compare:
             delta_rows.append(
                 {
+                    "cv_kind": cv_kind,
                     "comparison": f"{left}_minus_{right}",
                     "metric": metric,
                     "delta": float(pooled_indexed.loc[left, metric] - pooled_indexed.loc[right, metric]),
@@ -879,6 +923,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
     pd.DataFrame(delta_rows).to_csv(output_dir / "operator_deltas.csv", index=False)
     coverage = {
         "schema_version": 1,
+        "cv_kind": cv_kind,
+        "fold_algorithm": fold_algorithm,
         "n_folds": n_folds,
         "frozen_test_rows": n_test,
         "models": models,
