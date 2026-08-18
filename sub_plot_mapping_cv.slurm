@@ -20,6 +20,7 @@ PLOT_ENV="${PLOT_ENV:-/public/home/jarvis226/miniconda3/envs/torch}"
 PLOT_PYTHON="${PLOT_PYTHON:-${PLOT_ENV}/bin/python}"
 FIGURE_STEM="${FIGURE_STEM:-mapping_operator_spatiotemporal_cv}"
 MAPPING_GRU_LABEL="${MAPPING_GRU_LABEL:-Static-MLP + GRU (12 h)}"
+COMPOSITE_GRU_LABEL="${COMPOSITE_GRU_LABEL:-VisCast}"
 PLOT_RESTRUCTURED_FIG2="${PLOT_RESTRUCTURED_FIG2:-0}"
 IFS_COMPARISON_DIR="${IFS_COMPARISON_DIR:-}"
 CONTROLLED_SCRIPT="${CONTROLLED_SCRIPT:-/public/home/putianshu/vis_mlp/ifs_baseline/plot_viscast_controlled_attribution_composite.py}"
@@ -85,7 +86,7 @@ if [ "${PLOT_RESTRUCTURED_FIG2}" = "1" ]; then
         --controlled-script "${CONTROLLED_SCRIPT}" \
         --output-dir "${FIGURE_OUTPUT_DIR}" \
         --stem "${FIGURE_STEM}" \
-        --gru-label "${MAPPING_GRU_LABEL}" \
+        --gru-label "${COMPOSITE_GRU_LABEL}" \
         --formats svg,pdf,png,tiff \
         --dpi 600
 else

@@ -71,11 +71,7 @@ def select_mapping_models(
             "Spatial and temporal metric tables contain different models: "
             f"spatial={spatial_models}, temporal={temporal_models}"
         )
-    if spatial_models == mapping_plot.MODEL_ORDER:
-        labels = dict(mapping_plot.MODEL_LABELS)
-        labels["gru"] = str(gru_label)
-        return mapping_plot.MODEL_ORDER, labels
-    if set(spatial_models) == set(mapping_plot.DIRECT_MODEL_ORDER):
+    if set(mapping_plot.DIRECT_MODEL_ORDER).issubset(set(spatial_models)):
         labels = dict(mapping_plot.DIRECT_MODEL_LABELS)
         labels["gru"] = str(gru_label)
         return mapping_plot.DIRECT_MODEL_ORDER, labels
@@ -203,7 +199,7 @@ def main() -> None:
             temporal_labels,
             "Temporal transfer: low-visibility CSI",
             "Held-out temporal block",
-            "CSI",
+            "Score",
             "d",
         ),
         (
@@ -213,7 +209,7 @@ def main() -> None:
             temporal_labels,
             "Temporal transfer: low-visibility recall",
             "Held-out temporal block",
-            "Recall",
+            "",
             "e",
         ),
         (
@@ -223,7 +219,7 @@ def main() -> None:
             spatial_labels,
             "Spatial transfer: low-visibility CSI",
             "Held-out spatial block (west to east)",
-            "CSI",
+            "",
             "f",
         ),
         (
@@ -233,7 +229,7 @@ def main() -> None:
             spatial_labels,
             "Spatial transfer: low-visibility recall",
             "Held-out spatial block (west to east)",
-            "Recall",
+            "",
             "g",
         ),
     )
@@ -243,15 +239,10 @@ def main() -> None:
             model_order=model_order,
             model_labels=model_labels,
         )
-    handles, labels = temporal_axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.54, 0.650),
-        ncol=len(model_order),
+    temporal_axes[0].legend(
+        loc="upper left",
         handlelength=1.8,
-        columnspacing=1.5,
+        labelspacing=0.35,
     )
 
     output_dir = args.output_dir.expanduser().resolve()
