@@ -213,6 +213,7 @@ class MappingCVFigureTests(unittest.TestCase):
                         "cv_kind": kind,
                         "model": model,
                         "fold": fold,
+                        "decision_rule": "argmax",
                         "low_vis_csi": 0.20 + 0.05 * model_index + 0.01 * fold,
                         "low_vis_recall": 0.40 + 0.06 * model_index + 0.01 * fold,
                     }
@@ -221,12 +222,22 @@ class MappingCVFigureTests(unittest.TestCase):
                 {
                     "cv_kind": kind,
                     "model": model,
+                    "decision_rule": "argmax",
                     "low_vis_csi": 0.22 + 0.05 * model_index,
                     "low_vis_recall": 0.42 + 0.06 * model_index,
                 }
             )
         pd.DataFrame(rows).to_csv(aggregate / "fold_metrics.csv", index=False)
         pd.DataFrame(pooled).to_csv(aggregate / "pooled_metrics.csv", index=False)
+        with (aggregate / "coverage_manifest.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "analysis_decision_rule": "argmax",
+                    "checkpoint_selection_rules": ["argmax"],
+                    "all_checkpoints_selected_with_argmax": True,
+                },
+                handle,
+            )
         manifest = {"cv_kind": kind, "n_folds": 5}
         if kind == "temporal":
             manifest["fold_months"] = {

@@ -20,6 +20,7 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 BUNDLE_ID="${BUNDLE_ID:?set BUNDLE_ID}"
 MODEL_SEED="${MODEL_SEED:-20260815}"
+MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 CV_PREFIX="${CV_PREFIX:-spcv}"
 TASK_ID="${SLURM_ARRAY_TASK_ID}"
 
@@ -36,6 +37,11 @@ OUTPUT_DIR="${RESULT_ROOT}/results/${MODEL}/fold_${FOLD}"
 CKPT_DIR="${OUTPUT_DIR}/checkpoints"
 FOLD_DIR="${RESULT_ROOT}/folds/fold_${FOLD}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
+
+case "${MAPPING_DECISION_RULE}" in
+    argmax|val_search) ;;
+    *) echo "[preflight] invalid MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" >&2; exit 2 ;;
+esac
 
 export LOWVIS_RNN_LOCAL_CACHE_ID="${LOWVIS_RNN_LOCAL_CACHE_ID:-mapping_cv_s2_shared_data}"
 export LOWVIS_RNN_LOCAL_CACHE_DIR="${LOWVIS_RNN_LOCAL_CACHE_DIR:-/tmp}"
@@ -65,7 +71,7 @@ cd "${REPO_ROOT}"
 test -s "${FOLD_DIR}/s2_train_indices.npy"
 test -s "${FOLD_DIR}/s2_val_indices.npy"
 test -s "${FOLD_DIR}/s2_test_indices.npy"
-echo "[preflight] model=${MODEL} fold=${FOLD} run_id=${RUN_ID} indices=OK"
+echo "[preflight] model=${MODEL} fold=${FOLD} decision=${MAPPING_DECISION_RULE} run_id=${RUN_ID} indices=OK"
 
 echo "[preflight] preparing node-local Static-RNN cache"
 srun --nodes=1 --ntasks=1 --cpus-per-task=1 \
@@ -89,6 +95,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task="${CPUS_PER_TASK}" bash -c "
         --mode s2 \
         --s2-from-scratch \
         --encoder \"${MODEL}\" \
+        --seed \"${MODEL_SEED}\" \
         --run-id \"${RUN_ID}\" \
         --local-cache-id \"${LOWVIS_RNN_LOCAL_CACHE_ID}\" \
         --s2-data-dir \"${DATA_DIR}\" \
@@ -116,7 +123,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task="${CPUS_PER_TASK}" bash -c "
         --num-workers 0 \
         --patience \"${PATIENCE:-10}\" \
         --selection-metric recall_csi \
-        --threshold-mode val_search \
+        --threshold-mode \"${MAPPING_DECISION_RULE}\" \
         ${NEURAL_EXTRA_ARGS:-}
 "
 
@@ -138,6 +145,7 @@ python -u "${REPO_ROOT}/spatial_mapping_cv.py" evaluate-neural \
     --checkpoint "${CHECKPOINT}" \
     --run-config "${RUN_CONFIG}" \
     --scaler "${SCALER}" \
+    --decision-rule "${MAPPING_DECISION_RULE}" \
     --batch-size 4096 \
     --device cuda:0
 

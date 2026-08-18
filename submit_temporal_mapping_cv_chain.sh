@@ -7,8 +7,12 @@ BUNDLE_ID="${BUNDLE_ID:-temporal_mapping_cv_$(date +%Y%m%d_%H%M%S)}"
 RESULT_BASE="${RESULT_BASE:-/public/home/putianshu/vis_mlp/temporal_mapping_cv}"
 RESULT_ROOT="${RESULT_ROOT:-${RESULT_BASE}/${BUNDLE_ID}}"
 SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT:-}"
+SPATIAL_AGGREGATE_JOB_ID="${SPATIAL_AGGREGATE_JOB_ID:-}"
 TEMPORAL_EMBARGO_HOURS="${TEMPORAL_EMBARGO_HOURS:-24}"
 INPUT_WINDOW_HOURS="${INPUT_WINDOW_HOURS:-12}"
+MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
+MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
+MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
 STATE_FILE="${STATE_FILE:-${RESULT_ROOT}/submission_state.sh}"
 SUBMIT_LOG="${SUBMIT_LOG:-${RESULT_ROOT}/submission.log}"
 
@@ -19,8 +23,12 @@ write_state() {
         printf 'RESULT_ROOT=%q\n' "${RESULT_ROOT}"
         printf 'DATA_DIR=%q\n' "${DATA_DIR}"
         printf 'SPATIAL_RESULT_ROOT=%q\n' "${SPATIAL_RESULT_ROOT}"
+        printf 'SPATIAL_AGGREGATE_JOB_ID=%q\n' "${SPATIAL_AGGREGATE_JOB_ID}"
         printf 'TEMPORAL_EMBARGO_HOURS=%q\n' "${TEMPORAL_EMBARGO_HOURS}"
         printf 'INPUT_WINDOW_HOURS=%q\n' "${INPUT_WINDOW_HOURS}"
+        printf 'MAPPING_DECISION_RULE=%q\n' "${MAPPING_DECISION_RULE}"
+        printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
+        printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
         printf 'PREP_JOB_ID=%q\n' "${PREP_JOB_ID:-}"
         printf 'LOGISTIC_JOB_ID=%q\n' "${LOGISTIC_JOB_ID:-}"
         printf 'NEURAL_JOB_ID=%q\n' "${NEURAL_JOB_ID:-}"
@@ -40,8 +48,13 @@ if [ "${1:-}" != "--worker" ]; then
     echo "[launcher] submit_log=${SUBMIT_LOG}"
     REPO_ROOT="${REPO_ROOT}" BUNDLE_ID="${BUNDLE_ID}" RESULT_ROOT="${RESULT_ROOT}" \
         DATA_DIR="${DATA_DIR}" SPATIAL_RESULT_ROOT="${SPATIAL_RESULT_ROOT}" \
+        SPATIAL_AGGREGATE_JOB_ID="${SPATIAL_AGGREGATE_JOB_ID}" \
         TEMPORAL_EMBARGO_HOURS="${TEMPORAL_EMBARGO_HOURS}" \
-        INPUT_WINDOW_HOURS="${INPUT_WINDOW_HOURS}" STATE_FILE="${STATE_FILE}" \
+        INPUT_WINDOW_HOURS="${INPUT_WINDOW_HOURS}" \
+        MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE}" \
+        MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
+        MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
+        STATE_FILE="${STATE_FILE}" \
         SUBMIT_LOG="${SUBMIT_LOG}" \
         nohup bash "${REPO_ROOT}/submit_temporal_mapping_cv_chain.sh" --worker \
         </dev/null >"${SUBMIT_LOG}" 2>&1 &
@@ -58,6 +71,15 @@ echo "[worker] data=${DATA_DIR}"
 echo "[worker] result_root=${RESULT_ROOT}"
 echo "[worker] spatial_result_root=${SPATIAL_RESULT_ROOT:-not_set}"
 echo "[worker] embargo=${TEMPORAL_EMBARGO_HOURS}h window=${INPUT_WINDOW_HOURS}h"
+echo "[worker] decision_rule=${MAPPING_DECISION_RULE} logistic_concurrency=${MAPPING_LOGISTIC_CONCURRENCY} neural_concurrency=${MAPPING_NEURAL_CONCURRENCY}"
+
+case "${MAPPING_DECISION_RULE}" in
+    argmax|val_search) ;;
+    *) echo "[preflight] invalid MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" >&2; exit 2 ;;
+esac
+case "${MAPPING_LOGISTIC_CONCURRENCY}:${MAPPING_NEURAL_CONCURRENCY}" in
+    *[!0-9:]*|0:*|*:0) echo "[preflight] concurrency values must be positive integers" >&2; exit 2 ;;
+esac
 
 for required in \
     temporal_mapping_cv.py \
@@ -93,8 +115,9 @@ echo "[submit] prepare_job=${PREP_JOB_ID}"
 
 LOGISTIC_JOB_ID=$(sbatch --parsable \
     --job-name=tpcv_logistic \
+    --array="0-4%${MAPPING_LOGISTIC_CONCURRENCY}" \
     --dependency="afterok:${PREP_JOB_ID}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT}" \
+    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
     "${REPO_ROOT}/sub_spatial_mapping_logistic_cv.slurm")
 LOGISTIC_JOB_ID="${LOGISTIC_JOB_ID%%;*}"
 SUBMISSION_STATUS=logistic_submitted
@@ -103,8 +126,9 @@ echo "[submit] logistic_array_job=${LOGISTIC_JOB_ID}"
 
 NEURAL_JOB_ID=$(sbatch --parsable \
     --job-name=tpcv_neural \
+    --array="0-9%${MAPPING_NEURAL_CONCURRENCY}" \
     --dependency="afterok:${PREP_JOB_ID}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},BUNDLE_ID=${BUNDLE_ID},CV_PREFIX=tpcv" \
+    --export="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},BUNDLE_ID=${BUNDLE_ID},CV_PREFIX=tpcv,MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
     "${REPO_ROOT}/sub_spatial_mapping_neural_cv.slurm")
 NEURAL_JOB_ID="${NEURAL_JOB_ID%%;*}"
 SUBMISSION_STATUS=neural_submitted
@@ -114,7 +138,7 @@ echo "[submit] neural_array_job=${NEURAL_JOB_ID}"
 AGGREGATE_JOB_ID=$(sbatch --parsable \
     --job-name=tpcv_aggregate \
     --dependency="afterok:${LOGISTIC_JOB_ID}:${NEURAL_JOB_ID}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},IFS_PER_SAMPLE_CSV=" \
+    --export="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},IFS_PER_SAMPLE_CSV=,MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
     "${REPO_ROOT}/sub_aggregate_spatial_mapping_cv.slurm")
 AGGREGATE_JOB_ID="${AGGREGATE_JOB_ID%%;*}"
 SUBMISSION_STATUS=aggregate_submitted
@@ -123,9 +147,13 @@ echo "[submit] aggregate_job=${AGGREGATE_JOB_ID}"
 
 PLOT_JOB_ID=""
 if [ -n "${SPATIAL_RESULT_ROOT}" ]; then
+    PLOT_DEPENDENCY="afterok:${AGGREGATE_JOB_ID}"
+    if [ -n "${SPATIAL_AGGREGATE_JOB_ID}" ]; then
+        PLOT_DEPENDENCY="${PLOT_DEPENDENCY}:${SPATIAL_AGGREGATE_JOB_ID}"
+    fi
     PLOT_JOB_ID=$(sbatch --parsable \
         --job-name=mapping_cv_plot \
-        --dependency="afterok:${AGGREGATE_JOB_ID}" \
+        --dependency="${PLOT_DEPENDENCY}" \
         --export="ALL,REPO_ROOT=${REPO_ROOT},SPATIAL_RESULT_ROOT=${SPATIAL_RESULT_ROOT},TEMPORAL_RESULT_ROOT=${RESULT_ROOT}" \
         "${REPO_ROOT}/sub_plot_mapping_cv.slurm")
     PLOT_JOB_ID="${PLOT_JOB_ID%%;*}"

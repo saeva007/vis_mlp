@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from argparse import Namespace
@@ -91,7 +92,7 @@ class SpatialFoldContractTests(unittest.TestCase):
                 all_test.append(test_idx)
             self.assertTrue(np.array_equal(np.sort(np.concatenate(all_test)), np.arange(len(meta_test))))
 
-    def test_logistic_smoke_freezes_validation_thresholds_before_test(self):
+    def test_logistic_smoke_uses_argmax_before_test(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data_dir = root / "data"
@@ -137,13 +138,22 @@ class SpatialFoldContractTests(unittest.TestCase):
                     mist_ratio=0.22, min_fog_precision=0.0,
                     min_mist_precision=0.0, min_clear_recall=0.0,
                     threshold_grid_low=0.1, threshold_grid_high=0.7,
-                    threshold_grid_step=0.2,
+                    threshold_grid_step=0.2, decision_rule="argmax",
                 )
             )
             result = pd.read_json(output_dir / "result.json", typ="series")
-            self.assertEqual(result["threshold_source"], "held-in validation stations and validation times only")
-            self.assertEqual(result["test_access_policy"], "loaded after model and thresholds were frozen")
+            self.assertEqual(result["analysis_decision_rule"], "argmax")
+            self.assertEqual(result["checkpoint_selection_rule"], "argmax")
+            self.assertEqual(result["thresholds"], {"mode": "argmax"})
+            self.assertEqual(
+                result["test_access_policy"],
+                "loaded after model and validation decision rule were frozen",
+            )
             self.assertTrue((output_dir / "test_predictions.npz").is_file())
+            with np.load(output_dir / "test_predictions.npz") as payload:
+                self.assertTrue(
+                    np.array_equal(payload["pred"], np.argmax(payload["probs"], axis=1))
+                )
 
 
 class InstantaneousMLPTests(unittest.TestCase):
@@ -172,6 +182,97 @@ class InstantaneousMLPTests(unittest.TestCase):
             logits_b, reg_b = model(second)
         self.assertTrue(torch.allclose(logits_a, logits_b))
         self.assertTrue(torch.allclose(reg_a, reg_b))
+
+
+class ArgmaxAggregationTests(unittest.TestCase):
+    def test_aggregate_recomputes_argmax_and_reports_saved_rule_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "data"
+            folds_dir = root / "folds"
+            results_dir = root / "results"
+            output_dir = root / "aggregate"
+            data_dir.mkdir()
+            folds_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "station_id": ["S0", "S1", "S2", "S3"],
+                }
+            ).to_csv(data_dir / "meta_test.csv", index=False)
+            with (folds_dir / "fold_manifest.json").open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "cv_kind": "spatial",
+                        "algorithm": "synthetic",
+                        "n_folds": 2,
+                        "data_dir": str(data_dir),
+                        "data_shapes": {"test": {"x_shape": [4, 3]}},
+                    },
+                    handle,
+                )
+
+            y_true = np.asarray([0, 2, 1, 2], dtype=np.int8)
+            probs = np.asarray(
+                [
+                    [0.40, 0.35, 0.25],
+                    [0.30, 0.20, 0.50],
+                    [0.20, 0.45, 0.35],
+                    [0.10, 0.20, 0.70],
+                ],
+                dtype=np.float32,
+            )
+            stored_pred = np.asarray([2, 0, 2, 2], dtype=np.int8)
+            for model in spcv.MODELS:
+                for fold, rows in enumerate((np.asarray([0, 1]), np.asarray([2, 3]))):
+                    fold_output = results_dir / model / f"fold_{fold}"
+                    fold_output.mkdir(parents=True)
+                    with (fold_output / "result.json").open("w", encoding="utf-8") as handle:
+                        json.dump(
+                            {
+                                "model": model,
+                                "fold": fold,
+                                "checkpoint_selection_rule": "val_search",
+                                "thresholds": {"fog": 0.2, "mist": 0.2},
+                            },
+                            handle,
+                        )
+                    np.savez_compressed(
+                        fold_output / "test_predictions.npz",
+                        row_index=rows,
+                        y_true=y_true[rows],
+                        probs=probs[rows],
+                        pred=stored_pred[rows],
+                    )
+
+            spcv.aggregate_results(
+                Namespace(
+                    folds_dir=str(folds_dir),
+                    results_dir=str(results_dir),
+                    output_dir=str(output_dir),
+                    models=",".join(spcv.MODELS),
+                    ifs_csv="",
+                    decision_rule="argmax",
+                )
+            )
+
+            pooled = pd.read_csv(output_dir / "pooled_metrics.csv")
+            self.assertEqual(set(pooled["decision_rule"]), {"argmax"})
+            expected = trainer.build_metrics(y_true, np.argmax(probs, axis=1))
+            logistic = pooled.loc[pooled["model"] == "logistic"].iloc[0]
+            self.assertAlmostEqual(float(logistic["low_vis_csi"]), expected["low_vis_csi"])
+
+            effects = pd.read_csv(output_dir / "decision_rule_effects.csv")
+            pooled_csi = effects.loc[
+                (effects["scope"] == "pooled")
+                & (effects["model"] == "logistic")
+                & (effects["metric"] == "low_vis_csi")
+            ].iloc[0]
+            self.assertNotEqual(float(pooled_csi["argmax_minus_saved"]), 0.0)
+
+            with (output_dir / "coverage_manifest.json").open("r", encoding="utf-8") as handle:
+                coverage = json.load(handle)
+            self.assertEqual(coverage["analysis_decision_rule"], "argmax")
+            self.assertFalse(coverage["all_checkpoints_selected_with_argmax"])
 
 
 if __name__ == "__main__":

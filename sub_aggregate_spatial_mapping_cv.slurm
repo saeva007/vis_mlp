@@ -16,6 +16,12 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-}"
+MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
+
+case "${MAPPING_DECISION_RULE}" in
+    argmax|val_search) ;;
+    *) echo "[preflight] invalid MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" >&2; exit 2 ;;
+esac
 
 export LOWVIS_DIFFUSION_USE_DCU=0
 export LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME=1
@@ -33,6 +39,7 @@ command=(
     --folds-dir "${RESULT_ROOT}/folds"
     --results-dir "${RESULT_ROOT}/results"
     --output-dir "${RESULT_ROOT}/aggregate"
+    --decision-rule "${MAPPING_DECISION_RULE}"
 )
 
 # Bash 4.2 on the cluster treats an empty-array expansion as an unbound

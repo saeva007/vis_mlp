@@ -32,9 +32,11 @@ cd "${REPO_ROOT}"
 for path in \
     "${SPATIAL_RESULT_ROOT}/aggregate/fold_metrics.csv" \
     "${SPATIAL_RESULT_ROOT}/aggregate/pooled_metrics.csv" \
+    "${SPATIAL_RESULT_ROOT}/aggregate/coverage_manifest.json" \
     "${SPATIAL_RESULT_ROOT}/folds/fold_manifest.json" \
     "${TEMPORAL_RESULT_ROOT}/aggregate/fold_metrics.csv" \
     "${TEMPORAL_RESULT_ROOT}/aggregate/pooled_metrics.csv" \
+    "${TEMPORAL_RESULT_ROOT}/aggregate/coverage_manifest.json" \
     "${TEMPORAL_RESULT_ROOT}/folds/fold_manifest.json"; do
     test -s "${path}"
     echo "[preflight] ${path}=OK"

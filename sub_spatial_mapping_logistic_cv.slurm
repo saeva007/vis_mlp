@@ -19,7 +19,13 @@ DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm
 RESULT_ROOT="${RESULT_ROOT:?set RESULT_ROOT}"
 FOLD="${SLURM_ARRAY_TASK_ID}"
 SEED="${MODEL_SEED:-20260815}"
+MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 OUTPUT_DIR="${RESULT_ROOT}/results/logistic/fold_${FOLD}"
+
+case "${MAPPING_DECISION_RULE}" in
+    argmax|val_search) ;;
+    *) echo "[preflight] invalid MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" >&2; exit 2 ;;
+esac
 
 export LOWVIS_DIFFUSION_USE_DCU=0
 export LOWVIS_DIFFUSION_LOAD_HIP_RUNTIME=1
@@ -36,7 +42,7 @@ test -s "${RESULT_ROOT}/folds/fold_manifest.json"
 test -s "${RESULT_ROOT}/folds/fold_${FOLD}/s2_train_indices.npy"
 test -s "${RESULT_ROOT}/folds/fold_${FOLD}/s2_val_indices.npy"
 test -s "${RESULT_ROOT}/folds/fold_${FOLD}/s2_test_indices.npy"
-echo "[preflight] logistic fold=${FOLD} indices=OK output=${OUTPUT_DIR}"
+echo "[preflight] logistic fold=${FOLD} decision=${MAPPING_DECISION_RULE} indices=OK output=${OUTPUT_DIR}"
 
 python -u "${REPO_ROOT}/spatial_mapping_cv.py" train-logistic \
     --data-dir "${DATA_DIR}" \
@@ -44,6 +50,7 @@ python -u "${REPO_ROOT}/spatial_mapping_cv.py" train-logistic \
     --output-dir "${OUTPUT_DIR}" \
     --fold "${FOLD}" \
     --seed "${SEED}" \
+    --decision-rule "${MAPPING_DECISION_RULE}" \
     --fog-ratio 0.18 \
     --mist-ratio 0.22 \
     --max-epochs 20 \

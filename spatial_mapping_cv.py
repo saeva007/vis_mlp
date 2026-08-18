@@ -8,9 +8,10 @@ adds a second, station-level separation:
 * train/validation rows contain only stations outside the held-out spatial fold;
 * test rows contain only stations in the held-out fold;
 * fold construction uses station coordinates only (never visibility labels);
-* preprocessing and decision thresholds are fitted on training/validation rows;
-* test labels are loaded only after the fitted model and validation thresholds
-  are frozen.
+* preprocessing and any model-selection decision rule use training/validation
+  rows only;
+* test labels are loaded only after the fitted model and validation decision
+  rule are frozen.
 
 Subcommands prepare deterministic fold indices, fit an instantaneous
 multinomial logistic baseline, evaluate MLP/GRU checkpoints, and aggregate the
@@ -44,6 +45,21 @@ import train_static_rnn_lowvis as rnn
 DEFAULT_DATA_DIR = "/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2"
 SPLITS = ("train", "val", "test")
 MODELS = ("logistic", "mlp", "gru")
+DECISION_RULES = ("argmax", "val_search")
+DECISION_EFFECT_METRICS = (
+    "Fog_P",
+    "Fog_R",
+    "Fog_CSI",
+    "Mist_P",
+    "Mist_R",
+    "Mist_CSI",
+    "Clear_R",
+    "low_vis_precision",
+    "low_vis_recall",
+    "low_vis_csi",
+    "false_positive_rate",
+    "accuracy",
+)
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -456,6 +472,66 @@ def _metrics_with_probabilities(y_true: np.ndarray, pred: np.ndarray, probs: np.
     return rnn.add_probability_metrics(rnn.build_metrics(y_true, pred), y_true, probs)
 
 
+def _argmax_predictions(probs: np.ndarray) -> np.ndarray:
+    values = np.asarray(probs)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError(f"Expected [n, 3] class probabilities, got {values.shape}")
+    return np.argmax(values, axis=1).astype(np.int64, copy=False)
+
+
+def _saved_decision_rule(result: Mapping[str, object]) -> str:
+    explicit = result.get("analysis_decision_rule") or result.get("decision_rule")
+    if explicit in DECISION_RULES:
+        return str(explicit)
+    thresholds = result.get("thresholds")
+    if isinstance(thresholds, Mapping) and thresholds.get("mode") == "argmax":
+        return "argmax"
+    return "val_search"
+
+
+def _primary_predictions(payload: Mapping[str, np.ndarray], decision_rule: str) -> np.ndarray:
+    if decision_rule == "argmax":
+        return _argmax_predictions(payload["probs"])
+    if decision_rule == "val_search":
+        pred = np.asarray(payload["pred"], dtype=np.int64)
+        if pred.ndim != 1 or len(pred) != len(payload["probs"]):
+            raise ValueError("Stored predictions do not align with probability rows")
+        return pred
+    raise ValueError(f"Unsupported decision rule: {decision_rule}")
+
+
+def _decision_effect_rows(
+    cv_kind: str,
+    scope: str,
+    model: str,
+    fold: Optional[int],
+    saved_rule: str,
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    saved_pred: np.ndarray,
+) -> List[Dict[str, object]]:
+    saved_metrics = rnn.build_metrics(y_true, saved_pred)
+    argmax_metrics = rnn.build_metrics(y_true, _argmax_predictions(probs))
+    rows: List[Dict[str, object]] = []
+    for metric in DECISION_EFFECT_METRICS:
+        saved_value = float(saved_metrics[metric])
+        argmax_value = float(argmax_metrics[metric])
+        rows.append(
+            {
+                "cv_kind": cv_kind,
+                "scope": scope,
+                "model": model,
+                "fold": fold,
+                "saved_decision_rule": saved_rule,
+                "metric": metric,
+                "saved_value": saved_value,
+                "argmax_value": argmax_value,
+                "argmax_minus_saved": argmax_value - saved_value,
+            }
+        )
+    return rows
+
+
 def train_logistic(args: argparse.Namespace) -> None:
     data_dir = Path(args.data_dir).resolve()
     fold_dir = Path(args.fold_dir).resolve()
@@ -498,7 +574,8 @@ def train_logistic(args: argparse.Namespace) -> None:
     )
     rng = np.random.default_rng(args.seed)
     best_model: Optional[SGDClassifier] = None
-    best_ap = -math.inf
+    best_score = -math.inf
+    best_epoch = -1
     stale = 0
     history: List[Dict[str, object]] = []
     fitted = False
@@ -522,11 +599,34 @@ def train_logistic(args: argparse.Namespace) -> None:
             model, x_val, val_indices, layout, medians, scaler, args.batch_rows
         )
         val_ap = float(average_precision_score((y_val <= 1).astype(np.int64), val_probs[:, :2].sum(axis=1)))
-        improved = val_ap > best_ap + float(args.min_delta)
-        history.append({"epoch": epoch, "val_low_vis_ap": val_ap, "improved": bool(improved)})
-        print(f"[Logistic] epoch={epoch} val_low_vis_ap={val_ap:.6f} improved={improved}", flush=True)
+        if args.decision_rule == "argmax":
+            val_pred = _argmax_predictions(val_probs)
+            val_metrics = _metrics_with_probabilities(y_val, val_pred, val_probs)
+            selection_score = float(rnn.score_metrics(_threshold_args(args), val_metrics))
+            selection_metric = "recall_csi_argmax"
+        else:
+            selection_score = val_ap
+            selection_metric = "low_vis_ap"
+        improved = selection_score > best_score + float(args.min_delta)
+        history.append(
+            {
+                "epoch": epoch,
+                "decision_rule": args.decision_rule,
+                "selection_metric": selection_metric,
+                "val_selection_score": selection_score,
+                "val_low_vis_ap": val_ap,
+                "improved": bool(improved),
+            }
+        )
+        print(
+            f"[Logistic] epoch={epoch} decision={args.decision_rule} "
+            f"selection_score={selection_score:.6f} val_low_vis_ap={val_ap:.6f} "
+            f"improved={improved}",
+            flush=True,
+        )
         if improved:
-            best_ap = val_ap
+            best_score = selection_score
+            best_epoch = epoch
             best_model = copy.deepcopy(model)
             stale = 0
         else:
@@ -536,12 +636,18 @@ def train_logistic(args: argparse.Namespace) -> None:
     if best_model is None:
         raise RuntimeError("Logistic training did not produce a validation checkpoint")
 
-    # Freeze the model and thresholds before any test target is loaded.
+    # Freeze the model and validation decision rule before any test target is loaded.
     val_probs = _predict_logistic(
         best_model, x_val, val_indices, layout, medians, scaler, args.batch_rows
     )
-    _, thresholds, val_metrics = rnn.threshold_search(_threshold_args(args), val_probs, y_val)
-    val_pred = rnn.pred_from_thresholds(val_probs, thresholds["fog"], thresholds["mist"])
+    if args.decision_rule == "argmax":
+        thresholds: Dict[str, object] = {"mode": "argmax"}
+        val_pred = _argmax_predictions(val_probs)
+    else:
+        _, thresholds, _ = rnn.threshold_search(_threshold_args(args), val_probs, y_val)
+        val_pred = rnn.pred_from_thresholds(
+            val_probs, float(thresholds["fog"]), float(thresholds["mist"])
+        )
     val_metrics = _metrics_with_probabilities(y_val, val_pred, val_probs)
 
     test_indices = _load_indices(fold_dir, "test")
@@ -551,7 +657,12 @@ def train_logistic(args: argparse.Namespace) -> None:
     test_probs = _predict_logistic(
         best_model, x_test, test_indices, layout, medians, scaler, args.batch_rows
     )
-    test_pred = rnn.pred_from_thresholds(test_probs, thresholds["fog"], thresholds["mist"])
+    if args.decision_rule == "argmax":
+        test_pred = _argmax_predictions(test_probs)
+    else:
+        test_pred = rnn.pred_from_thresholds(
+            test_probs, float(thresholds["fog"]), float(thresholds["mist"])
+        )
     test_metrics = _metrics_with_probabilities(y_test, test_pred, test_probs)
 
     joblib.dump(
@@ -594,12 +705,21 @@ def train_logistic(args: argparse.Namespace) -> None:
         "test_rows": int(len(test_indices)),
         "train_class_counts": counts.astype(int).tolist(),
         "target_class_proportions": target.tolist(),
-        "best_validation_epoch": int(pd.DataFrame(history).iloc[int(np.argmax([row["val_low_vis_ap"] for row in history]))]["epoch"]),
+        "best_validation_epoch": int(best_epoch),
+        "checkpoint_selection_metric": (
+            "recall_csi_argmax" if args.decision_rule == "argmax" else "low_vis_ap"
+        ),
+        "checkpoint_selection_rule": args.decision_rule,
+        "analysis_decision_rule": args.decision_rule,
         "thresholds": thresholds,
-        "threshold_source": threshold_source,
+        "threshold_source": (
+            "not applicable; fixed argmax decision rule"
+            if args.decision_rule == "argmax"
+            else threshold_source
+        ),
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
-        "test_access_policy": "loaded after model and thresholds were frozen",
+        "test_access_policy": "loaded after model and validation decision rule were frozen",
     }
     _atomic_json(output_dir / "result.json", result)
     print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
@@ -693,20 +813,23 @@ def evaluate_neural(args: argparse.Namespace) -> None:
     val_indices, y_val, val_probs = _neural_split_predictions(
         run_args, model, scaler, data_dir, fold_dir, "val", device, args.batch_size, args.num_workers
     )
-    threshold_mode = str(metadata.get("threshold_mode", "argmax"))
+    checkpoint_selection_rule = str(metadata.get("threshold_mode", "argmax"))
     thresholds = metadata.get("thresholds", {"mode": "argmax"})
-    if threshold_mode == "argmax" or thresholds.get("mode") == "argmax":
-        val_pred = np.argmax(val_probs, axis=1)
+    analysis_decision_rule = (
+        checkpoint_selection_rule if args.decision_rule == "checkpoint" else args.decision_rule
+    )
+    if analysis_decision_rule == "argmax":
+        val_pred = _argmax_predictions(val_probs)
     else:
         val_pred = rnn.pred_from_thresholds(val_probs, float(thresholds["fog"]), float(thresholds["mist"]))
     val_metrics = _metrics_with_probabilities(y_val, val_pred, val_probs)
 
-    # Test data are opened only after checkpoint and validation thresholds are fixed.
+    # Test data are opened only after the checkpoint and validation decision rule are fixed.
     test_indices, y_test, test_probs = _neural_split_predictions(
         run_args, model, scaler, data_dir, fold_dir, "test", device, args.batch_size, args.num_workers
     )
-    if threshold_mode == "argmax" or thresholds.get("mode") == "argmax":
-        test_pred = np.argmax(test_probs, axis=1)
+    if analysis_decision_rule == "argmax":
+        test_pred = _argmax_predictions(test_probs)
     else:
         test_pred = rnn.pred_from_thresholds(test_probs, float(thresholds["fog"]), float(thresholds["mist"]))
     test_metrics = _metrics_with_probabilities(y_test, test_pred, test_probs)
@@ -742,12 +865,14 @@ def evaluate_neural(args: argparse.Namespace) -> None:
             else "12-hour dynamic sequence + static branch; no FE block"
         ),
         "objective": str(metadata.get("loss_mode")),
+        "checkpoint_selection_rule": checkpoint_selection_rule,
+        "analysis_decision_rule": analysis_decision_rule,
         "thresholds": thresholds,
         "threshold_source": threshold_source,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
         "test_rows": int(len(test_indices)),
-        "test_access_policy": "loaded after checkpoint and thresholds were frozen",
+        "test_access_policy": "loaded after checkpoint and validation decision rule were frozen",
     }
     _atomic_json(output_dir / "result.json", result)
     print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
@@ -817,6 +942,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
     fold_rows: List[Dict[str, object]] = []
     pooled_rows: List[Dict[str, object]] = []
     station_rows: List[Dict[str, object]] = []
+    decision_effect_rows: List[Dict[str, object]] = []
+    checkpoint_rule_rows: List[Dict[str, object]] = []
     pooled_by_model: Dict[str, Dict[str, np.ndarray]] = {}
     models = [value.strip() for value in args.models.split(",") if value.strip()]
     for model in models:
@@ -829,10 +956,50 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 raise FileNotFoundError(f"Missing completed {model} fold {fold}: {fold_output}")
             with result_path.open("r", encoding="utf-8") as handle:
                 result = json.load(handle)
+            payload = _load_prediction(prediction_path)
+            saved_rule = _saved_decision_rule(result)
+            saved_pred = np.asarray(payload["pred"], dtype=np.int64)
+            primary_pred = _primary_predictions(payload, args.decision_rule)
+            y_true = np.asarray(payload["y_true"], dtype=np.int64)
+            probs = np.asarray(payload["probs"], dtype=np.float64)
+            fold_metrics = _metrics_with_probabilities(y_true, primary_pred, probs)
             fold_rows.append(
-                {"cv_kind": cv_kind, "model": model, "fold": fold, **result["test_metrics"]}
+                {
+                    "cv_kind": cv_kind,
+                    "model": model,
+                    "fold": fold,
+                    "decision_rule": args.decision_rule,
+                    **fold_metrics,
+                }
             )
-            pieces.append(_load_prediction(prediction_path))
+            decision_effect_rows.extend(
+                _decision_effect_rows(
+                    cv_kind,
+                    "fold",
+                    model,
+                    fold,
+                    saved_rule,
+                    y_true,
+                    probs,
+                    saved_pred,
+                )
+            )
+            checkpoint_rule_rows.append(
+                {
+                    "cv_kind": cv_kind,
+                    "model": model,
+                    "fold": fold,
+                    "checkpoint_selection_rule": str(
+                        result.get("checkpoint_selection_rule", saved_rule)
+                    ),
+                    "saved_prediction_rule": saved_rule,
+                    "analysis_decision_rule": args.decision_rule,
+                }
+            )
+            payload["saved_pred"] = saved_pred
+            payload["argmax_pred"] = _argmax_predictions(probs)
+            payload["pred"] = primary_pred
+            pieces.append(payload)
         combined = {name: np.concatenate([piece[name] for piece in pieces], axis=0) for name in pieces[0]}
         order = np.argsort(combined["row_index"], kind="stable")
         combined = {name: values[order] for name, values in combined.items()}
@@ -844,7 +1011,35 @@ def aggregate_results(args: argparse.Namespace) -> None:
             combined["pred"].astype(np.int64),
             combined["probs"].astype(np.float64),
         )
-        pooled_rows.append({"cv_kind": cv_kind, "model": model, "n": n_test, **metrics})
+        pooled_rows.append(
+            {
+                "cv_kind": cv_kind,
+                "model": model,
+                "n": n_test,
+                "decision_rule": args.decision_rule,
+                **metrics,
+            }
+        )
+        saved_rules = sorted(
+            {
+                str(row["saved_prediction_rule"])
+                for row in checkpoint_rule_rows
+                if row["model"] == model
+            }
+        )
+        pooled_saved_rule = saved_rules[0] if len(saved_rules) == 1 else "mixed"
+        decision_effect_rows.extend(
+            _decision_effect_rows(
+                cv_kind,
+                "pooled",
+                model,
+                None,
+                pooled_saved_rule,
+                combined["y_true"].astype(np.int64),
+                combined["probs"].astype(np.float64),
+                combined["saved_pred"].astype(np.int64),
+            )
+        )
         station_metrics = _station_metrics(
             model,
             combined["row_index"].astype(np.int64),
@@ -853,7 +1048,10 @@ def aggregate_results(args: argparse.Namespace) -> None:
             combined["probs"].astype(np.float64),
             station_ids,
         )
-        station_rows.extend({"cv_kind": cv_kind, **row} for row in station_metrics)
+        station_rows.extend(
+            {"cv_kind": cv_kind, "decision_rule": args.decision_rule, **row}
+            for row in station_metrics
+        )
         pooled_by_model[model] = combined
 
     if args.ifs_csv:
@@ -880,6 +1078,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
                     "cv_kind": cv_kind,
                     "model": "ifs_native",
                     "fold": int(fold),
+                    "decision_rule": "native_physical_visibility",
                     "low_vis_ap": float("nan"),
                     **metrics,
                 }
@@ -893,6 +1092,7 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 "cv_kind": cv_kind,
                 "model": "ifs_native",
                 "n": int(len(ifs)),
+                "decision_rule": "native_physical_visibility",
                 "low_vis_ap": float("nan"),
                 **metrics,
             }
@@ -904,6 +1104,11 @@ def aggregate_results(args: argparse.Namespace) -> None:
     fold_table.to_csv(output_dir / "fold_metrics.csv", index=False)
     pooled_table.to_csv(output_dir / "pooled_metrics.csv", index=False)
     station_table.to_csv(output_dir / "station_metrics.csv", index=False)
+    pd.DataFrame(decision_effect_rows).to_csv(
+        output_dir / "decision_rule_effects.csv", index=False
+    )
+    checkpoint_rule_table = pd.DataFrame(checkpoint_rule_rows)
+    checkpoint_rule_table.to_csv(output_dir / "checkpoint_decision_rules.csv", index=False)
 
     delta_rows: List[Dict[str, object]] = []
     metrics_to_compare = ["low_vis_ap", "low_vis_precision", "low_vis_recall", "low_vis_csi", "false_positive_rate"]
@@ -916,21 +1121,33 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 {
                     "cv_kind": cv_kind,
                     "comparison": f"{left}_minus_{right}",
+                    "decision_rule": args.decision_rule,
                     "metric": metric,
                     "delta": float(pooled_indexed.loc[left, metric] - pooled_indexed.loc[right, metric]),
                 }
             )
     pd.DataFrame(delta_rows).to_csv(output_dir / "operator_deltas.csv", index=False)
+    checkpoint_rules = sorted(
+        checkpoint_rule_table["checkpoint_selection_rule"].astype(str).unique().tolist()
+    )
     coverage = {
-        "schema_version": 1,
+        "schema_version": 2,
         "cv_kind": cv_kind,
         "fold_algorithm": fold_algorithm,
         "n_folds": n_folds,
         "frozen_test_rows": n_test,
         "models": models,
         "each_learned_model_partitions_test_exactly_once": True,
-        "threshold_policy": "fold-specific validation-frozen thresholds",
-        "primary_metric": "pooled out-of-fold low_vis_ap",
+        "analysis_decision_rule": args.decision_rule,
+        "checkpoint_selection_rules": checkpoint_rules,
+        "all_checkpoints_selected_with_argmax": checkpoint_rules == ["argmax"],
+        "threshold_policy": (
+            "probability thresholds are not used in primary predictions"
+            if args.decision_rule == "argmax"
+            else "use each fold's saved validation-frozen decision rule"
+        ),
+        "primary_metrics": ["pooled out-of-fold low_vis_csi", "pooled out-of-fold low_vis_recall"],
+        "decision_rule_effects": "decision_rule_effects.csv compares argmax with each fold's saved predictions",
         "station_metric_policy": "station rows with no positive/negative variation retain NaN AP",
         "generated_utc": pd.Timestamp.utcnow().isoformat(),
     }
@@ -968,6 +1185,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scaler-sample-rows", type=int, default=200_000)
     p.add_argument("--fog-ratio", type=float, default=0.18)
     p.add_argument("--mist-ratio", type=float, default=0.22)
+    p.add_argument(
+        "--decision-rule",
+        choices=DECISION_RULES,
+        default="argmax",
+        help="Validation/checkpoint and test classification rule for the logistic operator.",
+    )
     p.add_argument("--min-fog-precision", type=float, default=0.10)
     p.add_argument("--min-mist-precision", type=float, default=0.10)
     p.add_argument("--min-clear-recall", type=float, default=0.88)
@@ -988,6 +1211,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--device", default="")
+    p.add_argument(
+        "--decision-rule",
+        choices=["checkpoint", *DECISION_RULES],
+        default="checkpoint",
+        help="Use the checkpoint rule or explicitly override inference classification.",
+    )
     p.set_defaults(func=evaluate_neural)
 
     p = sub.add_parser("aggregate", help="Aggregate five out-of-fold operator results")
@@ -996,6 +1225,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", required=True)
     p.add_argument("--models", default=",".join(MODELS))
     p.add_argument("--ifs-csv", default="")
+    p.add_argument(
+        "--decision-rule",
+        choices=DECISION_RULES,
+        default="argmax",
+        help="Primary OOF analysis rule; argmax recomputes labels from saved probabilities.",
+    )
     p.set_defaults(func=aggregate_results)
     return parser
 

@@ -72,29 +72,42 @@ def _load_json(path: Path) -> Dict[str, object]:
         return json.load(handle)
 
 
-def _load_cv_result(result_root: Path, expected_kind: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+def _load_cv_result(
+    result_root: Path, expected_kind: str
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object], Dict[str, object]]:
     aggregate_dir = result_root / "aggregate"
     folds_dir = result_root / "folds"
     fold_path = aggregate_dir / "fold_metrics.csv"
     pooled_path = aggregate_dir / "pooled_metrics.csv"
+    coverage_path = aggregate_dir / "coverage_manifest.json"
     manifest_path = folds_dir / "fold_manifest.json"
-    for path in (fold_path, pooled_path, manifest_path):
+    for path in (fold_path, pooled_path, coverage_path, manifest_path):
         if not path.is_file():
             raise FileNotFoundError(path)
     folds = pd.read_csv(fold_path)
     pooled = pd.read_csv(pooled_path)
+    coverage = _load_json(coverage_path)
     manifest = _load_json(manifest_path)
     actual_kind = str(manifest.get("cv_kind", "spatial"))
     if actual_kind != expected_kind:
         raise ValueError(f"Expected {expected_kind} CV at {result_root}, found {actual_kind}")
+    if str(coverage.get("analysis_decision_rule", "")) != "argmax":
+        raise ValueError(f"{coverage_path} is not an argmax primary analysis")
 
-    required = {"model", "fold", "low_vis_csi", "low_vis_recall"}
+    required = {"model", "fold", "decision_rule", "low_vis_csi", "low_vis_recall"}
     if not required.issubset(folds.columns):
         raise ValueError(f"{fold_path} lacks columns: {sorted(required - set(folds.columns))}")
-    if not {"model", "low_vis_csi", "low_vis_recall"}.issubset(pooled.columns):
+    if not {"model", "decision_rule", "low_vis_csi", "low_vis_recall"}.issubset(pooled.columns):
         raise ValueError(f"{pooled_path} lacks pooled low-visibility metrics")
     folds = folds.loc[folds["model"].isin(MODEL_ORDER)].copy()
     pooled = pooled.loc[pooled["model"].isin(MODEL_ORDER)].copy()
+    fold_rules = set(folds["decision_rule"].astype(str))
+    pooled_rules = set(pooled["decision_rule"].astype(str))
+    if fold_rules != {"argmax"} or pooled_rules != {"argmax"}:
+        raise ValueError(
+            f"{expected_kind} plotted metrics must use argmax; "
+            f"fold_rules={sorted(fold_rules)} pooled_rules={sorted(pooled_rules)}"
+        )
     folds["fold"] = pd.to_numeric(folds["fold"], errors="raise").astype(int)
     for metric in ("low_vis_csi", "low_vis_recall"):
         folds[metric] = pd.to_numeric(folds[metric], errors="raise")
@@ -111,7 +124,7 @@ def _load_cv_result(result_root: Path, expected_kind: str) -> Tuple[pd.DataFrame
             raise ValueError(f"{expected_kind} {model} folds are {observed}; expected {expected_folds}")
         if int((pooled["model"] == model).sum()) != 1:
             raise ValueError(f"{expected_kind} pooled metrics must contain exactly one {model} row")
-    return folds, pooled, manifest
+    return folds, pooled, manifest, coverage
 
 
 def _temporal_tick_labels(manifest: Mapping[str, object]) -> List[str]:
@@ -212,6 +225,7 @@ def _source_table(
                     "fold_label",
                     "model",
                     "model_label",
+                    "decision_rule",
                     "low_vis_csi",
                     "low_vis_recall",
                 ]
@@ -241,6 +255,7 @@ def _summary_table(
                         "cv_type": kind,
                         "model": model,
                         "model_label": MODEL_LABELS[model],
+                        "decision_rule": "argmax",
                         "metric": metric,
                         "fold_mean": float(np.mean(values)),
                         "fold_sd": float(np.std(values, ddof=1)),
@@ -262,10 +277,10 @@ def plot_mapping_cv(
     dpi: int,
 ) -> List[Path]:
     setup_style()
-    spatial_folds, spatial_pooled, spatial_manifest = _load_cv_result(
+    spatial_folds, spatial_pooled, spatial_manifest, spatial_coverage = _load_cv_result(
         spatial_result_root.resolve(), "spatial"
     )
-    temporal_folds, temporal_pooled, temporal_manifest = _load_cv_result(
+    temporal_folds, temporal_pooled, temporal_manifest, temporal_coverage = _load_cv_result(
         temporal_result_root.resolve(), "temporal"
     )
     if int(spatial_manifest["n_folds"]) != int(temporal_manifest["n_folds"]):
@@ -367,9 +382,23 @@ def plot_mapping_cv(
             "d": "spatial-fold low-visibility recall",
         },
         "models": [MODEL_LABELS[model] for model in MODEL_ORDER],
-        "metric_definition": "binary low visibility is visibility <= 1000 m",
+        "metric_definition": "binary low visibility is visibility < 1000 m",
         "variability_definition": "five held-out fold values; no row-level error bars",
-        "threshold_policy": "fold-specific validation-frozen thresholds",
+        "decision_rule": "argmax",
+        "checkpoint_selection": {
+            "spatial": {
+                "rules": spatial_coverage.get("checkpoint_selection_rules", []),
+                "all_argmax": bool(spatial_coverage.get("all_checkpoints_selected_with_argmax", False)),
+            },
+            "temporal": {
+                "rules": temporal_coverage.get("checkpoint_selection_rules", []),
+                "all_argmax": bool(temporal_coverage.get("all_checkpoints_selected_with_argmax", False)),
+            },
+        },
+        "threshold_policy": (
+            "argmax of the three class probabilities; no model- or fold-specific "
+            "probability thresholds are used in the plotted predictions"
+        ),
         "input_artifacts": {
             "spatial": "aggregate/fold_metrics.csv and aggregate/pooled_metrics.csv",
             "temporal": "aggregate/fold_metrics.csv and aggregate/pooled_metrics.csv",
