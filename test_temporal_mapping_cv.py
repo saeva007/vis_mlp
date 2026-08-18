@@ -38,6 +38,45 @@ class TemporalFoldContractTests(unittest.TestCase):
             np.save(data_dir / f"y_{split}.npy", np.full(len(frame), 2000.0, dtype=np.float32))
             frame.to_csv(data_dir / f"meta_{split}.csv", index=False)
 
+    @staticmethod
+    def _append_train_only_terminal_month(data_dir: Path) -> None:
+        meta_path = data_dir / "meta_train.csv"
+        meta = pd.read_csv(meta_path)
+        extra = pd.DataFrame(
+            {
+                "time": [pd.Timestamp("2025-11-15 06:00:00"), pd.Timestamp("2025-11-16 06:00:00")],
+                "station_id": ["S000", "S001"],
+                "lat": [30.0, 30.0],
+                "lon": [110.0, 110.0],
+            }
+        )
+        pd.concat([meta, extra], ignore_index=True).to_csv(meta_path, index=False)
+        x_train = np.load(data_dir / "X_train.npy")
+        y_train = np.load(data_dir / "y_train.npy")
+        np.save(
+            data_dir / "X_train.npy",
+            np.concatenate([x_train, np.zeros((len(extra), x_train.shape[1]), dtype=np.float32)]),
+        )
+        np.save(
+            data_dir / "y_train.npy",
+            np.concatenate([y_train, np.full(len(extra), 2000.0, dtype=np.float32)]),
+        )
+
+    @staticmethod
+    def _remove_month_from_split(data_dir: Path, split: str, month: str) -> None:
+        meta_path = data_dir / f"meta_{split}.csv"
+        meta = pd.read_csv(meta_path)
+        keep = (
+            pd.to_datetime(meta["time"], utc=True)
+            .dt.tz_convert(None)
+            .dt.to_period("M")
+            .astype(str)
+            != month
+        ).to_numpy(dtype=bool)
+        meta.loc[keep].reset_index(drop=True).to_csv(meta_path, index=False)
+        np.save(data_dir / f"X_{split}.npy", np.load(data_dir / f"X_{split}.npy")[keep])
+        np.save(data_dir / f"y_{split}.npy", np.load(data_dir / f"y_{split}.npy")[keep])
+
     def test_temporal_prepare_partitions_test_once_and_enforces_embargo(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -110,6 +149,52 @@ class TemporalFoldContractTests(unittest.TestCase):
                         overwrite=False,
                     )
                 )
+
+    def test_temporal_prepare_handles_asymmetric_source_months(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "data"
+            folds_dir = root / "folds"
+            data_dir.mkdir()
+            self._write_dataset(data_dir)
+            self._append_train_only_terminal_month(data_dir)
+            self._remove_month_from_split(data_dir, "val", "2025-10")
+
+            tpcv.prepare_temporal_folds(
+                Namespace(
+                    data_dir=str(data_dir),
+                    output_dir=str(folds_dir),
+                    n_folds=5,
+                    embargo_hours=24.0,
+                    window_hours=12.0,
+                    chunksize=7,
+                    overwrite=False,
+                )
+            )
+
+            with (folds_dir / "fold_manifest.json").open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            expected_months = [f"2025-{month:02d}" for month in range(1, 11)]
+            self.assertEqual(manifest["analysis_months"], expected_months)
+            self.assertEqual(
+                manifest["months_excluded_from_temporal_cv"],
+                {"train": ["2025-11"], "val": [], "test": []},
+            )
+            self.assertEqual(
+                manifest["analysis_months_missing_from_split"],
+                {"train": [], "val": ["2025-10"], "test": []},
+            )
+
+            meta_train = pd.read_csv(data_dir / "meta_train.csv")
+            for fold in range(5):
+                indices = np.load(folds_dir / f"fold_{fold}" / "s2_train_indices.npy")
+                selected_months = (
+                    pd.to_datetime(meta_train.iloc[indices]["time"], utc=True)
+                    .dt.tz_convert(None)
+                    .dt.to_period("M")
+                    .astype(str)
+                )
+                self.assertNotIn("2025-11", set(selected_months))
 
 
 class MappingCVFigureTests(unittest.TestCase):

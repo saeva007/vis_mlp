@@ -140,6 +140,7 @@ def _fold_interval(months: Sequence[str], embargo_hours: float) -> Dict[str, obj
 def _indices_by_temporal_fold(
     meta_path: Path,
     fold_months: Mapping[int, Sequence[str]],
+    analysis_months: Sequence[str],
     split: str,
     embargo_hours: float,
     chunksize: int,
@@ -149,16 +150,20 @@ def _indices_by_temporal_fold(
         int(fold): _fold_interval(months, embargo_hours)
         for fold, months in fold_months.items()
     }
+    analysis_month_values = np.asarray(analysis_months, dtype=str)
     offset = 0
     for chunk in pd.read_csv(meta_path, usecols=["time"], chunksize=chunksize):
         times = _parse_times(chunk["time"], meta_path)
         months = _month_strings(times)
+        inside_analysis_calendar = np.isin(months, analysis_month_values)
         for fold, heldout in fold_months.items():
             if split == "test":
-                mask = np.isin(months, np.asarray(heldout, dtype=str))
+                mask = inside_analysis_calendar & np.isin(
+                    months, np.asarray(heldout, dtype=str)
+                )
             else:
                 interval = intervals[int(fold)]
-                mask = np.asarray(
+                mask = inside_analysis_calendar & np.asarray(
                     (times < interval["embargo_start"])
                     | (times >= interval["embargo_end_exclusive"]),
                     dtype=bool,
@@ -188,7 +193,6 @@ def prepare_temporal_folds(args: argparse.Namespace) -> None:
 
     shapes = _dataset_shapes(data_dir)
     split_scans: Dict[str, Dict[str, object]] = {}
-    reference_months: List[str] | None = None
     for split in SPLITS:
         months, meta_rows, minimum, maximum = _scan_months(
             data_dir / f"meta_{split}.csv", args.chunksize
@@ -196,21 +200,33 @@ def prepare_temporal_folds(args: argparse.Namespace) -> None:
         expected_rows = int(shapes[split]["x_shape"][0])
         if meta_rows != expected_rows:
             raise ValueError(f"meta/X row mismatch for {split}: meta={meta_rows}, X={expected_rows}")
-        if reference_months is None:
-            reference_months = months
-        elif months != reference_months:
-            raise ValueError(
-                "Formal temporal CV requires the same observed calendar months in train/val/test; "
-                f"train={reference_months}, {split}={months}"
-            )
         split_scans[split] = {
             "rows": meta_rows,
             "minimum_time_utc": minimum,
             "maximum_time_utc": maximum,
             "months": months,
         }
-    assert reference_months is not None
-    fold_months = _assign_contiguous_month_folds(reference_months, int(args.n_folds))
+
+    # The frozen test split defines which calendar months can be evaluated.
+    # A partially observed terminal month can legitimately occur only in train
+    # under the source month-tail split; it must not become an unevaluable fold
+    # or a training-only advantage in temporal CV.
+    analysis_months = [str(month) for month in split_scans["test"]["months"]]
+    missing_analysis_months = {
+        split: sorted(
+            set(analysis_months)
+            - {str(month) for month in split_scans[split]["months"]}
+        )
+        for split in SPLITS
+    }
+    excluded_months = {
+        split: sorted(
+            {str(month) for month in split_scans[split]["months"]}
+            - set(analysis_months)
+        )
+        for split in SPLITS
+    }
+    fold_months = _assign_contiguous_month_folds(analysis_months, int(args.n_folds))
 
     summary_rows: List[Dict[str, object]] = []
     indices_by_split: Dict[str, Dict[int, np.ndarray]] = {}
@@ -218,6 +234,7 @@ def prepare_temporal_folds(args: argparse.Namespace) -> None:
         by_fold, meta_rows = _indices_by_temporal_fold(
             data_dir / f"meta_{split}.csv",
             fold_months,
+            analysis_months,
             split,
             float(args.embargo_hours),
             int(args.chunksize),
@@ -292,15 +309,19 @@ def prepare_temporal_folds(args: argparse.Namespace) -> None:
     pd.DataFrame(month_rows).to_csv(output_dir / "month_folds.csv", index=False)
 
     fold_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         "cv_kind": "temporal",
         "data_dir": str(data_dir),
         "data_shapes": shapes,
         "n_folds": int(args.n_folds),
-        "algorithm": "contiguous_observed_calendar_month_blocks_v1",
+        "algorithm": "contiguous_frozen_test_calendar_month_blocks_v2",
         "balance_policy": "held-out month counts differ by at most one",
-        "observed_months": reference_months,
+        "analysis_calendar_source": "frozen_test_split",
+        "analysis_months": analysis_months,
+        "observed_months": analysis_months,
+        "analysis_months_missing_from_split": missing_analysis_months,
+        "months_excluded_from_temporal_cv": excluded_months,
         "fold_months": {str(fold): months for fold, months in fold_months.items()},
         "embargo_hours": float(args.embargo_hours),
         "input_window_hours": float(args.window_hours),
@@ -311,8 +332,8 @@ def prepare_temporal_folds(args: argparse.Namespace) -> None:
             "block; this is not rolling-origin evaluation"
         ),
         "source_split_contract": {
-            "train": "existing X_train/y_train rows outside held-out months and embargo",
-            "validation": "existing X_val/y_val rows outside held-out months and embargo",
+            "train": "existing X_train/y_train rows within the frozen-test calendar, outside held-out months and embargo",
+            "validation": "existing X_val/y_val rows within the frozen-test calendar, outside held-out months and embargo",
             "test": "existing frozen X_test/y_test rows inside held-out months",
         },
         "split_time_coverage": split_scans,
