@@ -20,6 +20,9 @@ PLOT_ENV="${PLOT_ENV:-/public/home/jarvis226/miniconda3/envs/torch}"
 PLOT_PYTHON="${PLOT_PYTHON:-${PLOT_ENV}/bin/python}"
 FIGURE_STEM="${FIGURE_STEM:-mapping_operator_spatiotemporal_cv}"
 MAPPING_GRU_LABEL="${MAPPING_GRU_LABEL:-Static-MLP + GRU (12 h)}"
+PLOT_RESTRUCTURED_FIG2="${PLOT_RESTRUCTURED_FIG2:-0}"
+IFS_COMPARISON_DIR="${IFS_COMPARISON_DIR:-}"
+CONTROLLED_SCRIPT="${CONTROLLED_SCRIPT:-/public/home/putianshu/vis_mlp/ifs_baseline/plot_viscast_controlled_attribution_composite.py}"
 
 # This script imports NumPy/pandas/matplotlib only.  Do not initialize the
 # HIP-linked Torch runtime: that emits irrelevant HyHAL warnings on CPU nodes.
@@ -66,13 +69,34 @@ if [ "${missing_input}" -ne 0 ]; then
     exit 3
 fi
 
-"${PLOT_PYTHON}" -u "${REPO_ROOT}/plot_mapping_cv_folds.py" \
-    --spatial-result-root "${SPATIAL_RESULT_ROOT}" \
-    --temporal-result-root "${TEMPORAL_RESULT_ROOT}" \
-    --output-dir "${FIGURE_OUTPUT_DIR}" \
-    --stem "${FIGURE_STEM}" \
-    --gru-label "${MAPPING_GRU_LABEL}" \
-    --formats svg,pdf,png,tiff \
-    --dpi 600
+if [ "${PLOT_RESTRUCTURED_FIG2}" = "1" ]; then
+    test -s "${IFS_COMPARISON_DIR}/ifs_diagnostic_matched_metrics.csv" || {
+        echo "ERROR: missing ${IFS_COMPARISON_DIR}/ifs_diagnostic_matched_metrics.csv" >&2
+        exit 4
+    }
+    test -s "${CONTROLLED_SCRIPT}" || {
+        echo "ERROR: missing controlled-attribution script: ${CONTROLLED_SCRIPT}" >&2
+        exit 4
+    }
+    "${PLOT_PYTHON}" -u "${REPO_ROOT}/plot_viscast_task_mapping_transfer_composite.py" \
+        --ifs-comparison-dir "${IFS_COMPARISON_DIR}" \
+        --spatial-result-root "${SPATIAL_RESULT_ROOT}" \
+        --temporal-result-root "${TEMPORAL_RESULT_ROOT}" \
+        --controlled-script "${CONTROLLED_SCRIPT}" \
+        --output-dir "${FIGURE_OUTPUT_DIR}" \
+        --stem "${FIGURE_STEM}" \
+        --gru-label "${MAPPING_GRU_LABEL}" \
+        --formats svg,pdf,png,tiff \
+        --dpi 600
+else
+    "${PLOT_PYTHON}" -u "${REPO_ROOT}/plot_mapping_cv_folds.py" \
+        --spatial-result-root "${SPATIAL_RESULT_ROOT}" \
+        --temporal-result-root "${TEMPORAL_RESULT_ROOT}" \
+        --output-dir "${FIGURE_OUTPUT_DIR}" \
+        --stem "${FIGURE_STEM}" \
+        --gru-label "${MAPPING_GRU_LABEL}" \
+        --formats svg,pdf,png,tiff \
+        --dpi 600
+fi
 
 echo "[done] mapping CV figure=${FIGURE_OUTPUT_DIR} at $(date)"
