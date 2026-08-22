@@ -8,7 +8,11 @@ set -euo pipefail
 #   - argmax for checkpoint selection and frozen-test classification
 #   - native IFS diagnostic visibility retained as the matched reference
 
-REPO_ROOT="${REPO_ROOT:-/public/home/putianshu/vis_mlp/train}"
+# Keep this dedicated IFS chain anchored to the checkout that contains this
+# launcher.  A leaked REPO_ROOT (for example from an older frozen checkout)
+# must not redirect the submitted jobs to stale workflow scripts.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="${IFS_CV_REPO_ROOT:-${SCRIPT_DIR}}"
 DATA_DIR="${DATA_DIR:-/public/home/putianshu/vis_mlp/ifs_baseline/ml_dataset_overlap_ifs_12h_pm10_pm25_source_full}"
 RUN_ID="${RUN_ID:-mapping_cv_ifs_gru_argmax_$(date +%Y%m%d_%H%M%S)}"
 SPATIAL_BUNDLE_ID="${SPATIAL_BUNDLE_ID:-${RUN_ID}_spatial}"
@@ -37,4 +41,7 @@ echo "[ifs-gru] temporal_result=${TEMPORAL_RESULT_ROOT}"
 echo "[ifs-gru] local_cache=${LOWVIS_RNN_LOCAL_CACHE_DIR}/${LOWVIS_RNN_LOCAL_CACHE_ID}"
 echo "[ifs-gru] native_ifs_baseline=${IFS_PER_SAMPLE_CSV}"
 
-exec bash "${REPO_ROOT}/submit_mapping_cv_argmax_full_chain.sh" "$@"
+# Submit the complete DAG in this process.  The shared dispatcher already
+# assigns afterok dependencies (prepare -> fold array -> aggregate -> plot),
+# so there is no need for a detached local worker to submit later stages.
+exec bash "${REPO_ROOT}/submit_mapping_cv_argmax_full_chain.sh" --worker "$@"
