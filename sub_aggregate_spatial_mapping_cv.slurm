@@ -20,6 +20,7 @@ IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-${DEFAULT_IFS_PER_SAMPLE_CSV}}"
 REQUIRE_IFS_BASELINE="${REQUIRE_IFS_BASELINE:-1}"
 MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 MAPPING_MODELS="${MAPPING_MODELS:-logistic,mlp,gru}"
+MAPPING_CV_SEEDS="${MAPPING_CV_SEEDS:-}"
 
 case "${MAPPING_DECISION_RULE}" in
     argmax|val_search) ;;
@@ -45,6 +46,15 @@ command=(
     --models "${MAPPING_MODELS}"
     --decision-rule "${MAPPING_DECISION_RULE}"
 )
+
+if [ -n "${MAPPING_CV_SEEDS}" ]; then
+    if [ "${MAPPING_DECISION_RULE}" != "argmax" ]; then
+        echo "ERROR: P13 seed aggregation requires MAPPING_DECISION_RULE=argmax" >&2
+        exit 2
+    fi
+    command+=(--seeds "${MAPPING_CV_SEEDS}")
+    echo "[preflight] P13 seed ensemble=${MAPPING_CV_SEEDS}"
+fi
 
 # The formal mapping figure requires the native IFS diagnostic on the same
 # frozen-test rows.  Fail closed rather than silently producing learned-only

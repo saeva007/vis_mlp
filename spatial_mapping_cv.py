@@ -1090,6 +1090,113 @@ def _parse_models(raw_models: str) -> List[str]:
     return models
 
 
+def _parse_seed_list(raw_seeds: str) -> List[int]:
+    """Parse an optional, ordered P13 seed list without accepting duplicates."""
+
+    values = [
+        value.strip()
+        for value in str(raw_seeds or "").replace(":", ",").split(",")
+        if value.strip()
+    ]
+    if not values:
+        return []
+    try:
+        seeds = [int(value) for value in values]
+    except ValueError as exc:
+        raise ValueError(f"Invalid seed list: {raw_seeds!r}") from exc
+    if any(seed < 0 for seed in seeds):
+        raise ValueError(f"Seeds must be non-negative: {seeds}")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"Duplicate seeds are not allowed: {seeds}")
+    return seeds
+
+
+def _load_fold_seed_ensemble(
+    fold_output: Path,
+    model: str,
+    fold: int,
+    seeds: Sequence[int],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
+    """Load one fold's P13 member outputs and average post-softmax probabilities.
+
+    A CV test fold is valid only when all member outputs carry the same frozen
+    row indices and observed labels.  Keeping this check here prevents a
+    same-length but differently ordered seed output from being silently averaged.
+    """
+
+    payloads: List[Dict[str, np.ndarray]] = []
+    checkpoints: List[str] = []
+    run_configs: List[str] = []
+    for seed in seeds:
+        seed_dir = fold_output / f"seed_{int(seed)}"
+        result_path = seed_dir / "result.json"
+        prediction_path = seed_dir / "test_predictions.npz"
+        if not result_path.is_file() or not prediction_path.is_file():
+            raise FileNotFoundError(
+                f"Missing completed P13 {model} fold {fold} seed {seed}: {seed_dir}"
+            )
+        with result_path.open("r", encoding="utf-8") as handle:
+            result = json.load(handle)
+        if int(result.get("seed", -1)) != int(seed):
+            raise ValueError(
+                f"{model} fold {fold} seed directory {seed_dir} records "
+                f"seed={result.get('seed')!r}"
+            )
+        if _saved_decision_rule(result) != "argmax":
+            raise ValueError(
+                f"P13 {model} fold {fold} seed {seed} was not selected with argmax"
+            )
+        payload = _load_prediction(prediction_path)
+        required = {"row_index", "y_true", "probs", "pred"}
+        missing = required - set(payload)
+        if missing:
+            raise KeyError(f"{prediction_path} is missing fields: {sorted(missing)}")
+        probabilities = np.asarray(payload["probs"], dtype=np.float64)
+        if probabilities.ndim != 2 or probabilities.shape[1] != 3:
+            raise ValueError(
+                f"{prediction_path} has invalid class-probability shape {probabilities.shape}"
+            )
+        if not np.isfinite(probabilities).all() or np.any(probabilities.sum(axis=1) <= 0):
+            raise ValueError(f"{prediction_path} has invalid class probabilities")
+        payloads.append(payload)
+        checkpoints.append(str(result.get("checkpoint", "")))
+        run_configs.append(str(result.get("run_config", "")))
+
+    reference = payloads[0]
+    row_index = np.asarray(reference["row_index"], dtype=np.int64)
+    y_true = np.asarray(reference["y_true"], dtype=np.int64)
+    for seed, payload in zip(seeds[1:], payloads[1:]):
+        if not np.array_equal(np.asarray(payload["row_index"], dtype=np.int64), row_index):
+            raise ValueError(f"P13 {model} fold {fold} seed {seed} row indices do not match")
+        if not np.array_equal(np.asarray(payload["y_true"], dtype=np.int64), y_true):
+            raise ValueError(f"P13 {model} fold {fold} seed {seed} labels do not match")
+
+    mean_probs = np.mean(
+        np.stack([np.asarray(payload["probs"], dtype=np.float64) for payload in payloads], axis=0),
+        axis=0,
+    )
+    mean_probs /= mean_probs.sum(axis=1, keepdims=True)
+    if not np.isfinite(mean_probs).all():
+        raise ValueError(f"P13 {model} fold {fold} mean probabilities are non-finite")
+    pred = _argmax_predictions(mean_probs)
+    return (
+        {
+            "row_index": row_index,
+            "y_true": y_true,
+            "probs": mean_probs.astype(np.float32),
+            # P13's stored decision rule is the argmax of the seed-mean softmax.
+            "pred": pred,
+        },
+        {
+            "member_seeds": [int(seed) for seed in seeds],
+            "ensemble_size": int(len(seeds)),
+            "combination": "equal_weight_mean_post_softmax_then_argmax",
+            "checkpoints": checkpoints,
+            "run_configs": run_configs,
+        },
+    )
+
+
 def _station_metrics(
     model: str,
     row_index: np.ndarray,
@@ -1156,20 +1263,43 @@ def aggregate_results(args: argparse.Namespace) -> None:
     checkpoint_rule_rows: List[Dict[str, object]] = []
     pooled_by_model: Dict[str, Dict[str, np.ndarray]] = {}
     models = _parse_models(args.models)
+    seeds = _parse_seed_list(args.seeds)
+    ensemble_size = int(len(seeds) or 1)
+    member_seed_text = ",".join(str(seed) for seed in seeds)
+    if seeds and args.decision_rule != "argmax":
+        raise ValueError(
+            "Seed-mean P13 aggregation is defined as mean post-softmax probabilities "
+            "followed by argmax; use --decision-rule argmax."
+        )
     for model in models:
+        if seeds and model == "logistic":
+            raise ValueError("P13 seed aggregation is supported for neural MLP/GRU outputs only")
         pieces: List[Dict[str, np.ndarray]] = []
         for fold in range(n_folds):
             fold_output = results_dir / model / f"fold_{fold}"
-            result_path = fold_output / "result.json"
-            prediction_path = fold_output / "test_predictions.npz"
-            if not result_path.is_file() or not prediction_path.is_file():
-                raise FileNotFoundError(f"Missing completed {model} fold {fold}: {fold_output}")
-            with result_path.open("r", encoding="utf-8") as handle:
-                result = json.load(handle)
-            payload = _load_prediction(prediction_path)
-            saved_rule = _saved_decision_rule(result)
-            saved_pred = np.asarray(payload["pred"], dtype=np.int64)
-            primary_pred = _primary_predictions(payload, args.decision_rule)
+            ensemble_info: Dict[str, object] = {}
+            if seeds:
+                payload, ensemble_info = _load_fold_seed_ensemble(
+                    fold_output, model, fold, seeds
+                )
+                saved_rule = "argmax_mean_softmax"
+                saved_pred = np.asarray(payload["pred"], dtype=np.int64)
+                primary_pred = _argmax_predictions(np.asarray(payload["probs"], dtype=np.float64))
+                result = {
+                    "checkpoint_selection_rule": "argmax",
+                    "analysis_decision_rule": "argmax",
+                }
+            else:
+                result_path = fold_output / "result.json"
+                prediction_path = fold_output / "test_predictions.npz"
+                if not result_path.is_file() or not prediction_path.is_file():
+                    raise FileNotFoundError(f"Missing completed {model} fold {fold}: {fold_output}")
+                with result_path.open("r", encoding="utf-8") as handle:
+                    result = json.load(handle)
+                payload = _load_prediction(prediction_path)
+                saved_rule = _saved_decision_rule(result)
+                saved_pred = np.asarray(payload["pred"], dtype=np.int64)
+                primary_pred = _primary_predictions(payload, args.decision_rule)
             y_true = np.asarray(payload["y_true"], dtype=np.int64)
             probs = np.asarray(payload["probs"], dtype=np.float64)
             fold_metrics = _metrics_with_probabilities(y_true, primary_pred, probs)
@@ -1180,6 +1310,10 @@ def aggregate_results(args: argparse.Namespace) -> None:
                     "model": model,
                     "fold": fold,
                     "decision_rule": args.decision_rule,
+                    "ensemble_size": int(ensemble_info.get("ensemble_size", 1)),
+                    "member_seeds": ",".join(
+                        str(seed) for seed in ensemble_info.get("member_seeds", [])
+                    ),
                     **fold_metrics,
                 }
             )
@@ -1205,6 +1339,10 @@ def aggregate_results(args: argparse.Namespace) -> None:
                     ),
                     "saved_prediction_rule": saved_rule,
                     "analysis_decision_rule": args.decision_rule,
+                    "ensemble_size": int(ensemble_info.get("ensemble_size", 1)),
+                    "member_seeds": ",".join(
+                        str(seed) for seed in ensemble_info.get("member_seeds", [])
+                    ),
                 }
             )
             payload["saved_pred"] = saved_pred
@@ -1229,6 +1367,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 "model": model,
                 "n": n_test,
                 "decision_rule": args.decision_rule,
+                "ensemble_size": ensemble_size,
+                "member_seeds": member_seed_text,
                 **metrics,
             }
         )
@@ -1265,6 +1405,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
                 "cv_kind": cv_kind,
                 "sample_scope": "full_frozen_test_for_learned_operators",
                 "decision_rule": args.decision_rule,
+                "ensemble_size": ensemble_size,
+                "member_seeds": member_seed_text,
                 **row,
             }
             for row in station_metrics
@@ -1318,6 +1460,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
                         "fold": fold,
                         "n": int(len(fold_indices)),
                         "decision_rule": args.decision_rule,
+                        "ensemble_size": ensemble_size,
+                        "member_seeds": member_seed_text,
                         **model_metrics,
                     }
                 )
@@ -1352,6 +1496,8 @@ def aggregate_results(args: argparse.Namespace) -> None:
                     "model": model,
                     "n": int(len(ifs_row_index)),
                     "decision_rule": args.decision_rule,
+                    "ensemble_size": ensemble_size,
+                    "member_seeds": member_seed_text,
                     **model_metrics,
                 }
             )
@@ -1425,6 +1571,13 @@ def aggregate_results(args: argparse.Namespace) -> None:
         "n_folds": n_folds,
         "frozen_test_rows": n_test,
         "models": models + (["ifs_native"] if ifs_provenance is not None else []),
+        "seed_ensemble": {
+            "enabled": bool(seeds),
+            "member_seeds": [int(seed) for seed in seeds],
+            "combination": (
+                "equal_weight_mean_post_softmax_then_argmax" if seeds else "single_checkpoint"
+            ),
+        },
         "each_learned_model_partitions_test_exactly_once": True,
         "analysis_decision_rule": args.decision_rule,
         "checkpoint_selection_rules": checkpoint_rules,
@@ -1529,6 +1682,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--results-dir", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--models", default=",".join(MODELS))
+    p.add_argument(
+        "--seeds",
+        default="",
+        help=(
+            "Optional comma/colon-separated neural seed ensemble. Each fold is read from "
+            "results/<model>/fold_<k>/seed_<seed>/ and combined by mean post-softmax then argmax."
+        ),
+    )
     p.add_argument("--ifs-csv", default="")
     p.add_argument(
         "--decision-rule",

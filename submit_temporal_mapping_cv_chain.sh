@@ -14,6 +14,8 @@ MAPPING_DECISION_RULE="${MAPPING_DECISION_RULE:-argmax}"
 MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY:-5}"
 MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY:-4}"
 MAPPING_MODELS="${MAPPING_MODELS:-logistic,mlp,gru}"
+MAPPING_P13="${MAPPING_P13:-0}"
+MAPPING_CV_SEEDS="${MAPPING_CV_SEEDS:-}"
 IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV:-/public/home/putianshu/vis_mlp/static_rnn_eval_results/p13_seed_mean_timefix_20260719_130856_paper_figures/exp_20260718_232510_p13_sampling_calibration_manual_retry_p13_seed42_2_proposed_rare_event_focal/per_sample_eval.csv}"
 STATE_FILE="${STATE_FILE:-${RESULT_ROOT}/submission_state.sh}"
 SUBMIT_LOG="${SUBMIT_LOG:-${RESULT_ROOT}/submission.log}"
@@ -32,6 +34,8 @@ write_state() {
         printf 'MAPPING_LOGISTIC_CONCURRENCY=%q\n' "${MAPPING_LOGISTIC_CONCURRENCY}"
         printf 'MAPPING_NEURAL_CONCURRENCY=%q\n' "${MAPPING_NEURAL_CONCURRENCY}"
         printf 'MAPPING_MODELS=%q\n' "${MAPPING_MODELS}"
+        printf 'MAPPING_P13=%q\n' "${MAPPING_P13}"
+        printf 'MAPPING_CV_SEEDS=%q\n' "${MAPPING_CV_SEEDS}"
         printf 'IFS_PER_SAMPLE_CSV=%q\n' "${IFS_PER_SAMPLE_CSV}"
         printf 'PREP_JOB_ID=%q\n' "${PREP_JOB_ID:-}"
         printf 'LOGISTIC_JOB_ID=%q\n' "${LOGISTIC_JOB_ID:-}"
@@ -59,6 +63,7 @@ if [ "${1:-}" != "--worker" ]; then
         MAPPING_LOGISTIC_CONCURRENCY="${MAPPING_LOGISTIC_CONCURRENCY}" \
         MAPPING_NEURAL_CONCURRENCY="${MAPPING_NEURAL_CONCURRENCY}" \
         MAPPING_MODELS="${MAPPING_MODELS}" \
+        MAPPING_P13="${MAPPING_P13}" MAPPING_CV_SEEDS="${MAPPING_CV_SEEDS}" \
         IFS_PER_SAMPLE_CSV="${IFS_PER_SAMPLE_CSV}" \
         STATE_FILE="${STATE_FILE}" \
         SUBMIT_LOG="${SUBMIT_LOG}" \
@@ -78,6 +83,7 @@ echo "[worker] result_root=${RESULT_ROOT}"
 echo "[worker] spatial_result_root=${SPATIAL_RESULT_ROOT:-not_set}"
 echo "[worker] embargo=${TEMPORAL_EMBARGO_HOURS}h window=${INPUT_WINDOW_HOURS}h"
 echo "[worker] decision_rule=${MAPPING_DECISION_RULE} models=${MAPPING_MODELS} logistic_concurrency=${MAPPING_LOGISTIC_CONCURRENCY} neural_concurrency=${MAPPING_NEURAL_CONCURRENCY}"
+echo "[worker] p13=${MAPPING_P13} cv_seeds=${MAPPING_CV_SEEDS:-single_seed}"
 echo "[worker] ifs_per_sample=${IFS_PER_SAMPLE_CSV}"
 
 case "${MAPPING_DECISION_RULE}" in
@@ -106,6 +112,23 @@ if [ "${#REQUESTED_MODELS[@]}" -eq 0 ]; then
     exit 2
 fi
 export MAPPING_MODELS
+
+if [ -n "${MAPPING_CV_SEEDS}" ]; then
+    if [ "${MAPPING_P13}" != "1" ] || [ "${MAPPING_DECISION_RULE}" != "argmax" ]; then
+        echo "[preflight] seed-ensemble CV requires MAPPING_P13=1 and MAPPING_DECISION_RULE=argmax" >&2
+        exit 2
+    fi
+    if [ "${#REQUESTED_MODELS[@]}" -ne 1 ] || [ "${REQUESTED_MODELS[0]}" != "gru" ]; then
+        echo "[preflight] seed-ensemble CV is defined for the GRU mapping model only" >&2
+        exit 2
+    fi
+    MAPPING_CV_SEED_COUNT="$(printf '%s' "${MAPPING_CV_SEEDS}" | tr ':,' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+    case "${MAPPING_CV_SEED_COUNT}" in
+        ''|0|*[!0-9]*) echo "[preflight] invalid MAPPING_CV_SEEDS=${MAPPING_CV_SEEDS}" >&2; exit 2 ;;
+    esac
+else
+    MAPPING_CV_SEED_COUNT=0
+fi
 
 for required in \
     temporal_mapping_cv.py \
@@ -159,7 +182,10 @@ write_state
 
 NEURAL_JOB_ID=""
 NEURAL_EXPORT="ALL,REPO_ROOT=${REPO_ROOT},DATA_DIR=${DATA_DIR},RESULT_ROOT=${RESULT_ROOT},BUNDLE_ID=${BUNDLE_ID},CV_PREFIX=tpcv,MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}"
-if [ -n "${MODEL_SEEN[mlp]:-}" ] && [ -n "${MODEL_SEEN[gru]:-}" ]; then
+if [ "${MAPPING_CV_SEED_COUNT}" -gt 0 ]; then
+    NEURAL_ARRAY="0-$(( MAPPING_CV_SEED_COUNT * 5 - 1 ))%${MAPPING_NEURAL_CONCURRENCY}"
+    NEURAL_EXPORT="${NEURAL_EXPORT},MAPPING_NEURAL_MODEL=gru,MAPPING_P13=1,MAPPING_CV_SEEDS=${MAPPING_CV_SEEDS}"
+elif [ -n "${MODEL_SEEN[mlp]:-}" ] && [ -n "${MODEL_SEEN[gru]:-}" ]; then
     NEURAL_ARRAY="0-9%${MAPPING_NEURAL_CONCURRENCY}"
 elif [ -n "${MODEL_SEEN[mlp]:-}" ]; then
     NEURAL_ARRAY="0-4%${MAPPING_NEURAL_CONCURRENCY}"
@@ -196,7 +222,7 @@ fi
 AGGREGATE_JOB_ID=$(sbatch --parsable \
     --job-name=tpcv_aggregate \
     --dependency="${AGGREGATE_DEPENDENCY}" \
-    --export="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV},REQUIRE_IFS_BASELINE=1,MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE}" \
+    --export="ALL,REPO_ROOT=${REPO_ROOT},RESULT_ROOT=${RESULT_ROOT},IFS_PER_SAMPLE_CSV=${IFS_PER_SAMPLE_CSV},REQUIRE_IFS_BASELINE=1,MAPPING_DECISION_RULE=${MAPPING_DECISION_RULE},MAPPING_CV_SEEDS=${MAPPING_CV_SEEDS}" \
     "${REPO_ROOT}/sub_aggregate_spatial_mapping_cv.slurm")
 AGGREGATE_JOB_ID="${AGGREGATE_JOB_ID%%;*}"
 SUBMISSION_STATUS=aggregate_submitted
