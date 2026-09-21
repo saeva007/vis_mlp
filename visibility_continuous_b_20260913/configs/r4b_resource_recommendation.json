@@ -1,0 +1,26 @@
+{
+  "training_dcu_count": 1,
+  "allocated_dcu_count": 4,
+  "batch_size_per_rank": 4096,
+  "effective_batch_size": 4096,
+  "precision": "fp32",
+  "num_workers_total": 16,
+  "fast_validation": {
+    "interval_steps": 500,
+    "fixed_samples": 50000,
+    "draws": 16
+  },
+  "full_validation": {
+    "interval_steps": 5000,
+    "samples": 1748137,
+    "draws": 64
+  },
+  "test": {
+    "samples": 1753078,
+    "draws": 256,
+    "dcu_count": 4,
+    "parallelism": "sample_sharding"
+  },
+  "benchmark_job": "121994569",
+  "estimated_wall_hours_to_100k_excluding_test": 5.0
+}

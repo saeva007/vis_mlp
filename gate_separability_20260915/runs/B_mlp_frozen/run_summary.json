@@ -1,0 +1,16 @@
+{
+  "experiment_id": "Gate-separability-28.9/B",
+  "name": "B_mlp_frozen",
+  "date": "2026-09-15",
+  "status": "finished",
+  "gate_definition": "y_gate = 1[V >= 28.9 km]",
+  "model": "Frozen current-R5 encoder plus 256-64-1 MLP sigmoid probe",
+  "best_step": 20000,
+  "actual_stop_step": 20000,
+  "stop_reason": "max_steps",
+  "wall_seconds": 1288.2866575717926,
+  "resources": {"nodes": 1, "DCUs": 4, "CPUs": 32, "workers_total": 16, "effective_batch_size": 4096},
+  "test_all": {"n": 1753078, "positive_n": 431447, "AUROC": 0.8751269424547489, "AP": 0.702347571807551, "balanced_accuracy": 0.7322641600383086, "precision": 0.7033579266558125, "recall": 0.5386965258768748, "Brier": 0.11774630332799753},
+  "full_result": "../../gate_separability_summary.json",
+  "conclusion": "The nonlinear head provides a limited gain and does not make the 28.9 km label cleanly separable."
+}

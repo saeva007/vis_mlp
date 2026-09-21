@@ -1,0 +1,19 @@
+{
+  "experiment_id": "Gate-separability-28.9",
+  "date": "2026-09-15",
+  "status": "finished",
+  "question": "Can current inputs reliably separate V >= 28.9 km?",
+  "gate_definition": "y_gate = 1[V >= 28.9 km]",
+  "decision_threshold": 0.5,
+  "source_result": "C:/Users/Alienware/Documents/ChatGPT/vis/gate_separability_20260915/gate_separability_summary.json",
+  "test": {
+    "n": 1753078,
+    "positive_n": 431447,
+    "linear_frozen": {"best_step": 10000, "AUROC": 0.8666107534811607, "AP": 0.6849579399158692, "balanced_accuracy": 0.7198195397793565, "precision": 0.6991439777472231, "recall": 0.5114927210062882, "Brier": 0.12118580101102619},
+    "mlp_frozen": {"best_step": 20000, "AUROC": 0.8751269424547489, "AP": 0.702347571807551, "balanced_accuracy": 0.7322641600383086, "precision": 0.7033579266558125, "recall": 0.5386965258768748, "Brier": 0.11774630332799753},
+    "mlp_end_to_end": {"best_step": 20000, "AUROC": 0.8785623918936887, "AP": 0.7113015503602147, "balanced_accuracy": 0.7381408648664527, "precision": 0.7052113740424082, "recall": 0.5515463081212756, "Brier": 0.116049532796157}
+  },
+  "margin_analysis_km": [0.2, 0.5, 1.0],
+  "mlp_end_to_end_exclude_pm_1km": {"AUROC": 0.8874248259766842, "AP": 0.7225889928451751, "precision": 0.7126836585434025, "recall": 0.5669778083044675, "Brier": 0.10990799367374075},
+  "conclusion": "The 28.9 km Gate is limited mainly by label/feature overlap. More head capacity and encoder fine-tuning provide only limited gains, so 28.9 km should not be used as a hard weather regime boundary."
+}

@@ -1,0 +1,17 @@
+{
+  "experiment_id": "Gate-separability-28.9/C",
+  "name": "C_mlp_e2e",
+  "date": "2026-09-15",
+  "status": "finished",
+  "gate_definition": "y_gate = 1[V >= 28.9 km]",
+  "model": "Current-R5 encoder end-to-end fine-tuning plus 256-64-1 MLP sigmoid probe",
+  "best_step": 20000,
+  "actual_stop_step": 20000,
+  "stop_reason": "max_steps",
+  "wall_seconds": 2592.9735770225525,
+  "resources": {"nodes": 1, "DCUs": 4, "CPUs": 32, "workers_total": 16, "effective_batch_size": 4096},
+  "test_all": {"n": 1753078, "positive_n": 431447, "AUROC": 0.8785623918936887, "AP": 0.7113015503602147, "balanced_accuracy": 0.7381408648664527, "precision": 0.7052113740424082, "recall": 0.5515463081212756, "Brier": 0.116049532796157},
+  "test_excluding_pm_1km": {"AUROC": 0.8874248259766842, "AP": 0.7225889928451751, "precision": 0.7126836585434025, "recall": 0.5669778083044675, "Brier": 0.10990799367374075},
+  "full_result": "../../gate_separability_summary.json",
+  "conclusion": "End-to-end fine-tuning adds only a small gain; even excluding ±1 km does not qualitatively change separability."
+}

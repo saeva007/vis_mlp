@@ -1,0 +1,38 @@
+{
+  "experiment_id": "R5-Cap",
+  "date": "2026-09-15",
+  "status": "S1_running",
+  "remote_project_root": "/public/home/putianshu/vis_mlp/visibility_r5_cap_20260915",
+  "config": "/public/home/putianshu/vis_mlp/visibility_r5_cap_20260915/configs/r5_cap.json",
+  "run": "/public/home/putianshu/vis_mlp/visibility_r5_cap_20260915/runs/R5-Cap/seed1",
+  "question": "Does a soft exact-30-km point-mass mixture improve over the current 28.9-km Gate baseline?",
+  "model": "Current R5 backbone + simple CapQuery/CapHead + unchanged conditional diffusion head",
+  "cap_definition": "y_cap = 1[V == 30 km]; p_cap is a soft mixture weight and never a hard router",
+  "continuous_target": "z_norm from z=log(3.912/V - 3.912/30), eligible 0<V<30 km",
+  "loss": "Unweighted Cap BCE on all samples + unchanged diffusion v-prediction loss + lambda_boundary=1 unchanged SNR-weighted boundary loss on eligible samples",
+  "probability_mixture": {
+    "lt500m": "(1-p_cap)*q_lt500m",
+    "500_1000m": "(1-p_cap)*q_500_1000m",
+    "ge1000m": "p_cap+(1-p_cap)*q_ge1000m"
+  },
+  "initialization": "Independent S1 training from scratch; no reuse of semantically incompatible Gate weights",
+  "S1": {"status": "running", "job_id": "122175875", "node": "e14r2n09", "data": "/public/home/putianshu/vis_mlp/ml_dataset_pmst_v5_aligned_12h_pm10_pm25", "max_steps": 40000},
+  "S2": {"status": "not_started", "data": "/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2", "max_steps": 100000},
+  "resources": {"allocated_dcu_count": 4, "training_dcu_count": 1, "validator_dcu_count": 4, "cpu_cores": 32, "batch_size": 1024, "num_workers": 16, "precision": "fp32"},
+  "sanity": {
+    "status": "passed",
+    "job_id": "122175352",
+    "exit_code": "0:0",
+    "p_cap_min": 0.40934568643569946,
+    "p_cap_max": 0.5319842100143433,
+    "probability_sum_max_error": 0.0,
+    "loss_finite": true,
+    "probabilities_finite": true,
+    "generated_min_E": 0.13436611940068932,
+    "generated_max_V_km": 29.11448226270596,
+    "E_le_Emin_count": 0,
+    "V_ge_30km_count": 0
+  },
+  "results": null,
+  "conclusion": "Implementation and sanity checks passed; independent formal S1 is running."
+}

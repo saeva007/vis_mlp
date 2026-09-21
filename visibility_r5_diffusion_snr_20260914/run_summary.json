@@ -1,0 +1,67 @@
+{
+  "experiment_id": "R5-current-gate-baseline",
+  "registered_date": "2026-09-15",
+  "status": "finished",
+  "immutable_baseline": true,
+  "remote_project_root": "/public/home/putianshu/vis_mlp/visibility_r5_diffusion_snr_20260914",
+  "config": "/public/home/putianshu/vis_mlp/visibility_r5_diffusion_snr_20260914/configs/r5.json",
+  "run": "/public/home/putianshu/vis_mlp/visibility_r5_diffusion_snr_20260914/runs/R5-Diffusion/seed1",
+  "model": "DynamicTokenizer + 6-layer pre-LN Transformer d256 + static/aerosol contexts + GateQuery + ContinuousQuery + 4-block conditional diffusion",
+  "gate_definition": "y_gate = 1[V >= 28.9 km]",
+  "continuous_target": "z_norm from z=log(3.912/V - 3.912/28.9), eligible 0<V<28.9 km",
+  "loss": "Gate BCE + diffusion v-prediction loss + lambda_boundary=1 SNR-weighted boundary loss",
+  "S1": {
+    "status": "finished",
+    "steps": 40000,
+    "processed_samples": 40960000,
+    "wall_seconds": 5647.99,
+    "handoff_best_step": 35000,
+    "weights": "EMA",
+    "best_forward_objective": {"total": 2.0049183, "gate": 0.3346738, "diffusion": 1.4608172, "boundary_raw": 0.9608672, "boundary_snr": 0.2094273}
+  },
+  "S2": {
+    "status": "finished",
+    "steps": 100000,
+    "processed_samples": 102400000,
+    "wall_seconds": 13300.855,
+    "validated_checkpoints": 20,
+    "screening_best_step": 85000,
+    "screening_best_checkpoint": "/public/home/putianshu/vis_mlp/visibility_r5_diffusion_snr_20260914/runs/R5-Diffusion/seed1/S2/checkpoints/ckpt_step_85000.pt",
+    "screening_mean_event_AP": 0.2178144887,
+    "screening_mean_event_CSI": 0.1397610365
+  },
+  "final_evaluation": {
+    "status": "finished",
+    "job_id": "122086433",
+    "exit_code": "0:0",
+    "elapsed": "1-01:01:07",
+    "checkpoint_step": 85000,
+    "candidate_review_draws": 128,
+    "candidate_review_wall_seconds": 29872.776456832886,
+    "test_draws": 256,
+    "test_wall_seconds": 59843.276773929596,
+    "validator_dcu_count": 4,
+    "reverse_steps": 100,
+    "predictions": "/public/home/putianshu/vis_mlp/visibility_r5_diffusion_snr_20260914/runs/R5-Diffusion/seed1/S2/test_metrics_predictions.npz"
+  },
+  "test": {
+    "samples": 1753078,
+    "events_including_v0": {
+      "lt500m": {"Recall": 0.5596357665323183, "Precision": 0.20734472650848956, "CSI": 0.1782606628310589, "F1": 0.3025827280064568, "AP": 0.28791860863176166, "support": 20097},
+      "500_1000m": {"Recall": 0.0, "Precision": 0.0, "CSI": 0.0, "F1": 0.0, "AP": 0.08274120479827841, "support": 14471},
+      "lt1000m": {"Recall": 0.48165933811617684, "Precision": 0.3069520491123279, "CSI": 0.23073405302032954, "F1": 0.3749535530508608, "AP": 0.33531553517339086, "support": 34568}
+    },
+    "events_excluding_v0": {
+      "lt500m": {"Recall": 0.5106341715689443, "Precision": 0.155201886236369, "CSI": 0.13510647395877876, "F1": 0.23805075040684706, "AP": 0.19686767614505524, "support": 15469},
+      "500_1000m": {"Recall": 0.0, "Precision": 0.0, "CSI": 0.0, "F1": 0.0, "AP": 0.08372493479535119, "support": 14471},
+      "lt1000m": {"Recall": 0.44428857715430864, "Precision": 0.26136162687886827, "CSI": 0.19697037004131313, "F1": 0.32911486361105957, "AP": 0.2687801264452798, "support": 29940}
+    },
+    "mean_event_AP": 0.23532511620114363,
+    "mean_event_CSI": 0.13633157195046283,
+    "gate": {"accuracy": 0.8254595631226905, "precision": 0.6976857045617839, "recall": 0.5131522527680109, "AUROC": 0.8681204704594139, "AP": 0.688598195403565, "Brier": 0.12081852555274963},
+    "continuous": {"MAE_km": 5.244032859802246, "RMSE_km": 6.801276683807373, "MAE_v_lt_1km": 4.980605602264404, "MAE_v_lt_0p5km": 5.331880569458008},
+    "CRPS_V_km": 3.144035224685745,
+    "physical_support": {"generated_draws": 448787968, "E_le_Emin_count": 0, "continuous_V_ge_Vc_count": 0}
+  },
+  "conclusion": "The current R5 detects some <500 m and <1000 m events, but predicts no 500-1000 m cases by argmax and retains roughly 5 km low-visibility MAE; the 28.9 km Gate baseline does not solve the core middle-class or continuous-value distortion."
+}

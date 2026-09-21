@@ -1,8 +1,12 @@
 node_modules/
+.venv/
 
 __pycache__/
+**/__pycache__/
 .DS_Store
 *.pyc
+*.py[cod]
+.pytest_cache/
 
 checkpoints/
 
@@ -11,6 +15,23 @@ logs/
 *.out
 
 *.err
+
+# Training data and model artifacts stay on the cluster
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.tgz
+*.tar.gz
+*.ready
+
+# Temporary previews and local inspection output
+qa_preview/
+_ppt_readonly/
+*.inspect.ndjson
 
 catboost_info/
 

@@ -1,0 +1,29 @@
+{
+  "experiment_id": "R5-CensoredFlow",
+  "date": "2026-09-15",
+  "status": "implementing",
+  "remote_project_root": "/public/home/putianshu/vis_mlp/visibility_r5_censored_flow_20260915",
+  "config": "/public/home/putianshu/vis_mlp/visibility_r5_censored_flow_20260915/configs/r5_censored_flow.json",
+  "run": "/public/home/putianshu/vis_mlp/visibility_r5_censored_flow_20260915/runs/R5-CensoredFlow/seed1",
+  "question": "Can one censored conditional spline flow model the full visibility distribution and recover 500-1000 m probability without Gate, Cap, diffusion, or an auxiliary classifier?",
+  "model": "Current R5 shared Transformer backbone -> one flow query -> small conditioner -> one 16-bin monotonic rational-quadratic spline with linear tails",
+  "target": "z=log(3.912/V_km)",
+  "likelihood": {
+    "0_lt_V_lt_30": "-log p(z|X)",
+    "V_eq_30": "-log F(log(3.912/30)|X)",
+    "V_eq_0": "excluded from likelihood but retained in event evaluation"
+  },
+  "loss": "censored NLL only",
+  "event_probabilities": {
+    "lt500m": "1-F(log(3.912/0.5)|X)",
+    "500_1000m": "F(log(3.912/0.5)|X)-F(log(3.912/1)|X)",
+    "ge1000m": "F(log(3.912/1)|X)"
+  },
+  "forbidden_components_absent": ["Gate", "Cap head", "diffusion", "classification head", "boundary loss", "interval loss", "focal loss", "class weighting", "rare-event oversampling"],
+  "S1": {"status": "not_started", "data": "/public/home/putianshu/vis_mlp/ml_dataset_pmst_v5_aligned_12h_pm10_pm25", "max_steps": 40000},
+  "S2": {"status": "not_started", "data": "/public/home/putianshu/vis_mlp/ml_dataset_s2_tianji_12h_pm10_pm25_monthtail_2", "max_steps": 100000},
+  "resources": {"nodes_per_run": 1, "CPU_cores": 32, "allocated_DCU_count": 4, "training_DCU_count": 4, "batch_size_per_DCU": 1024, "effective_batch_size": 4096, "num_workers_total": 16, "precision": "fp32"},
+  "sanity": {"status": "pending", "checks": ["RQS invertibility", "Jacobian consistency", "stable finite log-CDF", "finite gradients", "analytic CDF ordering", "event probability simplex", "absence of forbidden branches"]},
+  "results": null,
+  "conclusion": "Pending sanity check and formal training."
+}
